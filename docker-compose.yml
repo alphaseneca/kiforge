@@ -1,0 +1,19 @@
+services:
+  export:
+    image: kicad/kicad:10.0
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    entrypoint: ["/bin/bash", "./kiforge.sh"]
+    command: [
+      "tests/sample_project",  # Default project path
+      "kiforge",               # Default output directory
+      "true",                  # Export 3D
+      "true",                  # Export SVG
+      "true",                  # Export BOM
+      "true",                  # Export Schematic PDF
+      "true",                  # Export POS CSV
+      "true",                  # Export STEP
+      "true",                  # Export Gerbers
+      "true"                   # Export Drills
+    ]

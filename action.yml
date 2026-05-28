@@ -1,0 +1,71 @@
+name: 'KiForge'
+description: 'Export BOM, CPL, STEP, Gerbers, Drills, 3D renders, SVGs, and PDF from a KiCad 10 project using the official docker image'
+author: 'alphaseneca'
+branding:
+  icon: 'cpu'
+  color: 'blue'
+
+inputs:
+  project_path:
+    description: 'Relative path to the KiCad project directory (contains .kicad_pro)'
+    required: true
+    default: '.'
+  output_dir:
+    description: 'Directory inside the workspace where outputs will be saved (relative to project_path)'
+    required: false
+    default: 'kiforge'
+  export_3d:
+    description: 'Export 3D front/back renders (true/false)'
+    required: false
+    default: 'true'
+  export_svg:
+    description: 'Export copper layer SVGs (true/false)'
+    required: false
+    default: 'true'
+  export_bom:
+    description: 'Export Bill of Materials (true/false)'
+    required: false
+    default: 'true'
+  export_sch_pdf:
+    description: 'Export schematic PDF (true/false)'
+    required: false
+    default: 'true'
+  export_pos:
+    description: 'Export component placement file (true/false)'
+    required: false
+    default: 'true'
+  export_step:
+    description: 'Export STEP 3D model (true/false)'
+    required: false
+    default: 'true'
+  export_gerbers:
+    description: 'Export Gerber files (true/false)'
+    required: false
+    default: 'true'
+  export_drills:
+    description: 'Export Drill files (true/false)'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run KiForge Exporter
+      shell: bash
+      run: |
+        docker run --rm \
+          -v "${{ github.workspace }}:/workspace" \
+          -v "${{ github.action_path }}:/action" \
+          -w /workspace \
+          kicad/kicad:10.0 \
+          /bin/bash /action/kiforge.sh \
+          "${{ inputs.project_path }}" \
+          "${{ inputs.output_dir }}" \
+          "${{ inputs.export_3d }}" \
+          "${{ inputs.export_svg }}" \
+          "${{ inputs.export_bom }}" \
+          "${{ inputs.export_sch_pdf }}" \
+          "${{ inputs.export_pos }}" \
+          "${{ inputs.export_step }}" \
+          "${{ inputs.export_gerbers }}" \
+          "${{ inputs.export_drills }}"

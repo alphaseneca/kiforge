@@ -1,0 +1,25 @@
+name: Test KiCad Exporter Action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run exporter action on sample project
+        uses: ./
+        with:
+          project_path: tests/sample_project
+          output_dir: kiforge
+
+      - name: Upload exported files
+        uses: actions/upload-artifact@v4
+        with:
+          name: kicad-exports
+          path: tests/sample_project/kiforge/

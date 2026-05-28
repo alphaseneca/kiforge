@@ -1,0 +1,30 @@
+{
+    "$schema": "https://go.kicad.org/pcm/schemas/v1",
+    "identifier": "com.github.alphaseneca.kiforge",
+    "type": "plugin",
+    "name": "KiForge",
+    "description": "One-click export of BOM, STEP, 3D renders, SVGs, PDF and placement files.",
+    "description_full": "KiForge automates exporting BOM, STEP, 3D renders, SVGs, PDF and placement files from inside the KiCad GUI or via CI/CD.",
+    "category": "manufacturing",
+    "author": {
+        "name": "alphaseneca",
+        "contact": {
+            "web": "https://github.com/alphaseneca/kiforge"
+        }
+    },
+    "license": "MIT",
+    "resources": {
+        "homepage": "https://github.com/alphaseneca/kiforge"
+    },
+    "versions": [
+        {
+            "version": "1.0.0",
+            "status": "stable",
+            "kicad_version": "10.0",
+            "download_url": "https://github.com/alphaseneca/kiforge/releases/download/v1.0.0/kiforge.zip",
+            "download_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "download_size": 1000,
+            "install_size": 1000
+        }
+    ]
+}

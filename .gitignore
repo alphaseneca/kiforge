@@ -1,0 +1,12 @@
+*.bak
+*-backups/
+*.kicad_pcb-bak
+*.kicad_sch-bak
+__pycache__/
+.history/
+kiforge/
+dist/
+tmp/
+.idea/
+.vscode/
+plugins/kiforge.py
