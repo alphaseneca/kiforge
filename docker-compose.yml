@@ -15,5 +15,6 @@ services:
       "true",                  # Export POS CSV
       "true",                  # Export STEP
       "true",                  # Export Gerbers
-      "true"                   # Export Drills
+      "true",                  # Export Drills
+      "true"                   # Export Interactive HTML BOM
     ]

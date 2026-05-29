@@ -11,6 +11,58 @@ import csv
 import zipfile
 import shutil
 import subprocess
+import logging
+import site
+
+# Ensure the user's local site-packages folder is in sys.path
+# This is critical for KiCad's isolated Python environment to recognize --user pip packages.
+if hasattr(site, 'getusersitepackages'):
+    user_site = site.getusersitepackages()
+    if user_site and user_site not in sys.path:
+        sys.path.append(user_site)
+
+# Prevent InteractiveHtmlBom from attempting to open graphical displays/dialogs in headless environments
+os.environ["INTERACTIVE_HTML_BOM_NO_DISPLAY"] = "1"
+
+# Configure structured logging for KiForge
+def setup_logger(output_dir=None):
+    """Sets up a structured logger for KiForge that logs to console and optionally a file"""
+    logger = logging.getLogger("KiForge")
+    logger.setLevel(logging.DEBUG)
+    
+    # Check if console and file handlers already exist
+    has_console = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in logger.handlers)
+    has_file = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+    
+    formatter = logging.Formatter(
+        '[%(asctime)s] [%(levelname)s] [%(name)s:%(filename)s:%(lineno)d] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    if not has_console:
+        # Console handler (outputs to KiCad scripting console / stderr)
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
+    # File handler
+    if output_dir and not has_file:
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            log_file = os.path.join(output_dir, "kiforge.log")
+            file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except Exception as e:
+            # Fallback if log directory is unwritable
+            logging.warning(f"Could not create log file: {e}")
+            
+    return logger
+
+# Get core logger instance
+logger = logging.getLogger("KiForge.Core")
 
 # User-customizable footprint rotation offsets for JLCPCB assembly.
 # Key: footprint name substring, Value: rotation angle offset in degrees (float).
@@ -46,6 +98,37 @@ def terminate_active_export():
                 _active_process.kill()
             except Exception:
                 pass
+
+def get_python_executable():
+    """Resolves the actual Python interpreter executable path, even if embedded inside KiCad."""
+    exe = sys.executable
+    base_name = os.path.basename(exe).lower()
+    if 'kicad' in base_name or base_name in ['pcbnew', '_pcbnew.pyd', '_pcbnew.exe', 'pythonw.exe']:
+        search_dirs = []
+        exe_dir = os.path.dirname(exe)
+        search_dirs.append(exe_dir)
+        if hasattr(sys, 'prefix'):
+            search_dirs.append(sys.prefix)
+            search_dirs.append(os.path.join(sys.prefix, 'bin'))
+            search_dirs.append(os.path.join(sys.prefix, 'Scripts'))
+        if hasattr(sys, 'exec_prefix'):
+            search_dirs.append(sys.exec_prefix)
+            search_dirs.append(os.path.join(sys.exec_prefix, 'bin'))
+        if sys.platform == 'win32':
+            candidates = ['kicad-python.exe', 'python.exe', 'pythonw.exe']
+        else:
+            candidates = ['python3', 'python', 'python3.10', 'python3.9', 'python3.11']
+        for directory in search_dirs:
+            for name in candidates:
+                path = os.path.join(directory, name)
+                if os.path.isfile(path) and os.access(path, os.X_OK):
+                    return path
+        if sys.platform == 'darwin':
+            contents_dir = os.path.dirname(exe_dir)
+            mac_py = os.path.join(contents_dir, "Frameworks", "Python.framework", "Versions", "Current", "bin", "python3")
+            if os.path.isfile(mac_py):
+                return mac_py
+    return exe
 
 def zip_directory(dir_path, zip_path):
     """Zips all files inside a directory to a zip archive (preserving relative paths)"""
@@ -154,9 +237,16 @@ def format_jlc_cpl(raw_pos_path, output_cpl_path):
         writer.writeheader()
         writer.writerows(jlc_cpl_rows)
 
-def run_export(project_path, output_dir, export_3d, export_svg, export_bom, export_sch_pdf, export_pos, export_step, export_gerbers, export_drills, progress_callback=None):
+def run_export(project_path, output_dir, export_3d, export_svg, export_bom, export_sch_pdf, export_pos, export_step, export_gerbers, export_drills, export_ibom=True, progress_callback=None):
     """Core function to execute exports and post-processing. Can report progress via callback."""
     project_path = os.path.abspath(project_path)
+    
+    # Setup startupinfo to prevent command prompt popup on Windows
+    startupinfo = None
+    if sys.platform == 'win32':
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
     
     # 1. Locate files (excluding .history and hidden folders)
     pcb_pro_file = None
@@ -171,7 +261,7 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
                 pcb_file = os.path.join(root, file)
                 
     if not pcb_pro_file and not pcb_file:
-        print("Error: No KiCad project (.kicad_pro) or board (.kicad_pcb) files found.")
+        logger.error("No KiCad project (.kicad_pro) or board (.kicad_pcb) files found.")
         return False
         
     if pcb_pro_file:
@@ -197,6 +287,17 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
     if not os.path.isabs(output_dir):
         output_dir = os.path.join(project_dir, output_dir)
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Initialize file logging in the output directory
+    setup_logger(output_dir)
+    logger.info(f"Initialized KiForge Exporter for project: {pcb_name}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.debug(f"Platform: {sys.platform}")
+    logger.debug(f"Python Executable: {sys.executable}")
+    logger.debug(f"Resolved Python Executable: {get_python_executable()}")
+    if hasattr(site, 'getusersitepackages'):
+        logger.debug(f"User site-packages: {site.getusersitepackages()}")
+    logger.debug(f"sys.path: {sys.path}")
     
     # Paths for processing
     temp_gerber_dir = os.path.join(output_dir, "temp_gerbers")
@@ -303,14 +404,57 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
             "--black-and-white", pcb_file
         ], "Exporting Back SVG"))
 
-    total_steps = len(commands) + 3 # +3 for post-processing steps
+    # 10. Interactive HTML BOM
+    if export_ibom and pcb_file:
+        ibom_available = False
+        ibom_run_cmd = []
+        py_exe = get_python_executable()
+        
+        # 1. Try importing the module first
+        try:
+            import InteractiveHtmlBom
+            ibom_available = True
+            ibom_run_cmd = [py_exe, "-m", "InteractiveHtmlBom.generate_interactive_bom"]
+            logger.info("InteractiveHtmlBom successfully imported from sys.path.")
+        except ImportError as e:
+            logger.debug("InteractiveHtmlBom import failed", exc_info=True)
+            # 2. Try installing it via pip inside the current python environment
+            logger.info(f"InteractiveHtmlBom not found in environment (Error: {e}). Attempting to install via pip...")
+            if progress_callback:
+                progress_callback(len(commands), len(commands) + 4, "Installing InteractiveHtmlBom dependency...")
+            try:
+                # Use --user to avoid write permission issues
+                subprocess.run(
+                    [py_exe, "-m", "pip", "install", "--user", "InteractiveHtmlBom"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    startupinfo=startupinfo
+                )
+                ibom_available = True
+                ibom_run_cmd = [py_exe, "-m", "InteractiveHtmlBom.generate_interactive_bom"]
+                logger.info("InteractiveHtmlBom successfully installed via pip.")
+            except Exception as e:
+                logger.warning(f"Failed to install InteractiveHtmlBom via pip: {e}")
+                
+        # 3. Fallback: check if the executable command exists in PATH (e.g. system pip path)
+        if not ibom_available:
+            import shutil
+            if shutil.which("generate_interactive_bom"):
+                ibom_available = True
+                ibom_run_cmd = ["generate_interactive_bom"]
 
-    # Setup startupinfo to prevent command prompt popup on Windows
-    startupinfo = None
-    if sys.platform == 'win32':
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 0  # SW_HIDE
+        if ibom_available:
+            ibom_cmd = ibom_run_cmd + [
+                "--no-browser",
+                "--dest-dir", output_dir,
+                pcb_file
+            ]
+            commands.append((ibom_cmd, "Exporting Interactive HTML BOM"))
+        else:
+            logger.warning("Interactive HTML BOM (iBOM) is not installed and pip installation failed. Skipping iBOM export.")
+
+    total_steps = len(commands) + 3 # +3 for post-processing steps
 
     # Run subprocess commands
     for idx, (cmd, desc) in enumerate(commands):
@@ -327,12 +471,18 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
                     shutil.rmtree(temp_gerber_dir)
                 return False
                 
-        print(f"[{idx+1}/{total_steps}] {desc}...")
+        logger.info(f"[{idx+1}/{total_steps}] Running command: {' '.join(cmd)}")
         try:
             # Run within project_dir for correct internal library/footprint resolution
             global _active_process
             _active_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=project_dir, startupinfo=startupinfo)
             stdout, stderr = _active_process.communicate()
+            
+            if stdout.strip():
+                logger.debug(f"Command stdout:\n{stdout.strip()}")
+            if stderr.strip():
+                logger.debug(f"Command stderr:\n{stderr.strip()}")
+                
             if _active_process.returncode != 0:
                 raise subprocess.CalledProcessError(_active_process.returncode, cmd, output=stdout, stderr=stderr)
         except subprocess.CalledProcessError as e:
@@ -341,7 +491,24 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
                     shutil.rmtree(temp_gerber_dir)
                 return False
             err_msg = f"Command failed: {' '.join(cmd)}\n\nError:\n{e.stderr or e.stdout}"
-            print(err_msg)
+            logger.error(err_msg)
+            if progress_callback:
+                raise RuntimeError(err_msg)
+            else:
+                sys.exit(1)
+        except OSError as e:
+            if _abort_requested:
+                if os.path.exists(temp_gerber_dir):
+                    shutil.rmtree(temp_gerber_dir)
+                return False
+            exe_name = cmd[0] if cmd else "unknown"
+            err_msg = (
+                f"Failed to execute command '{' '.join(cmd)}':\n"
+                f"Executable '{exe_name}' could not be found or executed.\n"
+                f"Please ensure '{exe_name}' is installed and present in your system PATH environment variable.\n"
+                f"System Error: {e}"
+            )
+            logger.error(err_msg)
             if progress_callback:
                 raise RuntimeError(err_msg)
             else:
@@ -358,7 +525,7 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
     desc_step = "Zipping Gerber and Drill files"
     if progress_callback:
         progress_callback(current_idx, total_steps, f"Post-Process: {desc_step}...")
-    print(f"[{current_idx+1}/{total_steps}] {desc_step}...")
+    logger.info(f"[{current_idx+1}/{total_steps}] {desc_step}...")
     
     if os.path.exists(temp_gerber_dir) and os.listdir(temp_gerber_dir):
         gerber_zip_path = os.path.join(output_dir, f"{pcb_name}_gerbers.zip")
@@ -366,7 +533,7 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
             zip_directory(temp_gerber_dir, gerber_zip_path)
             shutil.rmtree(temp_gerber_dir)
         except Exception as e:
-            print(f"Error packaging Gerbers: {e}")
+            logger.error(f"Error packaging Gerbers: {e}", exc_info=True)
     elif os.path.exists(temp_gerber_dir):
         shutil.rmtree(temp_gerber_dir)
         
@@ -377,7 +544,7 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
     desc_step = "Formatting JLCPCB BOM"
     if progress_callback:
         progress_callback(current_idx, total_steps, f"Post-Process: {desc_step}...")
-    print(f"[{current_idx+1}/{total_steps}] {desc_step}...")
+    logger.info(f"[{current_idx+1}/{total_steps}] {desc_step}...")
     
     if os.path.exists(raw_bom_path):
         jlc_bom_path = os.path.join(output_dir, f"{pcb_name}_bom_jlc.csv")
@@ -385,7 +552,7 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
             format_jlc_bom(raw_bom_path, jlc_bom_path)
             os.remove(raw_bom_path)
         except Exception as e:
-            print(f"Error formatting BOM: {e}")
+            logger.error(f"Error formatting BOM: {e}", exc_info=True)
             
     # Post Step 3: Format JLCPCB CPL
     if _abort_requested:
@@ -394,7 +561,7 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
     desc_step = "Formatting JLCPCB CPL"
     if progress_callback:
         progress_callback(current_idx, total_steps, f"Post-Process: {desc_step}...")
-    print(f"[{current_idx+1}/{total_steps}] {desc_step}...")
+    logger.info(f"[{current_idx+1}/{total_steps}] {desc_step}...")
     
     if os.path.exists(raw_pos_path):
         jlc_cpl_path = os.path.join(output_dir, f"{pcb_name}_cpl_jlc.csv")
@@ -402,12 +569,12 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
             format_jlc_cpl(raw_pos_path, jlc_cpl_path)
             os.remove(raw_pos_path)
         except Exception as e:
-            print(f"Error formatting CPL: {e}")
+            logger.error(f"Error formatting CPL: {e}", exc_info=True)
 
     if progress_callback:
         progress_callback(total_steps, total_steps, "Completed successfully!")
         
-    print("KiForge Exporter completed successfully.")
+    logger.info("KiForge Exporter completed successfully.")
     return True
 
 
@@ -424,6 +591,7 @@ if __name__ == "__main__":
     parser.add_argument("export_step", nargs="?", default="true")
     parser.add_argument("export_gerbers", nargs="?", default="true")
     parser.add_argument("export_drills", nargs="?", default="true")
+    parser.add_argument("export_ibom", nargs="?", default="true")
     
     args = parser.parse_args()
     
@@ -440,7 +608,8 @@ if __name__ == "__main__":
         export_pos=str_to_bool(args.export_pos),
         export_step=str_to_bool(args.export_step),
         export_gerbers=str_to_bool(args.export_gerbers),
-        export_drills=str_to_bool(args.export_drills)
+        export_drills=str_to_bool(args.export_drills),
+        export_ibom=str_to_bool(args.export_ibom)
     )
     if not success:
         sys.exit(1)

@@ -12,6 +12,7 @@ EXPORT_POS="${7:-true}"
 EXPORT_STEP="${8:-true}"
 EXPORT_GERBERS="${9:-true}"
 EXPORT_DRILLS="${10:-true}"
+EXPORT_IBOM="${11:-true}"
 
 # Determine the script path (handling action vs local docker compose)
 if [ -f "/action/kiforge.py" ]; then
@@ -32,4 +33,5 @@ python3 "$PYTHON_SCRIPT" \
     "$EXPORT_POS" \
     "$EXPORT_STEP" \
     "$EXPORT_GERBERS" \
-    "$EXPORT_DRILLS"
+    "$EXPORT_DRILLS" \
+    "$EXPORT_IBOM"

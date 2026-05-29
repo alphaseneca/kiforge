@@ -46,6 +46,10 @@ inputs:
     description: 'Export Drill files (true/false)'
     required: false
     default: 'true'
+  export_ibom:
+    description: 'Export Interactive HTML BOM (true/false)'
+    required: false
+    default: 'true'
 
 runs:
   using: 'composite'
@@ -68,4 +72,5 @@ runs:
           "${{ inputs.export_pos }}" \
           "${{ inputs.export_step }}" \
           "${{ inputs.export_gerbers }}" \
-          "${{ inputs.export_drills }}"
+          "${{ inputs.export_drills }}" \
+          "${{ inputs.export_ibom }}"

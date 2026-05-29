@@ -87,6 +87,37 @@ jobs:
 | `export_step` | Toggle STEP 3D model generation (`true` / `false`) | `true` | No |
 | `export_gerbers` | Toggle Gerber files generation (`true` / `false`) | `true` | No |
 | `export_drills` | Toggle Drill files generation (`true` / `false`) | `true` | No |
+| `export_ibom` | Toggle Interactive HTML BOM generation (`true` / `false`) | `true` | No |
+
+---
+
+## 3. Interactive HTML BOM (iBOM) Integration
+
+KiForge supports exporting interactive HTML BOMs using the popular [InteractiveHtmlBom](https://github.com/openscopeproject/InteractiveHtmlBom) tool. 
+
+To enable this feature, the `InteractiveHtmlBom` Python package must be installed in the active Python environment. If it is missing, KiForge will attempt to install it automatically via `pip` under the user context.
+
+### Manual Installation
+
+If you prefer to install it manually:
+
+*   **GitHub Actions / CLI**: The action automatically installs the dependency via pip at runtime. If you run locally, install it in your environment:
+    ```bash
+    pip install InteractiveHtmlBom
+    ```
+*   **KiCad GUI (Windows)**: Open the **KiCad Command Prompt** (from the start menu) and run:
+    ```cmd
+    pip install InteractiveHtmlBom
+    ```
+    *(Alternatively: `kicad-python.exe -m pip install --user InteractiveHtmlBom`)*
+*   **KiCad GUI (macOS)**: Run terminal command using the KiCad-bundled Python:
+    ```bash
+    /Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 -m pip install --user InteractiveHtmlBom
+    ```
+*   **KiCad GUI (Linux)**: Install using your system's python package manager:
+    ```bash
+    pip3 install --user InteractiveHtmlBom
+    ```
 
 ---
 
