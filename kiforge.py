@@ -578,38 +578,39 @@ def run_export(project_path, output_dir, export_3d, export_svg, export_bom, expo
     return True
 
 
-if __name__ == "__main__":
+def parse_cli_args(args=None):
+    """Parses command-line arguments for the KiForge exporter CLI"""
     import argparse
     parser = argparse.ArgumentParser(description="KiForge - KiCad 10 Exporter CLI")
-    parser.add_argument("project_path", nargs="?", default=".")
-    parser.add_argument("output_dir", nargs="?", default="kiforge")
-    parser.add_argument("export_3d", nargs="?", default="true")
-    parser.add_argument("export_svg", nargs="?", default="true")
-    parser.add_argument("export_bom", nargs="?", default="true")
-    parser.add_argument("export_sch_pdf", nargs="?", default="true")
-    parser.add_argument("export_pos", nargs="?", default="true")
-    parser.add_argument("export_step", nargs="?", default="true")
-    parser.add_argument("export_gerbers", nargs="?", default="true")
-    parser.add_argument("export_drills", nargs="?", default="true")
-    parser.add_argument("export_ibom", nargs="?", default="true")
+    parser.add_argument("--project-path", "--project_path", dest="project_path", default=".")
+    parser.add_argument("--output-dir", "--output_dir", dest="output_dir", default="kiforge")
+    parser.add_argument("--export-3d", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--export-svg", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--export-bom", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--export-sch-pdf", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--export-pos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--export-step", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--export-gerbers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--export-drills", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--export-ibom", action=argparse.BooleanOptionalAction, default=True)
+    return parser.parse_args(args)
+
+
+if __name__ == "__main__":
+    args = parse_cli_args()
     
-    args = parser.parse_args()
-    
-    def str_to_bool(s):
-        return s.lower() in ['true', '1', 'yes', 'y']
-        
     success = run_export(
         project_path=args.project_path,
         output_dir=args.output_dir,
-        export_3d=str_to_bool(args.export_3d),
-        export_svg=str_to_bool(args.export_svg),
-        export_bom=str_to_bool(args.export_bom),
-        export_sch_pdf=str_to_bool(args.export_sch_pdf),
-        export_pos=str_to_bool(args.export_pos),
-        export_step=str_to_bool(args.export_step),
-        export_gerbers=str_to_bool(args.export_gerbers),
-        export_drills=str_to_bool(args.export_drills),
-        export_ibom=str_to_bool(args.export_ibom)
+        export_3d=args.export_3d,
+        export_svg=args.export_svg,
+        export_bom=args.export_bom,
+        export_sch_pdf=args.export_sch_pdf,
+        export_pos=args.export_pos,
+        export_step=args.export_step,
+        export_gerbers=args.export_gerbers,
+        export_drills=args.export_drills,
+        export_ibom=args.export_ibom
     )
     if not success:
         sys.exit(1)

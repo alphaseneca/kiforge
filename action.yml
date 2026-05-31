@@ -57,20 +57,23 @@ runs:
     - name: Run KiForge Exporter
       shell: bash
       run: |
+        ARGS=()
+        ARGS+=("--project-path" "${{ inputs.project_path }}")
+        ARGS+=("--output-dir" "${{ inputs.output_dir }}")
+        
+        if [ "${{ inputs.export_3d }}" = "false" ]; then ARGS+=("--no-export-3d"); fi
+        if [ "${{ inputs.export_svg }}" = "false" ]; then ARGS+=("--no-export-svg"); fi
+        if [ "${{ inputs.export_bom }}" = "false" ]; then ARGS+=("--no-export-bom"); fi
+        if [ "${{ inputs.export_sch_pdf }}" = "false" ]; then ARGS+=("--no-export-sch-pdf"); fi
+        if [ "${{ inputs.export_pos }}" = "false" ]; then ARGS+=("--no-export-pos"); fi
+        if [ "${{ inputs.export_step }}" = "false" ]; then ARGS+=("--no-export-step"); fi
+        if [ "${{ inputs.export_gerbers }}" = "false" ]; then ARGS+=("--no-export-gerbers"); fi
+        if [ "${{ inputs.export_drills }}" = "false" ]; then ARGS+=("--no-export-drills"); fi
+        if [ "${{ inputs.export_ibom }}" = "false" ]; then ARGS+=("--no-export-ibom"); fi
+        
         docker run --rm \
           -v "${{ github.workspace }}:/workspace" \
           -v "${{ github.action_path }}:/action" \
           -w /workspace \
           kicad/kicad:10.0 \
-          /bin/bash /action/kiforge.sh \
-          "${{ inputs.project_path }}" \
-          "${{ inputs.output_dir }}" \
-          "${{ inputs.export_3d }}" \
-          "${{ inputs.export_svg }}" \
-          "${{ inputs.export_bom }}" \
-          "${{ inputs.export_sch_pdf }}" \
-          "${{ inputs.export_pos }}" \
-          "${{ inputs.export_step }}" \
-          "${{ inputs.export_gerbers }}" \
-          "${{ inputs.export_drills }}" \
-          "${{ inputs.export_ibom }}"
+          /bin/bash /action/kiforge.sh "${ARGS[@]}"
