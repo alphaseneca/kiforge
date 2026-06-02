@@ -490,13 +490,14 @@ class ExporterPlugin(_PluginBase):
         # Restore the pre-open modified state so the file is not flagged as
         # dirty just because the plugin dialog was opened and closed.
         try:
-            # Re-retrieve active board reference to be sure it's the current one
             current_board = pcbnew.GetBoard()
             if current_board and not board_was_modified:
-                if hasattr(current_board, "SetModified"):
-                    current_board.SetModified(False)
-                elif hasattr(current_board, "ResetModified"):
-                    current_board.ResetModified()
+                # In KiCad's legacy SWIG Python API, SetModified() takes no arguments
+                # and can only set the modified state to True. To clear the modified/dirty
+                # state programmatically, we must save the board to its current file path.
+                board_file = current_board.GetFileName()
+                if board_file and os.path.isfile(board_file):
+                    current_board.Save(board_file)
                 if hasattr(pcbnew, "Refresh"):
                     pcbnew.Refresh()
         except Exception:
