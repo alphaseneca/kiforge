@@ -4,6 +4,7 @@ import os
 import tempfile
 import json
 import shutil
+# pyrefly: ignore [missing-import]
 import wx
 
 # Add root directory to sys.path

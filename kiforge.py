@@ -166,6 +166,7 @@ class PathResolver:
     def get_kicad_python_path() -> str:
         """Resolves the python interpreter associated with KiCad (which has pcbnew)."""
         try:
+            # pyrefly: ignore [missing-import]
             import pcbnew
             return sys.executable
         except ImportError:
