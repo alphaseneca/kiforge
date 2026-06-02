@@ -748,8 +748,12 @@ class InteractiveBomTask(ExportTask):
             context.logger.info("InteractiveHtmlBom not found/working in target Python environment. Attempting to install via pip...")
             if context.progress_callback:
                 context.progress_callback(None, None, "Installing InteractiveHtmlBom dependency...")
+            
+            pip_success = False
+            err_output = ""
+            
             try:
-                # Use --user to install inside isolated environment without admin permissions
+                # Try 1: Standard --user install
                 subprocess.run(
                     [py_exe, "-m", "pip", "install", "--user", "InteractiveHtmlBom"],
                     check=True,
@@ -758,22 +762,44 @@ class InteractiveBomTask(ExportTask):
                     env=context.env,
                     startupinfo=context.startupinfo
                 )
-                # Verify installation again using find_spec (without executing)
-                subprocess.run(
-                    [py_exe, "-c", "import sys, importlib.util; sys.exit(0 if importlib.util.find_spec('InteractiveHtmlBom') else 1)"],
-                    check=True,
-                    capture_output=True,
-                    env=context.env,
-                    startupinfo=context.startupinfo
-                )
-                ibom_available = True
-                ibom_run_cmd = [
-                    py_exe, "-c",
-                    "import wx, sys; wx.DisableAsserts(); from InteractiveHtmlBom import generate_interactive_bom; sys.exit(generate_interactive_bom.main())"
-                ]
-                context.logger.info("InteractiveHtmlBom successfully installed and verified via pip.")
-            except Exception as pip_err:
-                context.logger.warning(f"Failed to install/verify InteractiveHtmlBom via pip: {pip_err}")
+                pip_success = True
+            except subprocess.CalledProcessError as e:
+                err_output = e.stderr or e.stdout or str(e)
+                context.logger.info("Standard pip install failed. Retrying with --break-system-packages...")
+                try:
+                    # Try 2: Retry with --break-system-packages (required for PEP 668 environments)
+                    subprocess.run(
+                        [py_exe, "-m", "pip", "install", "--user", "--break-system-packages", "InteractiveHtmlBom"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        env=context.env,
+                        startupinfo=context.startupinfo
+                    )
+                    pip_success = True
+                except subprocess.CalledProcessError as e2:
+                    err_output = e2.stderr or e2.stdout or str(e2)
+
+            if pip_success:
+                try:
+                    # Verify installation again using find_spec (without executing)
+                    subprocess.run(
+                        [py_exe, "-c", "import sys, importlib.util; sys.exit(0 if importlib.util.find_spec('InteractiveHtmlBom') else 1)"],
+                        check=True,
+                        capture_output=True,
+                        env=context.env,
+                        startupinfo=context.startupinfo
+                    )
+                    ibom_available = True
+                    ibom_run_cmd = [
+                        py_exe, "-c",
+                        "import wx, sys; wx.DisableAsserts(); from InteractiveHtmlBom import generate_interactive_bom; sys.exit(generate_interactive_bom.main())"
+                    ]
+                    context.logger.info("InteractiveHtmlBom successfully installed and verified via pip.")
+                except Exception as verify_err:
+                    context.logger.warning(f"Failed to verify InteractiveHtmlBom after installation: {verify_err}")
+            else:
+                context.logger.warning(f"Failed to install InteractiveHtmlBom via pip. Error details:\n{err_output.strip()}")
                 
         if not ibom_available:
             if shutil.which("generate_interactive_bom"):
