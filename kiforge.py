@@ -955,6 +955,9 @@ on:
 permissions:
   contents: write   # Required to create GitHub Releases and upload assets
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   export:
     runs-on: ubuntu-latest
