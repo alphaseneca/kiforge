@@ -472,36 +472,9 @@ class ExporterPlugin(_PluginBase):
         if app and hasattr(app, "GetTopWindow"):
             parent_window = app.GetTopWindow()
 
-        # Save the board's current modified state so that simply opening the
-        # KiForge dialog does not cause KiCad to mark the PCB as unsaved.
-        board_was_modified = False
-        board_ref = None
-        try:
-            board_ref = pcbnew.GetBoard()
-            if board_ref:
-                board_was_modified = board_ref.IsModified()
-        except Exception:
-            pass
-
         dialog = KiForgeStudioSettingsDialog(parent_window, project_dir)
         dialog.ShowModal()
         dialog.Destroy()
-
-        # Restore the pre-open modified state so the file is not flagged as
-        # dirty just because the plugin dialog was opened and closed.
-        try:
-            current_board = pcbnew.GetBoard()
-            if current_board and not board_was_modified:
-                # In KiCad's legacy SWIG Python API, SetModified() takes no arguments
-                # and can only set the modified state to True. To clear the modified/dirty
-                # state programmatically, we must save the board to its current file path.
-                board_file = current_board.GetFileName()
-                if board_file and os.path.isfile(board_file):
-                    current_board.Save(board_file)
-                if hasattr(pcbnew, "Refresh"):
-                    pcbnew.Refresh()
-        except Exception:
-            pass
 
 
 # Standalone application execution context
