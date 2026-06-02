@@ -471,9 +471,29 @@ class ExporterPlugin(_PluginBase):
         app = wx.GetApp()
         if app and hasattr(app, "GetTopWindow"):
             parent_window = app.GetTopWindow()
+
+        # Save the board's current modified state so that simply opening the
+        # KiForge dialog does not cause KiCad to mark the PCB as unsaved.
+        board_was_modified = False
+        board_ref = None
+        try:
+            board_ref = pcbnew.GetBoard()
+            if board_ref:
+                board_was_modified = board_ref.IsModified()
+        except Exception:
+            pass
+
         dialog = KiForgeStudioSettingsDialog(parent_window, project_dir)
         dialog.ShowModal()
         dialog.Destroy()
+
+        # Restore the pre-open modified state so the file is not flagged as
+        # dirty just because the plugin dialog was opened and closed.
+        try:
+            if board_ref and not board_was_modified:
+                board_ref.ResetModified()
+        except Exception:
+            pass
 
 
 # Standalone application execution context
