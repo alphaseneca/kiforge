@@ -3,137 +3,145 @@
 [![Test KiCad Exporter Action](https://github.com/alphaseneca/kiforge/actions/workflows/test-action.yml/badge.svg)](https://github.com/alphaseneca/kiforge/actions/workflows/test-action.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**KiForge** is an automated manufacturing files exporter for **KiCad 10** projects. It allows developers to run standard manufacturing and documentation exports with one click from inside the KiCad PCB editor, or automatically as part of a GitHub CI/CD pipeline using the official KiCad Docker environment.
+**KiForge** is an automated manufacturing files exporter for **KiCad 10** projects. Use it as:
 
-It generates:
-* **Gerber & Drill ZIP**: All board layer plots and plated/non-plated drill files zipped into a single archive (`_gerbers.zip`) aligned for JLCPCB.
-* **JLCPCB BOM**: Clean CSV Bill of Materials optimized with JLCPCB columns and LCSC parts (`_bom_jlc.csv`).
-* **JLCPCB CPL**: Component Placement List (position file) aligned for JLCPCB SMT assembly (`_cpl_jlc.csv`).
-* **3D renders**: Front and back high-quality perspectives (`.png`)
-* **SVGs**: Vector exports of front/back copper layers and board edges (`.svg`)
-* **Schematic PDF**: Complete multi-sheet schematics compiled into a single document (`_sch.pdf`)
-* **STEP Model**: 3D step file for mechanical alignment and enclosure design (`.step`)
+- A **one-click KiCad Plugin** — runs exports directly from the PCB Editor with a progress dialog.
+- A **reusable GitHub Action** — runs inside the official `kicad/kicad:10.0` Docker container on every tag push, producing release assets automatically.
+- A **CLI script** — call `python kiforge.py` from any shell or Docker container.
+
+It generates all files needed to order a board from JLCPCB and to document your design:
+
+| Output | File | Flag |
+|---|---|---|
+| Gerber + Drill archive | `<name>_gerbers.zip` | `export_gerbers` / `export_drills` |
+| JLCPCB Bill of Materials | `<name>_bom_jlc.csv` | `export_bom` |
+| JLCPCB Component Placement | `<name>_cpl_jlc.csv` | `export_pos` |
+| Schematic PDF | `<name>_sch.pdf` | `export_sch_pdf` |
+| STEP 3D model | `<name>.step` | `export_step` |
+| 3D front & back renders | `<name>_3d_front/back.png` | `export_3d` |
+| Copper layer SVGs | `<name>_front/back.svg` | `export_svg` |
+| Interactive HTML BOM | `ibom.html` | `export_ibom` |
 
 ---
 
 ## 1. KiCad 10 Action Plugin (GUI)
 
-The Python Action Plugin adds a **KiForge** menu item under **Tools > External Plugins** inside the PCB Editor. It runs the exports in a subprocess using `kicad-cli` and displays a progress bar.
+The plugin adds a **KiForge** entry under **Tools > External Plugins** inside the PCB Editor.
 
 ### Installation
 
-Copy the `plugins/` directory and `metadata.json` into your local KiCad 10 scripting plugins folder:
+Install via **KiCad Plugin Manager** (recommended) — search for `KiForge` — or copy the `plugins/` folder manually:
 
-* **Windows**: `%APPDATA%\kicad\10.0\scripting\plugins\com.github.alphaseneca.kiforge\`
-* **macOS**: `~/Library/Application Support/kicad/10.0/scripting/plugins/com.github.alphaseneca.kiforge/`
-* **Linux**: `~/.local/share/kicad/10.0/scripting/plugins/com.github.alphaseneca.kiforge/`
+| Platform | Path |
+|---|---|
+| Windows | `%APPDATA%\kicad\10.0\scripting\plugins\com.github.alphaseneca.kiforge\` |
+| macOS | `~/Library/Application Support/kicad/10.0/scripting/plugins/com.github.alphaseneca.kiforge/` |
+| Linux | `~/.local/share/kicad/10.0/scripting/plugins/com.github.alphaseneca.kiforge/` |
 
 ### Usage
 
-1. Open your project PCB file (`.kicad_pcb`) in KiCad 10.
-2. Select **Tools > External Plugins > KiForge**.
-3. A progress dialog will show the status of the exports.
-4. All exports are saved to a folder named `kiforge/` located in the same directory as the active `.kicad_pro` project file.
+1. Open your `.kicad_pcb` file in KiCad 10.
+2. Go to **Tools > External Plugins > KiForge**.
+3. Select or confirm your project directory and output options.
+4. Click **Run Export Now** — a progress dialog tracks each step.
+5. All files are saved into the configured output folder (default: `kiforge/` next to your `.kicad_pro`).
+
+The plugin also has a **Generate CI Files** button that writes a working GitHub Actions release workflow and updates your `.gitignore` automatically.
 
 ---
 
 ## 2. Reusable GitHub Action (CI/CD)
 
-The GitHub Action runs inside the official `kicad/kicad:10.0` container, running identical CLI exports in a clean, reproducible environment.
+The action runs the exact same `kicad-cli` exports inside the official KiCad Docker container. Generated files are uploaded directly as GitHub Release assets — **nothing is committed to your repository**.
 
-### Example Workflow
-
-Create a file named `.github/workflows/export-pcb.yml` in your project repository:
+### Minimal Example
 
 ```yaml
-name: Export PCB Manufacturing Files
+name: Manufacturing Release
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
+    tags: ['v*']
+
+permissions:
+  contents: write
 
 jobs:
   export:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Run KiForge Exporter
-        uses: alphaseneca/kiforge@v1
+      - name: Run KiForge
+        uses: alphaseneca/kiforge@v0.1.0
         with:
-          project_path: '.'  # Directory containing .kicad_pro
-          output_dir: 'kiforge'
+          project_path: '.'
 
-      - name: Upload Manufacturing Files
-        uses: actions/upload-artifact@v4
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
         with:
-          name: board-manufacturing-files
-          path: kiforge/
+          generate_release_notes: true
+          files: kiforge/*
 ```
 
-### Action Inputs
+> Replace `alphaseneca/kiforge@v0.1.0` with the latest tag from the [KiForge releases page](https://github.com/alphaseneca/kiforge/releases).
 
-| Input | Description | Default | Required |
-| :--- | :--- | :--- | :--- |
-| `project_path` | Relative path to the folder containing `.kicad_pro` | `.` | Yes |
-| `output_dir` | Name of directory (relative to `project_path`) where files are saved | `kiforge` | No |
-| `export_3d` | Toggle front/back 3D renders (`true` / `false`) | `true` | No |
-| `export_svg` | Toggle copper layer SVG exports (`true` / `false`) | `true` | No |
-| `export_bom` | Toggle BOM CSV generation (`true` / `false`) | `true` | No |
-| `export_sch_pdf` | Toggle schematic PDF generation (`true` / `false`) | `true` | No |
-| `export_pos` | Toggle position placement file CSV (`true` / `false`) | `true` | No |
-| `export_step` | Toggle STEP 3D model generation (`true` / `false`) | `true` | No |
-| `export_gerbers` | Toggle Gerber files generation (`true` / `false`) | `true` | No |
-| `export_drills` | Toggle Drill files generation (`true` / `false`) | `true` | No |
-| `export_ibom` | Toggle Interactive HTML BOM generation (`true` / `false`) | `true` | No |
+### All Inputs
 
----
+All inputs are optional. Every export is enabled by default — set to `'false'` to skip.
 
-## 3. Interactive HTML BOM (iBOM) Integration
+| Input | Description | Default |
+|---|---|---|
+| `project_path` | Path to the folder containing `.kicad_pro` | `'.'` |
+| `output_dir` | Output folder name (relative to `project_path`) | `'kiforge'` |
+| `export_gerbers` | Gerber layer files (zipped) | `'true'` |
+| `export_drills` | Drill files (included in Gerber ZIP) | `'true'` |
+| `export_bom` | JLCPCB-formatted Bill of Materials CSV | `'true'` |
+| `export_pos` | JLCPCB-formatted Component Placement CSV | `'true'` |
+| `export_sch_pdf` | Schematic PDF | `'true'` |
+| `export_step` | STEP 3D model | `'true'` |
+| `export_3d` | Front & back 3D renders (PNG) | `'true'` |
+| `export_svg` | Front & back copper layer SVGs | `'true'` |
+| `export_ibom` | Interactive HTML BOM | `'true'` |
 
-KiForge supports exporting interactive HTML BOMs using the popular [InteractiveHtmlBom](https://github.com/openscopeproject/InteractiveHtmlBom) tool. 
-
-To enable this feature, the `InteractiveHtmlBom` Python package must be installed in the active Python environment. If it is missing, KiForge will attempt to install it automatically via `pip` under the user context.
-
-### Manual Installation
-
-If you prefer to install it manually:
-
-*   **GitHub Actions / CLI**: The action automatically installs the dependency via pip at runtime. If you run locally, install it in your environment:
-    ```bash
-    pip install InteractiveHtmlBom
-    ```
-*   **KiCad GUI (Windows)**: Open the **KiCad Command Prompt** (from the start menu) and run:
-    ```cmd
-    pip install InteractiveHtmlBom
-    ```
-    *(Alternatively: `kicad-python.exe -m pip install --user InteractiveHtmlBom`)*
-*   **KiCad GUI (macOS)**: Run terminal command using the KiCad-bundled Python:
-    ```bash
-    /Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 -m pip install --user InteractiveHtmlBom
-    ```
-*   **KiCad GUI (Linux)**: Install using your system's python package manager:
-    ```bash
-    pip3 install --user InteractiveHtmlBom
-    ```
+For selective export examples and full workflow recipes, see [USAGE.md](USAGE.md).
 
 ---
 
-## 3. Local Testing with Docker Compose
+## 3. Interactive HTML BOM (iBOM)
 
-To test the exporter locally using the exact same environment as the GitHub Action:
+KiForge exports interactive BOMs using [InteractiveHtmlBom](https://github.com/openscopeproject/InteractiveHtmlBom). If the package is not installed, KiForge automatically tries to install it via `pip --user` at runtime.
 
-1. Install [Docker](https://www.docker.com/) and [Docker Compose](https://docs.docker.com/compose/).
-2. Run the compose service:
-   ```bash
-   docker compose run --rm export
-   ```
-3. By default, this will run exports against the `tests/sample_project` folder and output results to `tests/sample_project/kiforge/`.
+To install manually:
+
+```bash
+# CLI / GitHub Actions
+pip install InteractiveHtmlBom
+
+# KiCad GUI — Windows (KiCad Command Prompt)
+pip install InteractiveHtmlBom
+
+# KiCad GUI — macOS
+/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 -m pip install --user InteractiveHtmlBom
+
+# KiCad GUI — Linux
+pip3 install --user InteractiveHtmlBom
+```
+
+---
+
+## 4. Local Testing with Docker Compose
+
+Test against the same KiCad Docker environment used by the GitHub Action:
+
+```bash
+docker compose run --rm export
+```
+
+By default this runs against `tests/sample_project` and writes output to `tests/sample_project/kiforge/`.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).

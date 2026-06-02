@@ -61,5 +61,84 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertTrue(args.export_3d)
         self.assertTrue(args.export_svg)
 
+    def test_get_kicad_cli_path(self):
+        """Verify get_kicad_cli_path returns a string and is not empty."""
+        path = kiforge.get_kicad_cli_path()
+        self.assertTrue(isinstance(path, str))
+        self.assertTrue(len(path) > 0)
+
+    def test_get_kicad_python_path(self):
+        """Verify get_kicad_python_path returns a string and is not empty."""
+        path = kiforge.get_kicad_python_path()
+        self.assertTrue(isinstance(path, str))
+        self.assertTrue(len(path) > 0)
+
+    def test_context_cancellation(self):
+        """Verify ExportContext thread-safe cancellation functions as expected."""
+        options = {"export_bom": True}
+        context = kiforge.ExportContext(".", "kiforge_out", options)
+        self.assertFalse(context.is_aborted())
+        context.cancel()
+        self.assertTrue(context.is_aborted())
+
+    def test_rotation_offsets_merge(self):
+        """Verify ExportContext merges and exposes rotation offsets correctly."""
+        options = {
+            "rotation_offsets": {"R0603": 90.0, "U1": 180.0}
+        }
+        context = kiforge.ExportContext(".", "kiforge_out", options)
+        # Call resolve, but since '.' might not contain kicad board files, resolve returns False.
+        # However, it still merges the rotation offsets. Let's mock the pcb resolution.
+        context.pcb_file = "dummy.kicad_pcb"
+        context.pcb_name = "dummy"
+        context.project_dir = "."
+        context.output_dir = "kiforge_out"
+        context.temp_gerber_dir = "kiforge_out/temp_gerbers"
+        
+        # Manually trigger settings loading/merging or test the constructor logic
+        # In our refactored ExportContext, the merge happens at the end of resolve().
+        # Let's mock resolve's dependency methods or check it directly.
+        # We can just manually call the logic or mock setup_logger.
+        original_setup_logger = kiforge.setup_logger
+        kiforge.setup_logger = lambda dir: None
+        try:
+            context.resolve()
+        finally:
+            kiforge.setup_logger = original_setup_logger
+            
+        self.assertEqual(context.rotation_offsets.get("R0603"), 90.0)
+        self.assertEqual(context.rotation_offsets.get("U1"), 180.0)
+
+    def test_ci_generation(self):
+        """Verify centralized CI file generation creates correct workflow file and .gitignore entry."""
+        import tempfile
+        import shutil
+        
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # Create a mock .gitignore
+            gitignore_path = os.path.join(temp_dir, ".gitignore")
+            with open(gitignore_path, 'w', encoding='utf-8') as f:
+                f.write("*.log\n")
+                
+            options = {"export_3d": False, "export_bom": True}
+            msg, success = kiforge.generate_ci_files(temp_dir, "kiforge_test_ci", options)
+            self.assertTrue(success)
+            
+            # Check workflow file
+            workflow_path = os.path.join(temp_dir, ".github", "workflows", "release.yml")
+            self.assertTrue(os.path.isfile(workflow_path))
+            with open(workflow_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                self.assertIn("output_dir: 'kiforge_test_ci'", content)
+                self.assertIn("export_3d: 'false'", content)
+                
+            # Check gitignore
+            with open(gitignore_path, 'r', encoding='utf-8') as f:
+                git_content = f.read()
+                self.assertIn("kiforge_test_ci/", git_content)
+        finally:
+            shutil.rmtree(temp_dir)
+
 if __name__ == '__main__':
     unittest.main()

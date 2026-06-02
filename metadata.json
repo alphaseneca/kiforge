@@ -7,9 +7,11 @@
     "description_full": "KiForge automates exporting BOM, STEP, 3D renders, SVGs, PDF and placement files from inside the KiCad GUI or via CI/CD.",
     "category": "manufacturing",
     "author": {
-        "name": "alphaseneca",
+        "name": "Ukesh Aryal",
         "contact": {
-            "web": "https://github.com/alphaseneca/kiforge"
+            "web": "https://ukesharyal.com.np",
+            "github": "https://github.com/alphaseneca",
+            "email": "work@ukesharyal.com.np"
         }
     },
     "license": "MIT",
@@ -18,10 +20,10 @@
     },
     "versions": [
         {
-            "version": "1.0.0",
-            "status": "stable",
+            "version": "0.1.0",
+            "status": "development",
             "kicad_version": "10.0",
-            "download_url": "https://github.com/alphaseneca/kiforge/releases/download/v1.0.0/kiforge.zip",
+            "download_url": "https://github.com/alphaseneca/kiforge/releases/download/v0.1.0/kiforge.zip",
             "download_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
             "download_size": 1000,
             "install_size": 1000
