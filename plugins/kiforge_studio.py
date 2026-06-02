@@ -490,8 +490,15 @@ class ExporterPlugin(_PluginBase):
         # Restore the pre-open modified state so the file is not flagged as
         # dirty just because the plugin dialog was opened and closed.
         try:
-            if board_ref and not board_was_modified:
-                board_ref.ResetModified()
+            # Re-retrieve active board reference to be sure it's the current one
+            current_board = pcbnew.GetBoard()
+            if current_board and not board_was_modified:
+                if hasattr(current_board, "SetModified"):
+                    current_board.SetModified(False)
+                elif hasattr(current_board, "ResetModified"):
+                    current_board.ResetModified()
+                if hasattr(pcbnew, "Refresh"):
+                    pcbnew.Refresh()
         except Exception:
             pass
 
