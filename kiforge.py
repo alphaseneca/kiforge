@@ -1046,15 +1046,17 @@ class ExportRunner:
 
 def generate_ci_files(project_dir: str, output_dir_name: str, options: dict) -> tuple[str, bool]:
     """
-    Generates the GitHub Actions release workflow and updates .gitignore.
+    Generates both GitHub Actions and Gitea Actions release workflows and updates .gitignore.
     Returns a tuple of (message, success).
     """
-    workflow_dir = os.path.join(project_dir, ".github", "workflows")
+    github_dir = os.path.join(project_dir, ".github", "workflows")
+    gitea_dir = os.path.join(project_dir, ".gitea", "workflows")
     try:
-        os.makedirs(workflow_dir, exist_ok=True)
-        yaml_path = os.path.join(workflow_dir, "release.yml")
+        # 1. GitHub Actions Release Workflow
+        os.makedirs(github_dir, exist_ok=True)
+        github_yaml_path = os.path.join(github_dir, "release.yml")
         
-        yaml_content = f"""name: Manufacturing Release
+        github_yaml_content = f"""name: Manufacturing Release (GitHub)
 
 on:
   push:
@@ -1095,8 +1097,49 @@ jobs:
           generate_release_notes: true
           files: {output_dir_name}/*   # Upload every generated file directly as a release asset
 """
-        with open(yaml_path, 'w', encoding='utf-8') as f:
-            f.write(yaml_content)
+        with open(github_yaml_path, 'w', encoding='utf-8') as f:
+            f.write(github_yaml_content)
+
+        # 2. Gitea Actions Release Workflow
+        os.makedirs(gitea_dir, exist_ok=True)
+        gitea_yaml_path = os.path.join(gitea_dir, "release.yml")
+        
+        gitea_yaml_content = f"""name: Manufacturing Release (Gitea)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: https://github.com/actions/checkout@v4
+
+      - name: Run KiForge
+        uses: https://github.com/alphaseneca/kiforge@v0.1.0
+        with:
+          project_path: '.'
+          output_dir: '{output_dir_name}'
+          export_3d: '{'true' if options.get('export_3d', True) else 'false'}'
+          export_svg: '{'true' if options.get('export_svg', True) else 'false'}'
+          export_bom: '{'true' if options.get('export_bom', True) else 'false'}'
+          export_sch_pdf: '{'true' if options.get('export_sch_pdf', True) else 'false'}'
+          export_pos: '{'true' if options.get('export_pos', True) else 'false'}'
+          export_step: '{'true' if options.get('export_step', True) else 'false'}'
+          export_gerbers: '{'true' if options.get('export_gerbers', True) else 'false'}'
+          export_drills: '{'true' if options.get('export_drills', True) else 'false'}'
+          export_ibom: '{'true' if options.get('export_ibom', True) else 'false'}'
+
+      - name: Create Release and Upload Assets
+        uses: https://gitea.com/actions/release-action@v1
+        with:
+          files: {output_dir_name}/*
+"""
+        with open(gitea_yaml_path, 'w', encoding='utf-8') as f:
+            f.write(gitea_yaml_content)
             
         # Update .gitignore
         gitignore_path = os.path.join(project_dir, ".gitignore")
@@ -1119,7 +1162,11 @@ jobs:
                 f.write(f"# KiForge output directory\n{entry}\n")
             gitignore_updated = True
             
-        msg = f"GitHub Actions workflow generated successfully at:\n{yaml_path}"
+        msg = (
+            f"CI workflows generated successfully:\n"
+            f"  - GitHub: .github/workflows/release.yml\n"
+            f"  - Gitea: .gitea/workflows/release.yml"
+        )
         if gitignore_updated:
             msg += f"\n\nAnd output folder '{entry}' appended to .gitignore."
         else:

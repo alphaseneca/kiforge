@@ -110,7 +110,7 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertEqual(context.rotation_offsets.get("U1"), 180.0)
 
     def test_ci_generation(self):
-        """Verify centralized CI file generation creates correct workflow file and .gitignore entry."""
+        """Verify centralized CI file generation creates correct workflow files and .gitignore entry."""
         import tempfile
         import shutil
         
@@ -125,13 +125,22 @@ class TestKiForgeCLI(unittest.TestCase):
             msg, success = kiforge.generate_ci_files(temp_dir, "kiforge_test_ci", options)
             self.assertTrue(success)
             
-            # Check workflow file
-            workflow_path = os.path.join(temp_dir, ".github", "workflows", "release.yml")
-            self.assertTrue(os.path.isfile(workflow_path))
-            with open(workflow_path, 'r', encoding='utf-8') as f:
+            # Check GitHub workflow file
+            github_workflow_path = os.path.join(temp_dir, ".github", "workflows", "release.yml")
+            self.assertTrue(os.path.isfile(github_workflow_path))
+            with open(github_workflow_path, 'r', encoding='utf-8') as f:
                 content = f.read()
                 self.assertIn("output_dir: 'kiforge_test_ci'", content)
                 self.assertIn("export_3d: 'false'", content)
+
+            # Check Gitea workflow file
+            gitea_workflow_path = os.path.join(temp_dir, ".gitea", "workflows", "release.yml")
+            self.assertTrue(os.path.isfile(gitea_workflow_path))
+            with open(gitea_workflow_path, 'r', encoding='utf-8') as f:
+                gitea_content = f.read()
+                self.assertIn("output_dir: 'kiforge_test_ci'", gitea_content)
+                self.assertIn("export_3d: 'false'", gitea_content)
+                self.assertIn("release-action@v1", gitea_content)
                 
             # Check gitignore
             with open(gitignore_path, 'r', encoding='utf-8') as f:
