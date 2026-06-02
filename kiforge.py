@@ -319,7 +319,7 @@ class ExportContext:
             self.pcb_name = os.path.splitext(os.path.basename(self.pcb_file))[0]
             self.project_dir = os.path.dirname(self.pcb_file)
 
-        # Locate schematic file
+        # Locate schematic file based on the base project name (before appending version tag)
         sch_name = f"{self.pcb_name}.kicad_sch"
         potential_sch = os.path.join(self.project_dir, sch_name)
         if os.path.isfile(potential_sch):
@@ -333,6 +333,48 @@ class ExportContext:
                         break
                 if self.sch_file:
                     break
+
+        # Resolve version from options or environment variable
+        version = self.options.get("version")
+        if not version:
+            ref_type = os.environ.get("GITHUB_REF_TYPE", "")
+            if ref_type == "tag" or not ref_type:
+                version = os.environ.get("GITHUB_REF_NAME")
+        if not version:
+            version = os.environ.get("VERSION")
+
+        # Fallback: Extract version (revision) from schematic or board file title block
+        if not version:
+            def _extract_rev(file_path):
+                if not file_path or not os.path.isfile(file_path):
+                    return None
+                try:
+                    import re
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if "(rev " in line:
+                                match = re.search(r'\(rev\s+"?([^")\s]+)"?\)', line)
+                                if match:
+                                    rev_val = match.group(1).strip()
+                                    if rev_val and rev_val.lower() not in ["rev", "revision"]:
+                                        return rev_val
+                except Exception:
+                    pass
+                return None
+
+            version = _extract_rev(self.sch_file)
+            if not version:
+                version = _extract_rev(self.pcb_file)
+            
+        if version:
+            version_str = version.strip()
+            if "/" in version_str:
+                version_str = version_str.split("/")[-1]
+            if version_str:
+                # If version starts with a digit (e.g. "1.0.0"), prepend "v" for a clean "vX.X.X" format
+                if version_str[0].isdigit():
+                    version_str = f"v{version_str}"
+                self.pcb_name = f"{self.pcb_name}_{version_str}"
 
         # Resolve output directories
         if os.path.isabs(self.output_dir_name):
@@ -812,7 +854,47 @@ class InteractiveBomTask(ExportTask):
                 "--dest-dir", context.output_dir,
                 context.pcb_file
             ]
-            return self._run_subprocess(ibom_cmd, context)
+            success = self._run_subprocess(ibom_cmd, context)
+            if success:
+                # Rename default output (ibom.html) to include the versioned board name
+                default_ibom = os.path.join(context.output_dir, "ibom.html")
+                target_ibom = os.path.join(context.output_dir, f"{context.pcb_name}_ibom.html")
+                if os.path.exists(default_ibom):
+                    try:
+                        shutil.move(default_ibom, target_ibom)
+                        context.logger.info(f"Renamed InteractiveHtmlBom output to {os.path.basename(target_ibom)}")
+                        
+                        # Update the HTML title of the generated page to match the versioned board name
+                        with open(target_ibom, 'r', encoding='utf-8') as html_f:
+                            html_content = html_f.read()
+                        
+                        import re
+                        new_content = re.sub(
+                            r'<title>.*?</title>',
+                            f'<title>{context.pcb_name}</title>',
+                            html_content,
+                            flags=re.IGNORECASE
+                        )
+                        
+                        # Override pcbdata.metadata.title in JavaScript so it updates inside the page header too
+                        override_script = (
+                            f"\n<script type=\"text/javascript\">\n"
+                            f"  if (typeof pcbdata !== 'undefined' && pcbdata && pcbdata.metadata) {{\n"
+                            f"    pcbdata.metadata.title = \"{context.pcb_name}\";\n"
+                            f"  }}\n"
+                            f"</script>\n"
+                        )
+                        if "</body>" in new_content:
+                            new_content = new_content.replace("</body>", f"{override_script}</body>")
+                        else:
+                            new_content += override_script
+                        
+                        with open(target_ibom, 'w', encoding='utf-8') as html_f:
+                            html_f.write(new_content)
+                        context.logger.info("Updated InteractiveHtmlBom HTML page title and metadata header.")
+                    except Exception as ibom_post_err:
+                        context.logger.warning(f"Failed during InteractiveHtmlBom post-processing: {ibom_post_err}")
+            return success
         else:
             context.logger.warning("Interactive HTML BOM (iBOM) is not installed and pip installation failed. Skipping iBOM export.")
             return True
@@ -1085,6 +1167,7 @@ def parse_cli_args(args=None):
     parser.add_argument("--export-gerbers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--export-drills", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--export-ibom", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--version-tag", "--version_tag", dest="version_tag", default=None, help="Version tag to append to output filenames")
     parser.add_argument("--generate-ci", action="store_true", help="Generate GitHub Actions release workflow and update .gitignore instead of exporting")
     return parser.parse_args(args)
 
@@ -1103,7 +1186,8 @@ if __name__ == "__main__":
             "export_step": args.export_step,
             "export_gerbers": args.export_gerbers,
             "export_drills": args.export_drills,
-            "export_ibom": args.export_ibom
+            "export_ibom": args.export_ibom,
+            "version": args.version_tag
         }
         msg, success = generate_ci_files(args.project_path, args.output_dir, options)
         print(msg)
@@ -1119,7 +1203,8 @@ if __name__ == "__main__":
             "export_step": args.export_step,
             "export_gerbers": args.export_gerbers,
             "export_drills": args.export_drills,
-            "export_ibom": args.export_ibom
+            "export_ibom": args.export_ibom,
+            "version": args.version_tag
         }
         
         context = ExportContext(args.project_path, args.output_dir, options)

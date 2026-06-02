@@ -50,6 +50,10 @@ inputs:
     description: 'Export Interactive HTML BOM (true/false)'
     required: false
     default: 'true'
+  version:
+    description: 'Version tag to append to filenames'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -70,6 +74,7 @@ runs:
         if [ "${{ inputs.export_gerbers }}" = "false" ]; then ARGS+=("--no-export-gerbers"); fi
         if [ "${{ inputs.export_drills }}" = "false" ]; then ARGS+=("--no-export-drills"); fi
         if [ "${{ inputs.export_ibom }}" = "false" ]; then ARGS+=("--no-export-ibom"); fi
+        if [ -n "${{ inputs.version }}" ]; then ARGS+=("--version-tag" "${{ inputs.version }}"); fi
         
         echo "Building KiForge Docker image..."
         docker build -t kiforge:latest "${{ github.action_path }}"
@@ -77,6 +82,9 @@ runs:
         echo "Running KiForge Exporter..."
         docker run --rm \
           --user root \
+          -e GITHUB_REF_NAME \
+          -e GITHUB_REF_TYPE \
+          -e VERSION \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           kiforge:latest \

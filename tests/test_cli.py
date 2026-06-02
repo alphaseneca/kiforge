@@ -140,5 +140,48 @@ class TestKiForgeCLI(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir)
 
+    def test_version_tag_resolution(self):
+        """Verify version resolution and normalization from environment, options, and file extraction."""
+        import tempfile
+        import shutil
+        
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # Create a dummy pcb and sch file
+            pcb_path = os.path.join(temp_dir, "myboard.kicad_pcb")
+            sch_path = os.path.join(temp_dir, "myboard.kicad_sch")
+            
+            with open(pcb_path, "w", encoding="utf-8") as f:
+                f.write('(title_block (rev "1.2.3-pcb"))\n')
+            with open(sch_path, "w", encoding="utf-8") as f:
+                f.write('(title_block (rev "1.2.3-sch"))\n')
+                
+            # Case 1: Option version takes priority and normalizes (prepends 'v' if digit)
+            options = {"version": "9.9.9"}
+            context = kiforge.ExportContext(temp_dir, "out", options)
+            # Mock setup_logger to prevent log folder generation
+            original_setup_logger = kiforge.setup_logger
+            kiforge.setup_logger = lambda dir: None
+            try:
+                self.assertTrue(context.resolve())
+            finally:
+                kiforge.setup_logger = original_setup_logger
+            self.assertEqual(context.pcb_name, "myboard_v9.9.9")
+            
+            # Case 2: Extract revision from schematic file
+            options = {}
+            context = kiforge.ExportContext(temp_dir, "out", options)
+            original_setup_logger = kiforge.setup_logger
+            kiforge.setup_logger = lambda dir: None
+            try:
+                self.assertTrue(context.resolve())
+            finally:
+                kiforge.setup_logger = original_setup_logger
+            # Should read "1.2.3-sch" and normalize to "v1.2.3-sch"
+            self.assertEqual(context.pcb_name, "myboard_v1.2.3-sch")
+            
+        finally:
+            shutil.rmtree(temp_dir)
+
 if __name__ == '__main__':
     unittest.main()
