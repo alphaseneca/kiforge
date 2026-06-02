@@ -65,6 +65,8 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `export_svg` | Export front & back copper layer SVGs | `'true'` |
 | `export_ibom` | Export Interactive HTML BOM | `'true'` |
 
+> **Version tagging:** All output filenames are versioned automatically from the Git tag (e.g. `myboard_v1.0.0_gerbers.zip`). No extra configuration required — KiForge reads `GITHUB_REF_NAME` from the GitHub Actions environment.
+
 ---
 
 ## Output Files
@@ -84,7 +86,7 @@ KiForge writes all files into `output_dir/` on the GitHub Actions runner — not
 | `<name>_3d_back.png` | 3D back render | `export_3d` |
 | `<name>_front.svg` | Front copper layer SVG | `export_svg` |
 | `<name>_back.svg` | Back copper layer SVG | `export_svg` |
-| `ibom.html` | Interactive HTML BOM | `export_ibom` |
+| `<name>_ibom.html` | Interactive HTML BOM | `export_ibom` |
 
 ---
 
