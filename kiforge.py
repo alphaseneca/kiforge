@@ -165,22 +165,16 @@ class PathResolver:
     @staticmethod
     def get_kicad_python_path() -> str:
         """Resolves the python interpreter associated with KiCad (which has pcbnew)."""
-        current_exe = sys.executable
-        base_name = os.path.basename(current_exe).lower()
-        if "python" in base_name:
-            return current_exe
+        try:
+            import pcbnew
+            return sys.executable
+        except ImportError:
+            pass
 
         if sys.platform == 'win32':
             candidates = ['kicad-python.exe', 'python.exe', 'pythonw.exe']
         else:
             candidates = ['kicad-python', 'python3', 'python']
-
-        # 1. Try to find relative to current running executable (e.g. if we are running in KiCad GUI)
-        exe_dir = os.path.dirname(current_exe)
-        for name in candidates:
-            path = os.path.join(exe_dir, name)
-            if os.path.isfile(path) and os.access(path, os.X_OK):
-                return path
 
         # 2. Try to find relative to resolved kicad-cli path
         kicad_cli = PathResolver.get_kicad_cli_path()

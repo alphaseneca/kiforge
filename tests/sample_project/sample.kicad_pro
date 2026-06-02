@@ -312,7 +312,12 @@
     "legacy_lib_list": [],
     "top_level_sheets": []
   },
-  "sheets": [],
+  "sheets": [
+    [
+      "d0a79058-2c70-4d40-b4b1-8b01c3411b0e",
+      "Root"
+    ]
+  ],
   "text_variables": {},
   "tuning_profiles": {
     "meta": {
