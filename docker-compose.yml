@@ -1,11 +1,11 @@
 services:
   export:
-    image: kicad/kicad:10.0
+    build: .
     user: root
     volumes:
       - .:/workspace
     working_dir: /workspace
-    entrypoint: ["/bin/bash", "./kiforge.sh"]
+    entrypoint: ["/bin/bash", "/action/kiforge.sh"]
     command: [
       "--project-path", "tests/sample_project",
       "--output-dir", "kiforge"

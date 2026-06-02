@@ -71,12 +71,15 @@ runs:
         if [ "${{ inputs.export_drills }}" = "false" ]; then ARGS+=("--no-export-drills"); fi
         if [ "${{ inputs.export_ibom }}" = "false" ]; then ARGS+=("--no-export-ibom"); fi
         
+        echo "Building KiForge Docker image..."
+        docker build -t kiforge:latest "${{ github.action_path }}"
+
+        echo "Running KiForge Exporter..."
         docker run --rm \
           --user root \
           -v "${{ github.workspace }}:/workspace" \
-          -v "${{ github.action_path }}:/action" \
           -w /workspace \
-          kicad/kicad:10.0 \
+          kiforge:latest \
           /bin/bash /action/kiforge.sh "${ARGS[@]}"
           
         # Restore host user ownership on the output folder
