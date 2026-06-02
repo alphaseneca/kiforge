@@ -27,7 +27,20 @@ except ImportError:
 logger = logging.getLogger("KiForge.Studio")
 
 class KiForgeStudioSettingsDialog(wx.Dialog):
+    """
+    Settings dialog interface for KiForge Studio.
+    Provides graphical configuration for project path resolution, output options,
+    defaults storage (.kiforge.json), and GitHub Actions CI workflow generation.
+    """
+    
     def __init__(self, parent, project_dir=None):
+        """
+        Initializes the settings dialog window.
+        
+        Args:
+            parent: The parent wxWindow or None if running standalone.
+            project_dir (str, optional): Pre-resolved project root folder.
+        """
         super(KiForgeStudioSettingsDialog, self).__init__(
             parent, 
             title="KiForge Studio - Exporter Settings", 
@@ -41,6 +54,16 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.Center()
 
     def load_settings(self, project_dir):
+        """
+        Loads configuration settings from the project's .kiforge.json file.
+        Falls back to default configurations if the file does not exist or fails to parse.
+        
+        Args:
+            project_dir (str): The project root directory to inspect.
+            
+        Returns:
+            dict: The dictionary of loaded or default configuration options.
+        """
         defaults = {
             'output_dir': 'kiforge',
             'export_gerbers': True,
@@ -72,6 +95,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return defaults
 
     def init_ui(self):
+        """Builds and lays out the wxPython user interface components, panels, and controls."""
         main_sizer = wx.BoxSizer(wx.VERTICAL)
         
         # 1. Header Banner
@@ -193,6 +217,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.SetSizerAndFit(main_sizer)
 
     def update_ui_from_settings(self):
+        """Updates the dialog checkboxes and text values to reflect self.settings contents."""
         self.chk_gerbers.SetValue(self.settings.get('export_gerbers', True))
         self.chk_drills.SetValue(self.settings.get('export_drills', True))
         self.chk_pos.SetValue(self.settings.get('export_pos', True))
@@ -205,6 +230,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.txt_output_dir.SetValue(self.settings.get('output_dir', 'kiforge'))
 
     def on_browse(self, event):
+        """Triggered by the 'Browse...' button to select a project root directory."""
         default_dir = self.txt_project_dir.GetValue()
         if not default_dir or not os.path.isdir(default_dir):
             default_dir = os.path.expanduser("~")
@@ -220,6 +246,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         dlg.Destroy()
 
     def on_save_defaults(self, event):
+        """Saves current GUI checkbox and directory selections into a project-local .kiforge.json file."""
         project_dir = self.txt_project_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir):
             wx.MessageBox("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
@@ -248,6 +275,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             wx.MessageBox(f"Failed to save settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
 
     def on_generate_ci(self, event):
+        """Generates the GitHub Actions release workflow YAML and updates .gitignore based on current GUI selections."""
         project_dir = self.txt_project_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir):
             wx.MessageBox("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
@@ -277,6 +305,10 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             wx.MessageBox(msg, "Error", wx.OK | wx.ICON_ERROR)
 
     def on_run_export(self, event):
+        """
+        Runs the KiForge export pipeline in a background worker thread.
+        Monitors progress on the main thread and displays a modal cancelable ProgressDialog.
+        """
         project_dir = self.txt_project_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir):
             wx.MessageBox("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
@@ -381,6 +413,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.EndModal(wx.ID_OK)
 
     def on_close(self, event):
+        """Triggered when the close button is clicked, cancelling dialog and closing."""
         self.EndModal(wx.ID_CANCEL)
 
 
@@ -389,7 +422,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
 _PluginBase = pcbnew.ActionPlugin if has_pcbnew else object
 
 class ExporterPlugin(_PluginBase):
+    """
+    ActionPlugin interface implementation that registers KiForge inside the KiCad PCB Editor.
+    Extends pcbnew.ActionPlugin when running inside KiCad.
+    """
+    
     def defaults(self):
+        """Sets the default name, category, description, and icon paths for KiCad plugin manager registration."""
         self.name = "KiForge"
         self.category = "Manufacturing"
         self.description = "KiForge Studio - Export Gerbers, Drills, BOM, CPL, STEP, 3D renders, SVGs, and PDFs."
@@ -397,6 +436,11 @@ class ExporterPlugin(_PluginBase):
         self.icon_file_name = os.path.join(os.path.dirname(__file__), "icon.png")
 
     def Run(self):
+        """
+        Executes the KiForge ActionPlugin when clicked inside the KiCad PCB Editor.
+        Attempts to resolve the active project path from the pcbnew Board instance
+        and presents the Settings GUI.
+        """
         kiforge.setup_logger()
         logger.info("KiForge Studio action plugin invoked.")
 
@@ -434,7 +478,10 @@ class ExporterPlugin(_PluginBase):
 
 # Standalone application execution context
 def run_standalone():
-    """Allows running the KiForge Studio GUI directly as a standalone wx application"""
+    """
+    Allows running the KiForge Studio GUI directly as a standalone wx application
+    outside the KiCad interface.
+    """
     kiforge.setup_logger()
     
     app = wx.App(False)
