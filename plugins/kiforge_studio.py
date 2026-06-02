@@ -384,50 +384,52 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.EndModal(wx.ID_CANCEL)
 
 
-# PCBnew Action Plugin wrapper class
-if has_pcbnew:
-    class ExporterPlugin(pcbnew.ActionPlugin):
-        def defaults(self):
-            self.name = "KiForge"
-            self.category = "Manufacturing"
-            self.description = "KiForge Studio - Export Gerbers, Drills, BOM, CPL, STEP, 3D renders, SVGs, and PDFs."
-            self.show_toolbar_button = True
-            self.icon_file_name = os.path.join(os.path.dirname(__file__), "icon.png")
+# Use ActionPlugin as base when running inside KiCad, plain object otherwise.
+# This allows the class to always be defined and importable in standalone/test contexts.
+_PluginBase = pcbnew.ActionPlugin if has_pcbnew else object
 
-        def Run(self):
-            kiforge.setup_logger()
-            logger.info("KiForge Studio action plugin invoked.")
+class ExporterPlugin(_PluginBase):
+    def defaults(self):
+        self.name = "KiForge"
+        self.category = "Manufacturing"
+        self.description = "KiForge Studio - Export Gerbers, Drills, BOM, CPL, STEP, 3D renders, SVGs, and PDFs."
+        self.show_toolbar_button = True
+        self.icon_file_name = os.path.join(os.path.dirname(__file__), "icon.png")
 
-            project_dir = None
-            try:
-                board = pcbnew.GetBoard()
-                if board:
-                    board_file = board.GetFileName()
-                    if board_file and board_file.endswith(".kicad_pcb"):
-                        pro_file = board_file.replace(".kicad_pcb", ".kicad_pro")
-                        if os.path.isfile(pro_file):
-                            project_dir = os.path.dirname(pro_file)
-                        else:
-                            temp_dir = os.path.dirname(board_file)
-                            pro_files = [f for f in os.listdir(temp_dir) if f.endswith(".kicad_pro")]
-                            if pro_files:
-                                project_dir = temp_dir
-            except Exception as e:
-                logger.debug(f"Failed to resolve board filename from pcbnew context: {e}")
+    def Run(self):
+        kiforge.setup_logger()
+        logger.info("KiForge Studio action plugin invoked.")
 
-            if not project_dir:
-                cwd = os.getcwd()
-                pro_files = [f for f in os.listdir(cwd) if f.endswith(".kicad_pro")]
-                if pro_files:
-                    project_dir = cwd
+        project_dir = None
+        try:
+            board = pcbnew.GetBoard()
+            if board:
+                board_file = board.GetFileName()
+                if board_file and board_file.endswith(".kicad_pcb"):
+                    pro_file = board_file.replace(".kicad_pcb", ".kicad_pro")
+                    if os.path.isfile(pro_file):
+                        project_dir = os.path.dirname(pro_file)
+                    else:
+                        temp_dir = os.path.dirname(board_file)
+                        pro_files = [f for f in os.listdir(temp_dir) if f.endswith(".kicad_pro")]
+                        if pro_files:
+                            project_dir = temp_dir
+        except Exception as e:
+            logger.debug(f"Failed to resolve board filename from pcbnew context: {e}")
 
-            parent_window = None
-            app = wx.GetApp()
-            if app and hasattr(app, "GetTopWindow"):
-                parent_window = app.GetTopWindow()
-            dialog = KiForgeStudioSettingsDialog(parent_window, project_dir)
-            dialog.ShowModal()
-            dialog.Destroy()
+        if not project_dir:
+            cwd = os.getcwd()
+            pro_files = [f for f in os.listdir(cwd) if f.endswith(".kicad_pro")]
+            if pro_files:
+                project_dir = cwd
+
+        parent_window = None
+        app = wx.GetApp()
+        if app and hasattr(app, "GetTopWindow"):
+            parent_window = app.GetTopWindow()
+        dialog = KiForgeStudioSettingsDialog(parent_window, project_dir)
+        dialog.ShowModal()
+        dialog.Destroy()
 
 
 # Standalone application execution context
@@ -446,12 +448,6 @@ def run_standalone():
     dialog = KiForgeStudioSettingsDialog(None, project_dir)
     dialog.ShowModal()
     dialog.Destroy()
-
-
-# Register ActionPlugin within KiCad ONLY if running inside the KiCad GUI application context.
-# This prevents C++ assertions (PgmOrNull failed in register_action) in standalone/CLI environments.
-if wx.GetApp() is not None:
-    ExporterPlugin().register()
 
 
 # Direct script run entrypoint
