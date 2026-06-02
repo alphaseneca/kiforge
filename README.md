@@ -5,9 +5,10 @@
 ### Automated manufacturing & documentation exporter for KiCad 10
 
 [![Test Action](https://github.com/alphaseneca/kiforge/actions/workflows/test-action.yml/badge.svg)](https://github.com/alphaseneca/kiforge/actions/workflows/test-action.yml)
-[![Release](https://github.com/alphaseneca/kiforge/actions/workflows/release.yml/badge.svg)](https://github.com/alphaseneca/kiforge/actions/workflows/release.yml)
+[![Latest Release](https://img.shields.io/github/v/release/alphaseneca/kiforge?label=release&color=brightgreen)](https://github.com/alphaseneca/kiforge/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![KiCad 10](https://img.shields.io/badge/KiCad-10.0-blue?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTEyIDJDNi40NzcgMiAyIDYuNDc3IDIgMTJzNC40NzcgMTAgMTAgMTAgMTAtNC40NzcgMTAtMTBTMTcuNTIzIDIgMTIgMnoiLz48L3N2Zz4=)](https://www.kicad.org/)
+[![GitHub Stars](https://img.shields.io/github/stars/alphaseneca/kiforge?style=flat)](https://github.com/alphaseneca/kiforge/stargazers)
+[![KiCad 10](https://img.shields.io/badge/KiCad-10.0-blue)](https://www.kicad.org/)
 
 **KiForge** generates all files needed to order and document your PCB — from Gerbers and BOMs to 3D renders and Interactive HTML BOMs — in a single run. Use it as a KiCad GUI plugin, a reusable GitHub Action, or a plain CLI script.
 
