@@ -1,6 +1,7 @@
 services:
   export:
     image: kicad/kicad:10.0
+    user: root
     volumes:
       - .:/workspace
     working_dir: /workspace

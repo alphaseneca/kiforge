@@ -72,8 +72,15 @@ runs:
         if [ "${{ inputs.export_ibom }}" = "false" ]; then ARGS+=("--no-export-ibom"); fi
         
         docker run --rm \
+          --user root \
           -v "${{ github.workspace }}:/workspace" \
           -v "${{ github.action_path }}:/action" \
           -w /workspace \
           kicad/kicad:10.0 \
           /bin/bash /action/kiforge.sh "${ARGS[@]}"
+          
+        # Restore host user ownership on the output folder
+        # This prevents permission issues in subsequent workflow steps
+        if [ -d "${{ inputs.project_path }}/${{ inputs.output_dir }}" ]; then
+          sudo chown -R $(id -u):$(id -g) "${{ inputs.project_path }}/${{ inputs.output_dir }}"
+        fi
