@@ -214,7 +214,7 @@ def _generate_pcm_repository_files(meta: dict):
         },
         "name": "KiForge Custom PCM Repository",
         "packages": {
-            "url": f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/packages.json",
+            "url": f"https://github.com/{GITHUB_REPO}/releases/latest/download/packages.json",
             "sha256": packages_sha256
         }
     }

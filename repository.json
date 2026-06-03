@@ -8,7 +8,7 @@
     },
     "name": "KiForge Custom PCM Repository",
     "packages": {
-        "url": "https://raw.githubusercontent.com/alphaseneca/kiforge/main/packages.json",
-        "sha256": "9c17ac8f99171ea76113f63d1979caa237522612f1bcd4580b6a90efcaa4e2fa"
+        "url": "https://github.com/alphaseneca/kiforge/releases/latest/download/packages.json",
+        "sha256": "8407119f253203327fcba6674f981fd474db21fcf4e74a93c04ee95179cdb177"
     }
 }
