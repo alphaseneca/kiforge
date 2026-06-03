@@ -1145,23 +1145,61 @@ jobs:
             
         # Update .gitignore
         gitignore_path = os.path.join(project_dir, ".gitignore")
-        entry = f"{output_dir_name}/"
         gitignore_updated = False
+        
+        target_ignores = [
+            f"{output_dir_name}/",
+            "*.lck",
+            "*.tmp",
+            "fp-info-cache",
+            "_autosave-*",
+            "*.bak",
+            "*-backups/",
+            "*.kicad_pcb-bak",
+            "*.kicad_sch-bak",
+            ".history/",
+        ]
         
         if os.path.exists(gitignore_path):
             with open(gitignore_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
             lines = [line.strip() for line in content.splitlines()]
-            if entry not in lines and f"/{entry}" not in lines and f"./{entry}" not in lines:
+            missing = []
+            for item in target_ignores:
+                if item not in lines and f"/{item}" not in lines and f"./{item}" not in lines:
+                    missing.append(item)
+                    
+            if missing:
                 with open(gitignore_path, 'a', encoding='utf-8') as f:
                     if not content.endswith("\n"):
                         f.write("\n")
-                    f.write(f"\n# KiForge output directory\n{entry}\n")
+                    f.write("\n# KiCad & KiForge patterns added by KiForge\n")
+                    for item in missing:
+                        f.write(f"{item}\n")
                 gitignore_updated = True
         else:
+            default_ignores = [
+                "# KiForge output directory",
+                f"{output_dir_name}/",
+                "",
+                "# KiCad temporary and lock files",
+                "*.lck",
+                "*.tmp",
+                "fp-info-cache",
+                "_autosave-*",
+                "",
+                "# KiCad backup files",
+                "*.bak",
+                "*-backups/",
+                "*.kicad_pcb-bak",
+                "*.kicad_sch-bak",
+                "",
+                "# KiCad 10 Local History / Auto-backups",
+                ".history/",
+            ]
             with open(gitignore_path, 'w', encoding='utf-8') as f:
-                f.write(f"# KiForge output directory\n{entry}\n")
+                f.write("\n".join(default_ignores) + "\n")
             gitignore_updated = True
             
         msg = (
@@ -1170,9 +1208,9 @@ jobs:
             f"  - Gitea: .gitea/workflows/release.yml"
         )
         if gitignore_updated:
-            msg += f"\n\nAnd output folder '{entry}' appended to .gitignore."
+            msg += f"\n\nAnd KiCad & KiForge ignore patterns added/updated in .gitignore."
         else:
-            msg += f"\n\nOutput folder '{entry}' was already ignored in .gitignore."
+            msg += f"\n\nAll KiCad & KiForge patterns were already ignored in .gitignore."
         return msg, True
     except Exception as e:
         return f"Failed to generate CI files: {e}", False
