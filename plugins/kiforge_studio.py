@@ -184,9 +184,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         ci_box = wx.StaticBox(self, label="CI/CD Release Integration")
         ci_sizer = wx.StaticBoxSizer(ci_box, wx.VERTICAL)
         
-        lbl_ci_desc = wx.StaticText(ci_box, label="Generate GitHub Actions release workflow matching selections.")
+        lbl_ci_desc = wx.StaticText(ci_box, label="Generate GitHub & Gitea Actions release workflows matching selections.")
         lbl_ci_desc.SetForegroundColour(wx.Colour(100, 116, 139)) # Slate gray (#64748b)
-        btn_generate_ci = wx.Button(ci_box, label="Generate CI Files (.github/ & .gitignore)")
+        btn_generate_ci = wx.Button(ci_box, label="Generate CI Files (.github/ .gitea/ .gitignore)")
         btn_generate_ci.Bind(wx.EVT_BUTTON, self.on_generate_ci)
         
         ci_sizer.Add(lbl_ci_desc, 0, wx.ALL, 5)
