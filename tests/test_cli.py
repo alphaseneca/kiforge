@@ -140,7 +140,7 @@ class TestKiForgeCLI(unittest.TestCase):
                 gitea_content = f.read()
                 self.assertIn("output_dir: 'kiforge_test_ci'", gitea_content)
                 self.assertIn("export_3d: 'false'", gitea_content)
-                self.assertIn("release-action@v1", gitea_content)
+                self.assertIn("gitea-release-action@main", gitea_content)
                 
             # Check gitignore
             with open(gitignore_path, 'r', encoding='utf-8') as f:

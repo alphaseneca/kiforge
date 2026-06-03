@@ -1134,7 +1134,7 @@ jobs:
           export_ibom: '{'true' if options.get('export_ibom', True) else 'false'}'
 
       - name: Create Release and Upload Assets
-        uses: https://gitea.com/actions/release-action@v1
+        uses: https://gitea.com/actions/gitea-release-action@main
         with:
           files: {output_dir_name}/*
 """
