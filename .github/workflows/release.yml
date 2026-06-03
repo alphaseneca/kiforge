@@ -35,5 +35,6 @@ jobs:
             dist/com.github.alphaseneca.kiforge-${{ github.ref_name }}.zip
             packages.json
             repository.json
+            resources.zip
           overwrite: true
           overwrite_files: true

@@ -177,10 +177,11 @@ def _update_metadata(version: str, zip_name: str, sha256: str,
 
 
 def _generate_pcm_repository_files(meta: dict):
-    """Generate packages.json and repository.json for custom PCM hosting."""
+    """Generate packages.json, repository.json, and resources.zip for custom PCM hosting."""
     import time
     packages_path = Path("packages.json")
     repo_path = Path("repository.json")
+    resources_zip_path = Path("resources.zip")
     
     # 1. Generate packages.json
     packages_data = {
@@ -196,7 +197,21 @@ def _generate_pcm_repository_files(meta: dict):
     # Compute SHA-256 of packages.json
     packages_sha256 = _sha256(packages_path)
     
-    # 2. Generate repository.json
+    # 2. Generate resources.zip containing the package icon
+    print("Generating resources.zip...")
+    with zipfile.ZipFile(resources_zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        icon_path = Path("resources/icon.png")
+        if icon_path.exists():
+            # In the resources archive, the icon must be located at <package_identifier>/icon.png
+            zipf.write(icon_path, f"{meta['identifier']}/icon.png")
+            print(f"  Added icon: {icon_path} -> {meta['identifier']}/icon.png")
+        else:
+            print("  Warning: resources/icon.png not found!")
+            
+    # Compute SHA-256 of resources.zip
+    resources_sha256 = _sha256(resources_zip_path)
+    
+    # 3. Generate repository.json
     author_name = "Ukesh Aryal"
     author_url = "https://github.com/alphaseneca/kiforge"
     
@@ -205,6 +220,9 @@ def _generate_pcm_repository_files(meta: dict):
         if "contact" in meta["author"]:
             author_url = meta["author"]["contact"].get("web", meta["author"]["contact"].get("github", author_url))
             
+    update_timestamp = int(time.time())
+    update_time_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    
     repo_data = {
         "$schema": "https://gitlab.com/kicad/code/kicad/-/raw/master/kicad/pcm/schemas/pcm.v1.schema.json#/definitions/Repository",
         "maintainer": {
@@ -217,15 +235,21 @@ def _generate_pcm_repository_files(meta: dict):
         "packages": {
             "url": f"https://github.com/{GITHUB_REPO}/releases/latest/download/packages.json",
             "sha256": packages_sha256,
-            "update_timestamp": int(time.time()),
-            "update_time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+            "update_timestamp": update_timestamp,
+            "update_time_utc": update_time_utc
+        },
+        "resources": {
+            "url": f"https://github.com/{GITHUB_REPO}/releases/latest/download/resources.zip",
+            "sha256": resources_sha256,
+            "update_timestamp": update_timestamp,
+            "update_time_utc": update_time_utc
         }
     }
     
     with open(repo_path, "w", encoding="utf-8") as f:
         json.dump(repo_data, f, indent=4)
         f.write("\n")
-    print(f"repository.json generated/updated with packages.json SHA-256: {packages_sha256}")
+    print(f"repository.json generated/updated with packages.json SHA-256: {packages_sha256} and resources.zip SHA-256: {resources_sha256}")
 
 
 def clean_dist():

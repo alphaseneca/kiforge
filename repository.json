@@ -9,8 +9,14 @@
     "name": "KiForge Custom PCM Repository",
     "packages": {
         "url": "https://github.com/alphaseneca/kiforge/releases/latest/download/packages.json",
-        "sha256": "ac452bdbe77f6b55a653f57ab87969e9e6598d38be939c307bea1b0bc1f5c94d",
-        "update_timestamp": 1780469207,
-        "update_time_utc": "2026-06-03 06:46:47"
+        "sha256": "a8309a6abec0488b63ea0f5b24b6367d77e9199841d19a8dec0bdc99eec2f50f",
+        "update_timestamp": 1780470423,
+        "update_time_utc": "2026-06-03 07:07:03"
+    },
+    "resources": {
+        "url": "https://github.com/alphaseneca/kiforge/releases/latest/download/resources.zip",
+        "sha256": "42d0b143c034796a6d947b380c5e592556ce46bca928660392646cc4d4161efe",
+        "update_timestamp": 1780470423,
+        "update_time_utc": "2026-06-03 07:07:03"
     }
 }
