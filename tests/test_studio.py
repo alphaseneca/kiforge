@@ -76,8 +76,8 @@ class TestKiForgeStudio(unittest.TestCase):
         
         dialog.Destroy()
 
-    def test_ci_generation(self):
-        """Verify CI workflow and gitignore logic works correctly."""
+    def test_cd_generation(self):
+        """Verify CD workflow and gitignore logic works correctly."""
         # Create a mock .gitignore
         gitignore_path = os.path.join(self.test_dir, ".gitignore")
         with open(gitignore_path, 'w', encoding='utf-8') as f:
@@ -91,10 +91,10 @@ class TestKiForgeStudio(unittest.TestCase):
         dialog.chk_3d.SetValue(False)
         dialog.chk_bom.SetValue(True)
         
-        # Simulate CI generation trigger
+        # Simulate CD generation trigger
         class MockEvent:
             pass
-        dialog.on_generate_ci(MockEvent())
+        dialog.on_generate_cd(MockEvent())
         
         # Verify files are created
         workflow_path = os.path.join(self.test_dir, ".github", "workflows", "release.yml")
