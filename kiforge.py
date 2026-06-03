@@ -695,7 +695,17 @@ class Step3dExportTask(ExportTask):
             "-o", output_step,
             context.pcb_file
         ]
-        return self._run_subprocess(cmd, context)
+        try:
+            return self._run_subprocess(cmd, context)
+        except RuntimeError as e:
+            err_msg = str(e)
+            if "Cannot use VRML models" in err_msg or "non-mesh formats" in err_msg:
+                context.logger.warning(
+                    f"STEP export completed with warnings (some components only have VRML models and were skipped): {err_msg}"
+                )
+                return True
+            raise
+
 
 
 class Render3dExportTask(ExportTask):

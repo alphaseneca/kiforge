@@ -192,5 +192,34 @@ class TestKiForgeCLI(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir)
 
+    def test_step3d_export_task_vrml_warning(self):
+        """Verify that Step3dExportTask intercepts VRML model export errors, logs a warning, and returns True."""
+        task = kiforge.Step3dExportTask()
+        
+        # Create a mock ExportContext
+        options = {"export_step": True}
+        context = kiforge.ExportContext(".", "kiforge_out", options)
+        context.pcb_file = "dummy.kicad_pcb"
+        context.pcb_name = "dummy"
+        context.project_dir = "."
+        context.output_dir = "kiforge_out"
+        context.temp_gerber_dir = "kiforge_out/temp_gerbers"
+        
+        import logging
+        context.logger = logging.getLogger("kiforge_test_vrml")
+        
+        # Mock _run_subprocess to raise a RuntimeError with the VRML error message
+        def mock_run_subprocess(cmd, ctx):
+            raise RuntimeError("Command failed: pcb export step ...\n\nError:\nCannot use VRML models when exporting to non-mesh formats.")
+            
+        task._run_subprocess = mock_run_subprocess
+        
+        # This should log a warning and return True instead of raising an error/returning False
+        with self.assertLogs("kiforge_test_vrml", level="WARNING") as cm:
+            result = task.run(context)
+            self.assertTrue(result)
+            self.assertTrue(any("Cannot use VRML models" in log for log in cm.output))
+
+
 if __name__ == '__main__':
     unittest.main()
