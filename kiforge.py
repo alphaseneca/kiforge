@@ -1094,6 +1094,7 @@ jobs:
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{{{ github.ref_name }}}}
           generate_release_notes: true
           files: {output_dir_name}/*   # Upload every generated file directly as a release asset
 """
