@@ -1,0 +1,14 @@
+{
+    "$schema": "https://gitlab.com/kicad/code/kicad/-/raw/master/kicad/pcm/schemas/pcm.v1.schema.json#/definitions/Repository",
+    "maintainer": {
+        "name": "Ukesh Aryal",
+        "contact": {
+            "url": "https://ukesharyal.com.np"
+        }
+    },
+    "name": "KiForge Custom PCM Repository",
+    "packages": {
+        "url": "https://raw.githubusercontent.com/alphaseneca/kiforge/main/packages.json",
+        "sha256": "9c17ac8f99171ea76113f63d1979caa237522612f1bcd4580b6a90efcaa4e2fa"
+    }
+}

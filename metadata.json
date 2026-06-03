@@ -24,9 +24,9 @@
             "status": "stable",
             "kicad_version": "10.0",
             "download_url": "https://github.com/alphaseneca/kiforge/releases/download/v0.1.0/com.github.alphaseneca.kiforge-v0.1.0.zip",
-            "download_sha256": "d0d36965b0267c276e13dc97cb7a0eaa4f5eb5b0c082cc0b368ff7e37398c0cc",
-            "download_size": 24774,
-            "install_size": 83549
+            "download_sha256": "b5ed7496e8f9940a6b17eb1228db629e8dbf8c76bd59c3344d3f8a4b0272a3fe",
+            "download_size": 25089,
+            "install_size": 86098
         }
     ]
 }

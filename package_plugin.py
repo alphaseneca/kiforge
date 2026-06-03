@@ -172,6 +172,58 @@ def _update_metadata(version: str, zip_name: str, sha256: str,
     print(f"  download_size:  {download_size}")
     print(f"  install_size:   {install_size}")
 
+    # Generate custom PCM repository files packages.json and repository.json
+    _generate_pcm_repository_files(meta)
+
+
+def _generate_pcm_repository_files(meta: dict):
+    """Generate packages.json and repository.json for custom PCM hosting."""
+    packages_path = Path("packages.json")
+    repo_path = Path("repository.json")
+    
+    # 1. Generate packages.json
+    packages_data = {
+        "$schema": "https://go.kicad.org/pcm/schemas/v1",
+        "packages": [meta]
+    }
+    
+    with open(packages_path, "w", encoding="utf-8") as f:
+        json.dump(packages_data, f, indent=4)
+        f.write("\n")
+    print(f"\npackages.json generated/updated.")
+    
+    # Compute SHA-256 of packages.json
+    packages_sha256 = _sha256(packages_path)
+    
+    # 2. Generate repository.json
+    author_name = "Ukesh Aryal"
+    author_url = "https://github.com/alphaseneca/kiforge"
+    
+    if "author" in meta:
+        author_name = meta["author"].get("name", author_name)
+        if "contact" in meta["author"]:
+            author_url = meta["author"]["contact"].get("web", meta["author"]["contact"].get("github", author_url))
+            
+    repo_data = {
+        "$schema": "https://gitlab.com/kicad/code/kicad/-/raw/master/kicad/pcm/schemas/pcm.v1.schema.json#/definitions/Repository",
+        "maintainer": {
+            "name": author_name,
+            "contact": {
+                "url": author_url
+            }
+        },
+        "name": "KiForge Custom PCM Repository",
+        "packages": {
+            "url": f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/packages.json",
+            "sha256": packages_sha256
+        }
+    }
+    
+    with open(repo_path, "w", encoding="utf-8") as f:
+        json.dump(repo_data, f, indent=4)
+        f.write("\n")
+    print(f"repository.json generated/updated with packages.json SHA-256: {packages_sha256}")
+
 
 def clean_dist():
     """Clean the dist directory."""
