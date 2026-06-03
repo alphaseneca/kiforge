@@ -178,6 +178,7 @@ def _update_metadata(version: str, zip_name: str, sha256: str,
 
 def _generate_pcm_repository_files(meta: dict):
     """Generate packages.json and repository.json for custom PCM hosting."""
+    import time
     packages_path = Path("packages.json")
     repo_path = Path("repository.json")
     
@@ -215,7 +216,9 @@ def _generate_pcm_repository_files(meta: dict):
         "name": "KiForge Custom PCM Repository",
         "packages": {
             "url": f"https://github.com/{GITHUB_REPO}/releases/latest/download/packages.json",
-            "sha256": packages_sha256
+            "sha256": packages_sha256,
+            "update_timestamp": int(time.time()),
+            "update_time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         }
     }
     
