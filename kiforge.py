@@ -1135,8 +1135,9 @@ jobs:
           export_ibom: '{'true' if options.get('export_ibom', True) else 'false'}'
 
       - name: Create Release and Upload Assets
-        uses: https://gitea.com/actions/gitea-release-action@main
+        uses: https://github.com/softprops/action-gh-release@v2
         with:
+          tag_name: ${{{{ github.ref_name }}}}
           files: {output_dir_name}/*
 """
         with open(gitea_yaml_path, 'w', encoding='utf-8') as f:
