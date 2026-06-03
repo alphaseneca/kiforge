@@ -180,18 +180,18 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         output_sizer.Add(self.txt_output_dir, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
         content_sizer.Add(output_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
         
-        # 5. CI/CD Section
-        ci_box = wx.StaticBox(self, label="CI/CD Release Integration")
-        ci_sizer = wx.StaticBoxSizer(ci_box, wx.VERTICAL)
+        # 5. CD Section
+        cd_box = wx.StaticBox(self, label="CD Release Integration")
+        cd_sizer = wx.StaticBoxSizer(cd_box, wx.VERTICAL)
         
-        lbl_ci_desc = wx.StaticText(ci_box, label="Generate GitHub & Gitea Actions release workflows matching selections.")
-        lbl_ci_desc.SetForegroundColour(wx.Colour(100, 116, 139)) # Slate gray (#64748b)
-        btn_generate_ci = wx.Button(ci_box, label="Generate CI Files (.github/.gitea/.gitignore)")
-        btn_generate_ci.Bind(wx.EVT_BUTTON, self.on_generate_ci)
+        lbl_cd_desc = wx.StaticText(cd_box, label="Generate GitHub & Gitea Actions release CD workflows matching selections.")
+        lbl_cd_desc.SetForegroundColour(wx.Colour(100, 116, 139)) # Slate gray (#64748b)
+        btn_generate_cd = wx.Button(cd_box, label="Generate CD Files (.github/.gitea/.gitignore)")
+        btn_generate_cd.Bind(wx.EVT_BUTTON, self.on_generate_cd)
         
-        ci_sizer.Add(lbl_ci_desc, 0, wx.ALL, 5)
-        ci_sizer.Add(btn_generate_ci, 0, wx.ALL | wx.EXPAND, 5)
-        content_sizer.Add(ci_sizer, 0, wx.EXPAND | wx.BOTTOM, 15)
+        cd_sizer.Add(lbl_cd_desc, 0, wx.ALL, 5)
+        cd_sizer.Add(btn_generate_cd, 0, wx.ALL | wx.EXPAND, 5)
+        content_sizer.Add(cd_sizer, 0, wx.EXPAND | wx.BOTTOM, 15)
         
         # 6. Action buttons in Footer
         footer_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -274,8 +274,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         except Exception as e:
             wx.MessageBox(f"Failed to save settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
 
-    def on_generate_ci(self, event):
-        """Generates the GitHub Actions release workflow YAML and updates .gitignore based on current GUI selections."""
+    def on_generate_cd(self, event):
+        """Generates the GitHub & Gitea Actions release workflow YAML and updates .gitignore based on current GUI selections."""
         project_dir = self.txt_project_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir):
             wx.MessageBox("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
@@ -300,7 +300,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         
         msg, success = kiforge.generate_ci_files(project_dir, output_dir_name, options)
         if success:
-            wx.MessageBox(msg, "CI Files Generated", wx.OK | wx.ICON_INFORMATION)
+            wx.MessageBox(msg, "CD Files Generated", wx.OK | wx.ICON_INFORMATION)
         else:
             wx.MessageBox(msg, "Error", wx.OK | wx.ICON_ERROR)
 

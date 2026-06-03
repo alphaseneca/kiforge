@@ -1203,7 +1203,7 @@ jobs:
             gitignore_updated = True
             
         msg = (
-            f"CI workflows generated successfully:\n"
+            f"CD workflows generated successfully:\n"
             f"  - GitHub: .github/workflows/release.yml\n"
             f"  - Gitea: .gitea/workflows/release.yml"
         )
