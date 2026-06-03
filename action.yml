@@ -80,15 +80,62 @@ runs:
         docker build -t kiforge:latest "${{ github.action_path }}"
 
         echo "Running KiForge Exporter..."
-        docker run --rm \
-          --user root \
-          -e GITHUB_REF_NAME \
-          -e GITHUB_REF_TYPE \
-          -e VERSION \
-          -v "${{ github.workspace }}:/workspace" \
-          -w /workspace \
-          kiforge:latest \
-          /bin/bash /action/kiforge.sh "${ARGS[@]}"
+        
+        get_container_id() {
+          # 1. Try hostname
+          if [ -n "$(hostname)" ] && docker inspect "$(hostname)" &>/dev/null; then
+            echo "$(hostname)"
+            return 0
+          fi
+          
+          # 2. Try cgroup
+          if [ -f /proc/self/cgroup ]; then
+            local cid
+            cid=$(grep -o -E '[0-9a-f]{64}' /proc/self/cgroup 2>/dev/null | head -n 1)
+            if [ -n "$cid" ] && docker inspect "$cid" &>/dev/null; then
+              echo "$cid"
+              return 0
+            fi
+          fi
+          
+          # 3. Try mountinfo
+          if [ -f /proc/self/mountinfo ]; then
+            local cid
+            cid=$(grep -o -E '[0-9a-f]{64}' /proc/self/mountinfo 2>/dev/null | head -n 1)
+            if [ -n "$cid" ] && docker inspect "$cid" &>/dev/null; then
+              echo "$cid"
+              return 0
+            fi
+          fi
+          
+          return 1
+        }
+
+        CONTAINER_ID=$(get_container_id || true)
+
+        if [ -n "$CONTAINER_ID" ]; then
+          echo "Detected running inside a Docker container ($CONTAINER_ID). Using --volumes-from..."
+          docker run --rm \
+            --user root \
+            -e GITHUB_REF_NAME \
+            -e GITHUB_REF_TYPE \
+            -e VERSION \
+            --volumes-from "$CONTAINER_ID" \
+            -w "${{ github.workspace }}" \
+            kiforge:latest \
+            /bin/bash /action/kiforge.sh "${ARGS[@]}"
+        else
+          echo "Running on host or container ID not found. Using standard volume mount..."
+          docker run --rm \
+            --user root \
+            -e GITHUB_REF_NAME \
+            -e GITHUB_REF_TYPE \
+            -e VERSION \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            kiforge:latest \
+            /bin/bash /action/kiforge.sh "${ARGS[@]}"
+        fi
           
         # Restore host user ownership on the output folder
         # This prevents permission issues in subsequent workflow steps
