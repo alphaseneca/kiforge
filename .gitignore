@@ -10,3 +10,4 @@ tmp/
 .idea/
 .vscode/
 plugins/kiforge.py
+.DS_Store
