@@ -38,6 +38,7 @@ import sys
 import csv
 import zipfile
 import shutil
+import tempfile
 import subprocess
 import logging
 import site
@@ -168,7 +169,21 @@ class PathResolver:
         try:
             # pyrefly: ignore [missing-import]
             import pcbnew
-            return sys.executable
+            exe = sys.executable
+            # Inside the KiCad GUI, sys.executable is the 'kicad' app binary, not a
+            # Python interpreter — running '<kicad> -c ...' would launch the GUI and
+            # hang forever. Use it only if it is actually python; otherwise derive the
+            # real bundled interpreter from sys.prefix.
+            if exe and os.path.basename(exe).lower().startswith("python"):
+                return exe
+            for name in ("python3", "python"):
+                cand = os.path.join(sys.prefix, "bin", name)          # macOS/Linux
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    return cand
+                cand_win = os.path.join(sys.prefix, name + ".exe")    # Windows
+                if os.path.isfile(cand_win):
+                    return cand_win
+            # Fall through to the generic PATH / standard-dir search below.
         except ImportError:
             pass
 
@@ -200,6 +215,7 @@ class PathResolver:
                         return path
         elif sys.platform == 'darwin':
             paths = [
+                "/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3",
                 "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-python",
                 "/Applications/KiCad/KiCad.app/Contents/MacOS/python3",
                 "/Applications/KiCad/KiCad.app/Contents/MacOS/python",
@@ -860,12 +876,27 @@ class InteractiveBomTask(ExportTask):
                 ibom_run_cmd = ["generate_interactive_bom"]
 
         if ibom_available:
+            # InteractiveHtmlBom loads the .kicad_pcb through pcbnew, which trips KiCad's
+            # "project already open" lock warning when the board is currently open in the
+            # PCB Editor. Run against a temporary copy so the original board file (and its
+            # lock) is never touched.
+            ibom_temp_dir = tempfile.mkdtemp(prefix="kiforge_ibom_")
+            ibom_input = os.path.join(ibom_temp_dir, os.path.basename(context.pcb_file))
+            try:
+                shutil.copy2(context.pcb_file, ibom_input)
+            except Exception as copy_err:
+                context.logger.warning(f"Could not stage temporary board copy for iBOM ({copy_err}); using original board file.")
+                ibom_input = context.pcb_file
+
             ibom_cmd = ibom_run_cmd + [
                 "--no-browser",
                 "--dest-dir", context.output_dir,
-                context.pcb_file
+                ibom_input
             ]
-            success = self._run_subprocess(ibom_cmd, context)
+            try:
+                success = self._run_subprocess(ibom_cmd, context)
+            finally:
+                shutil.rmtree(ibom_temp_dir, ignore_errors=True)
             if success:
                 # Rename default output (ibom.html) to include the versioned board name
                 default_ibom = os.path.join(context.output_dir, "ibom.html")
