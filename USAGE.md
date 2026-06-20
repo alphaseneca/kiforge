@@ -64,8 +64,10 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `export_3d` | Export front & back 3D PNG renders | `'true'` |
 | `export_svg` | Export front & back copper layer SVGs | `'true'` |
 | `export_ibom` | Export Interactive HTML BOM | `'true'` |
+| `format_jlc` | Apply JLCPCB BOM/CPL column formatting | `'true'` |
+| `version` | Override version suffix for output filenames | _(auto from Git tag)_ |
 
-> **Version tagging:** All output filenames are versioned automatically from the Git tag (e.g. `myboard_v1.0.0_gerbers.zip`). No extra configuration required — KiForge reads `GITHUB_REF_NAME` from the GitHub Actions environment.
+> **Version tagging:** All output filenames are versioned automatically on every run — locally and in CD. On tag push, KiForge reads `GITHUB_REF_NAME` (e.g. `myboard_v1.0.0_gerbers.zip`, `myboard_v1.0.0_sch.pdf`). Locally, the version comes from `--version-tag`, title-block `(rev ...)`, or defaults to `v0.1.0`.
 
 ---
 
@@ -73,7 +75,7 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 
 KiForge writes all files into `output_dir/` on the GitHub Actions runner — not in your repository. The upload step then attaches them as downloadable assets to your GitHub Release.
 
-`<name>` is derived from your `.kicad_pro` / `.kicad_pcb` filename.
+`<name>` is derived from your `.kicad_pro` / `.kicad_pcb` filename plus the resolved version suffix (e.g. `myboard_v1.0.0`).
 
 | File | Description | Controlled by |
 |---|---|---|

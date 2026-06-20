@@ -30,7 +30,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     """
     Settings dialog interface for KiForge Studio.
     Provides graphical configuration for project path resolution, output options,
-    defaults storage (.kiforge.json), and GitHub Actions CI workflow generation.
+    defaults storage (.kiforge.json), and GitHub/Gitea CD release workflow generation.
     """
     
     def __init__(self, parent, project_dir=None):
@@ -47,52 +47,15 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
         )
         self.project_dir = project_dir
-        self.settings = self.load_settings(project_dir)
+        self.settings = kiforge.load_merged_settings(project_dir)
         
         self.init_ui()
         self.update_ui_from_settings()
         self.Center()
 
     def load_settings(self, project_dir):
-        """
-        Loads configuration settings from the project's .kiforge.json file.
-        Falls back to default configurations if the file does not exist or fails to parse.
-        
-        Args:
-            project_dir (str): The project root directory to inspect.
-            
-        Returns:
-            dict: The dictionary of loaded or default configuration options.
-        """
-        defaults = {
-            'output_dir': 'kiforge',
-            'export_gerbers': True,
-            'export_drills': True,
-            'export_pos': True,
-            'export_bom': True,
-            'export_ibom': True,
-            'export_sch_pdf': True,
-            'export_step': True,
-            'export_3d': True,
-            'export_svg': True,
-        }
-        if not project_dir:
-            return defaults
-            
-        settings_file = os.path.join(project_dir, ".kiforge.json")
-        if os.path.isfile(settings_file):
-            try:
-                with open(settings_file, 'r', encoding='utf-8') as f:
-                    loaded = json.load(f)
-                    for k, v in loaded.items():
-                        if k in defaults:
-                            if isinstance(defaults[k], bool) and isinstance(v, str):
-                                defaults[k] = v.lower() == 'true'
-                            else:
-                                defaults[k] = v
-            except Exception as e:
-                logger.warning(f"Failed to load settings from {settings_file}: {e}")
-        return defaults
+        """Load merged global + project settings via the core exporter."""
+        return kiforge.load_merged_settings(project_dir)
 
     def init_ui(self):
         """Builds and lays out the wxPython user interface components, panels, and controls."""
@@ -145,6 +108,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_pos = wx.CheckBox(mfg_box, label="Component Placement (CPL)")
         self.chk_bom = wx.CheckBox(mfg_box, label="Bill of Materials (BOM)")
         self.chk_ibom = wx.CheckBox(mfg_box, label="Interactive HTML BOM (iBOM)")
+        self.chk_gerbers.Bind(wx.EVT_CHECKBOX, self.on_gerbers_toggled)
         
         mfg_sizer.Add(self.chk_gerbers, 0, wx.ALL, 6)
         mfg_sizer.Add(self.chk_drills, 0, wx.ALL, 6)
@@ -179,6 +143,20 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         output_sizer.Add(lbl_out, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
         output_sizer.Add(self.txt_output_dir, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
         content_sizer.Add(output_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
+
+        options_box = wx.StaticBox(self, label="Export Options")
+        options_sizer = wx.StaticBoxSizer(options_box, wx.VERTICAL)
+        self.chk_format_jlc = wx.CheckBox(options_box, label="Apply JLCPCB BOM/CPL formatting & rotation offsets")
+        self.chk_generate_cd = wx.CheckBox(options_box, label="Generate/update CD workflow files on export")
+        options_sizer.Add(self.chk_format_jlc, 0, wx.ALL, 6)
+        options_sizer.Add(self.chk_generate_cd, 0, wx.ALL, 6)
+        lbl_generate_cd_help = wx.StaticText(
+            options_box,
+            label="When checked, CD workflow files and .gitignore are updated after each export (local runs only).",
+        )
+        lbl_generate_cd_help.SetForegroundColour(wx.Colour(100, 116, 139))
+        options_sizer.Add(lbl_generate_cd_help, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        content_sizer.Add(options_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
         
         # 5. CD Section
         cd_box = wx.StaticBox(self, label="CD Release Integration")
@@ -186,7 +164,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         
         lbl_cd_desc = wx.StaticText(cd_box, label="Generate GitHub & Gitea Actions release CD workflows matching selections.")
         lbl_cd_desc.SetForegroundColour(wx.Colour(100, 116, 139)) # Slate gray (#64748b)
-        btn_generate_cd = wx.Button(cd_box, label="Generate CD Files (.github/.gitea/.gitignore)")
+        btn_generate_cd = wx.Button(cd_box, label="Generate CD Files Only (.github/.gitea/.gitignore)")
         btn_generate_cd.Bind(wx.EVT_BUTTON, self.on_generate_cd)
         
         cd_sizer.Add(lbl_cd_desc, 0, wx.ALL, 5)
@@ -194,11 +172,28 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         content_sizer.Add(cd_sizer, 0, wx.EXPAND | wx.BOTTOM, 15)
         
         # 6. Action buttons in Footer
+        defaults_box = wx.StaticBox(self, label="Saved Defaults")
+        defaults_sizer = wx.StaticBoxSizer(defaults_box, wx.VERTICAL)
+        lbl_defaults_help = wx.StaticText(
+            defaults_box,
+            label="Project defaults → .kiforge.json in the project folder. "
+                  "Global defaults → user config (e.g. ~/.config/kiforge/settings.json). "
+                  "Global loads first; project overrides.",
+        )
+        lbl_defaults_help.SetForegroundColour(wx.Colour(100, 116, 139))
+        defaults_btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        btn_save_project = wx.Button(defaults_box, label="Save Project Defaults")
+        btn_save_project.Bind(wx.EVT_BUTTON, self.on_save_project_defaults)
+        btn_save_global = wx.Button(defaults_box, label="Save Global Defaults")
+        btn_save_global.Bind(wx.EVT_BUTTON, self.on_save_global_defaults)
+        defaults_btn_sizer.Add(btn_save_project, 0, wx.RIGHT, 5)
+        defaults_btn_sizer.Add(btn_save_global, 0)
+        defaults_sizer.Add(lbl_defaults_help, 0, wx.ALL, 5)
+        defaults_sizer.Add(defaults_btn_sizer, 0, wx.ALL, 5)
+        content_sizer.Add(defaults_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
+
         footer_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        
-        btn_save = wx.Button(self, label="Save Defaults")
-        btn_save.Bind(wx.EVT_BUTTON, self.on_save_defaults)
-        
+
         btn_export = wx.Button(self, label="Run Export Now")
         btn_export.SetDefault()
         btn_export.Bind(wx.EVT_BUTTON, self.on_run_export)
@@ -206,7 +201,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         btn_close = wx.Button(self, wx.ID_CANCEL, label="Close")
         btn_close.Bind(wx.EVT_BUTTON, self.on_close)
         
-        footer_sizer.Add(btn_save, 0, wx.RIGHT, 10)
         footer_sizer.AddStretchSpacer()
         footer_sizer.Add(btn_export, 0, wx.RIGHT, 10)
         footer_sizer.Add(btn_close, 0)
@@ -228,6 +222,38 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_3d.SetValue(self.settings.get('export_3d', True))
         self.chk_svg.SetValue(self.settings.get('export_svg', True))
         self.txt_output_dir.SetValue(self.settings.get('output_dir', 'kiforge'))
+        self.chk_format_jlc.SetValue(self.settings.get('format_jlc', True))
+        self.chk_generate_cd.SetValue(self.settings.get('generate_cd', self.settings.get('generate_ci', True)))
+        self._sync_drill_checkbox_state()
+
+    def _current_settings(self):
+        """Collect the current dialog state as a settings dictionary."""
+        return {
+            'output_dir': self.txt_output_dir.GetValue().strip(),
+            'export_gerbers': self.chk_gerbers.IsChecked(),
+            'export_drills': self.chk_drills.IsChecked(),
+            'export_pos': self.chk_pos.IsChecked(),
+            'export_bom': self.chk_bom.IsChecked(),
+            'export_ibom': self.chk_ibom.IsChecked(),
+            'export_sch_pdf': self.chk_sch_pdf.IsChecked(),
+            'export_step': self.chk_step.IsChecked(),
+            'export_3d': self.chk_3d.IsChecked(),
+            'export_svg': self.chk_svg.IsChecked(),
+            'format_jlc': self.chk_format_jlc.IsChecked(),
+            'generate_cd': self.chk_generate_cd.IsChecked(),
+        }
+
+    def _sync_drill_checkbox_state(self):
+        """Drill export is required whenever Gerbers are enabled."""
+        if self.chk_gerbers.IsChecked():
+            self.chk_drills.SetValue(True)
+            self.chk_drills.Disable()
+        else:
+            self.chk_drills.Enable()
+
+    def on_gerbers_toggled(self, event):
+        """Keep drill export aligned with Gerber export requirements."""
+        self._sync_drill_checkbox_state()
 
     def on_browse(self, event):
         """Triggered by the 'Browse...' button to select a project root directory."""
@@ -245,60 +271,46 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self.update_ui_from_settings()
         dlg.Destroy()
 
-    def on_save_defaults(self, event):
-        """Saves current GUI checkbox and directory selections into a project-local .kiforge.json file."""
+    def _export_options(self):
+        """Build export and CD option flags from the current dialog state."""
+        options = self._current_settings()
+        if options['export_gerbers']:
+            options['export_drills'] = True
+        return options
+
+    def on_save_project_defaults(self, event):
+        """Save current selections to the project .kiforge.json file."""
         project_dir = self.txt_project_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir):
             wx.MessageBox("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
             return
-            
-        settings = {
-            'output_dir': self.txt_output_dir.GetValue().strip(),
-            'export_gerbers': self.chk_gerbers.IsChecked(),
-            'export_drills': self.chk_drills.IsChecked(),
-            'export_pos': self.chk_pos.IsChecked(),
-            'export_bom': self.chk_bom.IsChecked(),
-            'export_ibom': self.chk_ibom.IsChecked(),
-            'export_sch_pdf': self.chk_sch_pdf.IsChecked(),
-            'export_step': self.chk_step.IsChecked(),
-            'export_3d': self.chk_3d.IsChecked(),
-            'export_svg': self.chk_svg.IsChecked(),
-        }
-        
-        settings_file = os.path.join(project_dir, ".kiforge.json")
         try:
-            with open(settings_file, 'w', encoding='utf-8') as f:
-                json.dump(settings, f, indent=4)
-            wx.MessageBox("Default settings saved successfully to:\n" + settings_file, 
-                          "Settings Saved", wx.OK | wx.ICON_INFORMATION)
+            target = kiforge.save_settings(self._current_settings(), project_dir=project_dir, scope="project")
+            wx.MessageBox(f"Project defaults saved to:\n{target}", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
         except Exception as e:
-            wx.MessageBox(f"Failed to save settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
+            wx.MessageBox(f"Failed to save project settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_save_global_defaults(self, event):
+        """Save current selections to the user-wide KiForge settings file."""
+        try:
+            target = kiforge.save_settings(self._current_settings(), scope="global")
+            wx.MessageBox(f"Global defaults saved to:\n{target}", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
+        except Exception as e:
+            wx.MessageBox(f"Failed to save global settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
 
     def on_generate_cd(self, event):
-        """Generates the GitHub & Gitea Actions release workflow YAML and updates .gitignore based on current GUI selections."""
+        """Generate CD workflow YAML and update .gitignore from current selections."""
         project_dir = self.txt_project_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir):
             wx.MessageBox("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
             return
-            
+
         output_dir_name = self.txt_output_dir.GetValue().strip()
         if not output_dir_name:
             wx.MessageBox("Please specify a valid output directory name.", "Error", wx.OK | wx.ICON_ERROR)
             return
-            
-        options = {
-            'export_gerbers': self.chk_gerbers.IsChecked(),
-            'export_drills': self.chk_drills.IsChecked(),
-            'export_pos': self.chk_pos.IsChecked(),
-            'export_bom': self.chk_bom.IsChecked(),
-            'export_ibom': self.chk_ibom.IsChecked(),
-            'export_sch_pdf': self.chk_sch_pdf.IsChecked(),
-            'export_step': self.chk_step.IsChecked(),
-            'export_3d': self.chk_3d.IsChecked(),
-            'export_svg': self.chk_svg.IsChecked(),
-        }
-        
-        msg, success = kiforge.generate_ci_files(project_dir, output_dir_name, options)
+
+        msg, success = kiforge.generate_cd_files(project_dir, output_dir_name, self._export_options())
         if success:
             wx.MessageBox(msg, "CD Files Generated", wx.OK | wx.ICON_INFORMATION)
         else:
@@ -307,31 +319,20 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     def on_run_export(self, event):
         """
         Runs the KiForge export pipeline in a background worker thread.
-        Monitors progress on the main thread and displays a modal cancelable ProgressDialog.
+        Monitors progress on the main thread with a cancelable ProgressDialog.
         """
         project_dir = self.txt_project_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir):
             wx.MessageBox("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
             return
-            
+
         output_dir_name = self.txt_output_dir.GetValue().strip()
         if not output_dir_name:
             wx.MessageBox("Please specify a valid output directory name.", "Error", wx.OK | wx.ICON_ERROR)
             return
 
-        export_flags = {
-            'export_gerbers': self.chk_gerbers.IsChecked(),
-            'export_drills': self.chk_drills.IsChecked(),
-            'export_pos': self.chk_pos.IsChecked(),
-            'export_bom': self.chk_bom.IsChecked(),
-            'export_ibom': self.chk_ibom.IsChecked(),
-            'export_sch_pdf': self.chk_sch_pdf.IsChecked(),
-            'export_step': self.chk_step.IsChecked(),
-            'export_3d': self.chk_3d.IsChecked(),
-            'export_svg': self.chk_svg.IsChecked(),
-        }
+        export_flags = self._export_options()
 
-        # Hide main dialog during export execution
         self.Hide()
 
         state = {
@@ -340,7 +341,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             'error_msg': None,
             'val': 0,
             'msg': "Initializing...",
-            'cancelled': False
+            'cancelled': False,
         }
 
         def progress_callback(step_index, total_steps, message):
@@ -350,7 +351,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 state['msg'] = message
             return not context.is_aborted()
 
-        # Instantiate and resolve context on main thread
         context = kiforge.ExportContext(project_dir, output_dir_name, export_flags, progress_callback)
         if not context.resolve():
             wx.MessageBox("Failed to resolve project files or KiCad executables.", "KiForge Error", wx.OK | wx.ICON_ERROR)
@@ -360,8 +360,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         logger.info(f"Resolved project directory: {project_dir}")
         logger.info(f"Resolved output directory: {context.output_dir}")
 
-        progress = wx.ProgressDialog("KiForge", "Initializing exporter...", 100,
-                                     style=wx.PD_AUTO_HIDE | wx.PD_APP_MODAL | wx.PD_CAN_ABORT)
+        progress = wx.ProgressDialog(
+            "KiForge",
+            "Initializing exporter...",
+            100,
+            parent=None,
+            style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT | wx.PD_SMOOTH,
+        )
 
         def export_worker():
             try:
@@ -380,34 +385,37 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         thread.daemon = True
         thread.start()
 
+        last_val = -1
+        last_msg = ""
+        app = wx.GetApp()
         while state['running']:
-            wx.SafeYield()
-            keep_going, _ = progress.Update(state['val'], state['msg'])
-            if not keep_going:
-                state['cancelled'] = True
-                logger.warning("Export cancelled by user via progress dialog.")
-                context.cancel()
-                break
-            time.sleep(0.05)
+            if state['val'] != last_val or state['msg'] != last_msg:
+                keep_going, _ = progress.Update(state['val'], state['msg'])
+                last_val = state['val']
+                last_msg = state['msg']
+                if not keep_going:
+                    state['cancelled'] = True
+                    logger.warning("Export cancelled by user via progress dialog.")
+                    context.cancel()
+                    break
+            if app:
+                app.ProcessPendingEvents()
+            time.sleep(0.2)
 
-        progress.Hide()
         progress.Destroy()
-        wx.SafeYield()
-
         thread.join(timeout=2.0)
 
         if state['cancelled']:
-            logger.info("Displaying export aborted message box.")
             wx.MessageBox("Export aborted by user.", "KiForge", wx.OK | wx.ICON_WARNING)
         elif state['error_msg']:
-            logger.info(f"Displaying error message box: {state['error_msg']}")
             wx.MessageBox(f"An error occurred during export:\n{state['error_msg']}", "KiForge Error", wx.OK | wx.ICON_ERROR)
         elif state['success']:
-            logger.info("Displaying export success message box.")
-            wx.MessageBox(f"All manufacturing files exported and formatted successfully inside:\n{context.output_dir}", 
-                          "KiForge Success", wx.OK | wx.ICON_INFORMATION)
+            wx.MessageBox(
+                f"All manufacturing files exported and formatted successfully inside:\n{context.output_dir}",
+                "KiForge Success",
+                wx.OK | wx.ICON_INFORMATION,
+            )
         else:
-            logger.info("Displaying unexpected status message box.")
             wx.MessageBox("Export finished with unexpected status.", "KiForge", wx.OK | wx.ICON_WARNING)
 
         self.EndModal(wx.ID_OK)

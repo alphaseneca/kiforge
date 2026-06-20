@@ -21,7 +21,7 @@ graph TD
 
 1. **KiCad GUI ActionPlugin**: Invoked via `plugins/kiforge_studio.py` within the KiCad PCB Editor. It runs the export pipeline in a background worker thread while providing a modal, responsive `wx.ProgressDialog` on the main GUI thread.
 2. **Standalone GUI Mode**: Runs as a standard desktop application for local testing when launched directly.
-3. **CLI & CI/CD Composite Action**: Run headlessly in terminal environments or inside Docker containers (such as the official `kicad/kicad:10.0` container) in GitHub Actions pipelines.
+3. **CLI & CD Composite Action**: Run headlessly in terminal environments or inside Docker containers (such as the official `kicad/kicad:10.0` container) in GitHub Actions pipelines.
 
 ---
 
@@ -58,7 +58,7 @@ sequenceDiagram
 
     User->>Context: Instantiate(project_path, options)
     User->>Context: resolve()
-    Note over Context: 1. Resolves kicad-cli / python paths<br/>2. Locates .kicad_pcb & .kicad_sch<br/>3. Merges .kiforge.json & options
+    Note over Context: 1. Resolves kicad-cli / python paths<br/>2. Locates .kicad_pcb & .kicad_sch<br/>3. Appends version to pcb_name<br/>4. Merges settings & rotation offsets
     Context-->>User: Success (bool)
     
     User->>Runner: Instantiate(context)
@@ -86,8 +86,9 @@ sequenceDiagram
 The `ExportContext.resolve()` method performs all environment discovery:
 1. **Executable Resolution**: Finds `kicad-cli` and `kicad-python` (with `pcbnew` bound) standard paths across Windows, macOS, and Linux using `PathResolver`.
 2. **File Discovery**: Recursively searches the `project_path` to find `.kicad_pcb`, `.kicad_pro`, and `.kicad_sch` files.
-3. **Settings Merging**: Loads project-local `.kiforge.json` settings and merges them with run-time command flags (command line or GUI).
-4. **Environment Setup**: Configures environment variables (`PYTHONPATH` and `PATH`) to ensure third-party site-packages and KiCad binaries are accessible.
+3. **Version Suffix**: Resolves version from CLI/options, `GITHUB_REF_NAME`, title-block `(rev ...)`, or `v0.1.0`, then appends it to `pcb_name`. All export tasks use this prefixed name (Gerber ZIP, BOM, CPL, STEP, schematic PDF, etc.) in both local and CD runs.
+4. **Settings Merging**: Loads global settings (`~/.config/kiforge/settings.json` on Linux), project-local `.kiforge.json`, and merges them with run-time command flags (command line or GUI).
+5. **Environment Setup**: Configures environment variables (`PYTHONPATH` and `PATH`) to ensure third-party site-packages and KiCad binaries are accessible.
 
 ### Phase 2: Pipeline Initialization
 `ExportRunner` builds an ordered task pipeline consisting of two parts:
@@ -106,7 +107,7 @@ Each task executes its logic inside `run()`, typically invoking `_run_subprocess
 Running heavy CLI export processes directly on a GUI thread freezes the window manager, leading to "Not Responding" application hangs. KiForge Studio solves this by splitting GUI polling and worker threads safely:
 
 * **Background Worker Thread**: Invokes `kiforge.run_export(context)` and runs the pipeline.
-* **Progress GUI Thread**: Polls `state['running']` status and updates `wx.ProgressDialog` on the main thread via `wx.SafeYield()`.
+* **Progress GUI Thread**: Polls worker state and updates `wx.ProgressDialog` only when progress text or value changes (avoids Linux/Windows flicker from tight `wx.SafeYield()` loops).
 * **Thread-Safe Cancellation**: If the user clicks "Cancel" on the progress dialog, the GUI thread calls `context.cancel()`. The worker thread checks `context.is_aborted()` at each task boundary, locks `context._lock`, and terminates/kills the active `subprocess.Popen` instance immediately.
 
 ---
@@ -145,3 +146,19 @@ KiCad's internal scripting environment has unique constraints:
   # Applies the offset matching component packages
   rotation = (rotation + offset) % 360.0
   ```
+* **Optional formatting**: Set `format_jlc: false` in settings or pass `--no-format-jlc` on the CLI to skip JLCPCB BOM/CPL post-processing.
+
+---
+
+## 7. Settings & Gitignore Template
+
+KiForge settings merge in this order: built-in defaults → global file → project `.kiforge.json` → runtime GUI/CLI flags.
+
+| Scope | Location |
+| --- | --- |
+| Global | `~/.config/kiforge/settings.json` (Linux), `%APPDATA%/kiforge/settings.json` (Windows) |
+| Project | `<project>/.kiforge.json` |
+
+CD workflow generation and `.gitignore` updates use `templates/kiforge.gitignore` beside the installed `kiforge.py`. Users can edit that template in-place after installation; KiForge merges missing patterns into each project's `.gitignore` on export (when `generate_cd` is enabled) or via **Generate CD Files Only**.
+
+When Gerbers are enabled, drill export runs automatically so the Gerber ZIP always includes drill files. JLC formatting (`format_jlc`) and CD generation (`generate_cd`) default to on and can be disabled per run or in saved settings.

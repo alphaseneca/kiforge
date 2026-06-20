@@ -20,11 +20,11 @@
 
 ## ✨ What it exports
 
-All outputs are versioned automatically — when triggered by a Git tag (e.g. `v1.2.0`), every filename becomes `<boardname>_v1.2.0_<type>.<ext>`.
+All outputs are versioned automatically in every run (GUI, CLI, and CD) — every filename becomes `<boardname>_vX.Y.Z_<type>.<ext>` (e.g. `myboard_v1.2.0_sch.pdf`).
 
 | Output | Filename | Toggle |
 |---|---|---|
-| Gerber + Drill archive | `<name>_gerbers.zip` | `export_gerbers` / `export_drills` |
+| Gerber + Drill archive | `<name>_gerbers.zip` | `export_gerbers` (drills included automatically when Gerbers are enabled) |
 | JLCPCB Bill of Materials | `<name>_bom_jlc.csv` | `export_bom` |
 | JLCPCB Component Placement | `<name>_cpl_jlc.csv` | `export_pos` |
 | Schematic PDF | `<name>_sch.pdf` | `export_sch_pdf` |
@@ -56,7 +56,9 @@ The quickest way. KiForge appears under **Tools › External Plugins** inside th
 4. Click **Run Export Now** — a live progress dialog tracks each step.
 5. All files land in the configured output folder (default: `kiforge/` next to your `.kicad_pro`).
 
-> **Bonus:** The plugin has a **Generate CI Files** button that writes a complete GitHub Actions release workflow and updates your `.gitignore` automatically — no manual YAML editing required.
+Settings merge from built-in defaults → global (`~/.config/kiforge/settings.json` on Linux) → project `.kiforge.json`. Use **Save Project Defaults** or **Save Global Defaults** to persist your toggles.
+
+> **Bonus:** CD workflow files (`.github/workflows/release.yml`, `.gitea/workflows/release.yml`, and `.gitignore` patterns from `templates/kiforge.gitignore`) are generated automatically after each successful export when **Generate/update CD workflow files on export** is checked. You can also use **Generate CD Files Only** without exporting.
 
 ---
 
@@ -100,7 +102,7 @@ jobs:
           files: kiforge/*
 ```
 
-> Tip: Use the **Generate CI Files** button in the KiCad plugin to create this file automatically.
+> Tip: Use the **Generate CD Files Only** button in the KiCad plugin to create this file automatically.
 
 #### Triggering a release
 
@@ -223,7 +225,8 @@ docker compose run --rm export
 | `--no-export-gerbers` | Skip Gerber export |
 | `--no-export-drills` | Skip drill file export |
 | `--no-export-ibom` | Skip Interactive HTML BOM |
-| `--generate-ci` | Generate GitHub Actions workflow + update `.gitignore` instead of exporting |
+| `--no-format-jlc` | Skip JLCPCB BOM/CPL column formatting |
+| `--generate-cd` | Generate GitHub/Gitea release CD workflow + update `.gitignore` instead of exporting |
 
 ---
 
@@ -236,8 +239,11 @@ KiForge appends the version to **all** output filenames automatically. The versi
 3. `VERSION` environment variable
 4. `(rev ...)` field from your `.kicad_sch` title block
 5. `(rev ...)` field from your `.kicad_pcb` title block
+6. Default `v0.1.0` if none of the above are set
 
-**Example** — push tag `v1.2.0` on a board named `my-board`:
+Version suffixes apply to **all** outputs locally and in CD — including schematic PDF (`*_sch.pdf`), because `ExportContext.resolve()` appends the version to `pcb_name` before any task runs.
+
+**Example** — tag `v1.2.0` (or `--version-tag v1.2.0`) on a board named `my-board`:
 
 ```
 my-board_v1.2.0.step
@@ -280,6 +286,7 @@ pip3 install --user InteractiveHtmlBom
 ## 🔩 JLCPCB-ready outputs
 
 ### BOM (`*_bom_jlc.csv`)
+- JLCPCB column formatting is optional — disable with `format_jlc: false` in settings or `--no-format-jlc` on the CLI
 - DNP (Do Not Populate) components are automatically filtered out
 - LCSC part numbers are resolved from any of these custom fields: `LCSC`, `LCSC Part`, `LCSC Part #`, `JLCPCB Part`, `JLCPCB Part #`, `LCSC_Part`
 - Output columns: `Designator`, `Comment`, `Footprint`, `LCSC`, `Quantity`
@@ -329,6 +336,8 @@ kiforge/
 ├── docker-compose.yml      # Local Docker test environment
 ├── package_plugin.py       # Builds the KiCad PCM plugin zip
 ├── metadata.json           # KiCad Plugin Manager manifest
+├── templates/
+│   └── kiforge.gitignore   # Editable gitignore template merged into downstream projects
 ├── plugins/
 │   ├── __init__.py         # KiCad plugin registration hook
 │   ├── kiforge_studio.py   # wx GUI (settings dialog + progress)
@@ -336,7 +345,7 @@ kiforge/
 ├── tests/
 │   ├── sample_project/     # Minimal KiCad project for CI tests
 │   ├── test_cli.py         # Unit tests for CLI, context, versioning
-│   └── test_studio.py      # Unit tests for GUI settings & CI gen
+│   └── test_studio.py      # Unit tests for GUI settings & CD gen
 └── .github/workflows/
     ├── release.yml         # Builds versioned plugin zip on tag push
     └── test-action.yml     # Runs export on sample project (CI check)

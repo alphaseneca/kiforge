@@ -74,6 +74,17 @@ def package_plugin(version: str = None):
     print("Copying root kiforge.py to plugins/kiforge.py...")
     shutil.copy2("kiforge.py", "plugins/kiforge.py")
 
+    # Copy gitignore template beside the plugin module for install-path resolution
+    plugin_template_dir = Path("plugins/templates")
+    plugin_template_dir.mkdir(parents=True, exist_ok=True)
+    template_src = Path("templates/kiforge.gitignore")
+    template_dst = plugin_template_dir / "kiforge.gitignore"
+    if template_src.is_file():
+        shutil.copy2(template_src, template_dst)
+        print(f"Copied gitignore template to {template_dst}")
+    else:
+        print(f"  Warning: gitignore template not found: {template_src}")
+
     print(f"Packaging plugin: {PLUGIN_ID}")
     print(f"Version:          {version or '(unversioned)'}")
     print(f"Output file:      {zip_path}")
@@ -84,6 +95,7 @@ def package_plugin(version: str = None):
         ("plugins/__init__.py",     "plugins/__init__.py"),
         ("plugins/kiforge_studio.py","plugins/kiforge_studio.py"),
         ("plugins/kiforge.py",      "plugins/kiforge.py"),
+        ("plugins/templates/kiforge.gitignore", "plugins/templates/kiforge.gitignore"),
         ("plugins/icon.png",        "plugins/icon.png"),
         ("resources/icon.png",      "resources/icon.png"),
     ]

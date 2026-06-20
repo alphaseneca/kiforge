@@ -4,13 +4,19 @@ import os
 import tempfile
 import json
 import shutil
-# pyrefly: ignore [missing-import]
-import wx
 
 # Add root directory to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Import from plugins
+import kiforge
+
+# GUI tests need a working wx display; opt in with KIFORGE_RUN_GUI_TESTS=1
+if os.environ.get("KIFORGE_RUN_GUI_TESTS") != "1":
+    raise unittest.SkipTest("GUI tests skipped; set KIFORGE_RUN_GUI_TESTS=1 to run")
+
+# pyrefly: ignore [missing-import]
+import wx
+
 from plugins import kiforge_studio
 
 class TestKiForgeStudio(unittest.TestCase):
@@ -41,6 +47,8 @@ class TestKiForgeStudio(unittest.TestCase):
         settings = dialog.settings
         self.assertEqual(settings['output_dir'], 'kiforge')
         self.assertTrue(settings['export_gerbers'])
+        self.assertTrue(settings['format_jlc'])
+        self.assertTrue(settings['generate_cd'])
         dialog.Destroy()
 
     def test_save_and_load_settings(self):
@@ -111,7 +119,63 @@ class TestKiForgeStudio(unittest.TestCase):
         with open(gitignore_path, 'r', encoding='utf-8') as f:
             git_content = f.read()
             self.assertIn("kiforge_ci_test/", git_content)
-            
+            self.assertIn(".history/", git_content)
+
+        dialog.Destroy()
+
+    def test_save_project_defaults(self):
+        """Verify project defaults are saved via the studio dialog handler."""
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        dialog.txt_project_dir.SetValue(self.test_dir)
+        dialog.txt_output_dir.SetValue("saved_out")
+        dialog.chk_format_jlc.SetValue(False)
+
+        class MockEvent:
+            pass
+
+        dialog.on_save_project_defaults(MockEvent())
+        loaded = kiforge.load_merged_settings(self.test_dir)
+        self.assertEqual(loaded["output_dir"], "saved_out")
+        self.assertFalse(loaded["format_jlc"])
+        dialog.Destroy()
+
+    def test_save_global_defaults(self):
+        """Verify global defaults are saved via the studio dialog handler."""
+        global_path = kiforge.get_global_settings_path()
+        backup = None
+        if os.path.isfile(global_path):
+            with open(global_path, "r", encoding="utf-8") as f:
+                backup = f.read()
+
+        try:
+            dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+            dialog.chk_generate_cd.SetValue(False)
+
+            class MockEvent:
+                pass
+
+            dialog.on_save_global_defaults(MockEvent())
+            loaded = kiforge.load_merged_settings(None)
+            self.assertFalse(loaded["generate_cd"])
+            dialog.Destroy()
+        finally:
+            if backup is not None:
+                os.makedirs(os.path.dirname(global_path), exist_ok=True)
+                with open(global_path, "w", encoding="utf-8") as f:
+                    f.write(backup)
+            elif os.path.isfile(global_path):
+                os.remove(global_path)
+
+    def test_gerber_toggle_forces_drills(self):
+        """Verify enabling gerbers disables and checks the drill checkbox."""
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        dialog.chk_gerbers.SetValue(True)
+        dialog._sync_drill_checkbox_state()
+        self.assertTrue(dialog.chk_drills.IsChecked())
+        self.assertFalse(dialog.chk_drills.IsEnabled())
+        dialog.chk_gerbers.SetValue(False)
+        dialog._sync_drill_checkbox_state()
+        self.assertTrue(dialog.chk_drills.IsEnabled())
         dialog.Destroy()
 
 if __name__ == '__main__':

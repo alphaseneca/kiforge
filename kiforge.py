@@ -11,7 +11,7 @@ Entry Points
 ------------
 CLI (headless / GitHub Actions / Docker):
     python kiforge.py [--project-path PATH] [--output-dir DIR] [--no-export-*]
-    python kiforge.py --generate-ci [--project-path PATH] [--output-dir DIR]
+    python kiforge.py --generate-cd [--project-path PATH] [--output-dir DIR]
 
 Library (KiCad GUI plugin via kiforge_studio.py):
     context = ExportContext(project_path, output_dir_name, options, progress_callback)
@@ -29,7 +29,7 @@ ExportTask          — Abstract base for each export step. Subclasses implement
                       is_applicable() and run() only.
 ExportRunner        — Drives the ordered pipeline, handles progress callbacks,
                       propagates cancellation, and cleans up on abort/error.
-generate_ci_files() — Standalone helper to write a GitHub Actions release workflow
+generate_cd_files() — Standalone helper to write a GitHub Actions release workflow
                       and update .gitignore for a downstream KiCad project.
 """
 
@@ -105,6 +105,287 @@ logger = logging.getLogger("KiForge.Core")
 # Legacy module-level footprint rotation offsets for JLCPCB assembly (Deprecated).
 # Use configuration files or options dict where possible.
 ROTATION_OFFSETS = {}
+
+KIFORGE_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+DEFAULT_SETTINGS = {
+    "output_dir": "kiforge",
+    "export_gerbers": True,
+    "export_drills": True,
+    "export_pos": True,
+    "export_bom": True,
+    "export_ibom": True,
+    "export_sch_pdf": True,
+    "export_step": True,
+    "export_3d": True,
+    "export_svg": True,
+    "format_jlc": True,
+    "generate_cd": True,
+}
+
+_BUILTIN_GITIGNORE_PATTERNS = [
+    "*.lck", "*.tmp", "fp-info-cache", "_autosave-*",
+    "*.bak", "*-backups/", "*.kicad_pcb-bak", "*.kicad_sch-bak", "*.kicad_prl",
+    "*.pdf", "*.svg", "bom/", ".history/",
+]
+
+_STEP_EXPORT_WARNINGS = (
+    "Cannot use VRML models",
+    "non-mesh formats",
+    "Cannot add a VRML model",
+    "No solid model created",
+    "Could not load model",
+    "Failed to load",
+    "3D model not found",
+    "Error loading mesh",
+)
+
+
+def get_kiforge_root() -> str:
+    """Return the directory containing the installed kiforge.py module."""
+    return KIFORGE_ROOT
+
+
+def get_gitignore_template_path():
+    """
+    Find the editable gitignore template that ships with the installed KiForge module.
+
+    KiForge looks next to kiforge.py (for example plugins/templates/kiforge.gitignore
+    in a PCM install, or templates/kiforge.gitignore at the repo root during development).
+    Users can edit that file after installation to customize which patterns are merged
+    into downstream KiCad projects.
+
+    Returns:
+        str | None: Absolute path to the template file, or None if it is not present.
+    """
+    candidates = [
+        os.path.join(KIFORGE_ROOT, "templates", "kiforge.gitignore"),
+        os.path.join(os.path.dirname(KIFORGE_ROOT), "templates", "kiforge.gitignore"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def get_global_settings_path() -> str:
+    """Return the path to the user-wide KiForge settings file."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        return os.path.join(base, "kiforge", "settings.json")
+    if sys.platform == "darwin":
+        return os.path.join(
+            os.path.expanduser("~"), "Library", "Application Support", "kiforge", "settings.json"
+        )
+    xdg = os.environ.get("XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config"))
+    return os.path.join(xdg, "kiforge", "settings.json")
+
+
+def _coerce_setting_value(default, value):
+    if isinstance(default, bool) and isinstance(value, str):
+        return value.lower() == "true"
+    return value
+
+
+def load_merged_settings(project_dir=None):
+    """
+    Build the effective KiForge settings for a run by layering configuration sources.
+
+    Defaults are applied first, then the user-wide settings file (for example
+    ~/.config/kiforge/settings.json on Linux), and finally project-local
+    .kiforge.json when project_dir is given. Project values override global ones.
+    Legacy generate_ci keys in saved JSON are still accepted as generate_cd.
+
+    Args:
+        project_dir: Optional KiCad project root containing .kiforge.json.
+
+    Returns:
+        dict: Merged settings ready for the GUI or ExportContext.
+    """
+    settings = DEFAULT_SETTINGS.copy()
+
+    global_path = get_global_settings_path()
+    if os.path.isfile(global_path):
+        try:
+            with open(global_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            for key, default in DEFAULT_SETTINGS.items():
+                if key in loaded:
+                    settings[key] = _coerce_setting_value(default, loaded[key])
+                elif key == "generate_cd" and "generate_ci" in loaded:
+                    settings[key] = _coerce_setting_value(default, loaded["generate_ci"])
+        except Exception as e:
+            logger.warning(f"Failed to load global settings from {global_path}: {e}")
+
+    if project_dir:
+        settings_file = os.path.join(project_dir, ".kiforge.json")
+        if os.path.isfile(settings_file):
+            try:
+                with open(settings_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                for key, default in DEFAULT_SETTINGS.items():
+                    if key in loaded:
+                        settings[key] = _coerce_setting_value(default, loaded[key])
+                    elif key == "generate_cd" and "generate_ci" in loaded:
+                        settings[key] = _coerce_setting_value(default, loaded["generate_ci"])
+            except Exception as e:
+                logger.warning(f"Failed to load project settings from {settings_file}: {e}")
+
+    return settings
+
+
+def save_settings(settings, project_dir=None, scope="project"):
+    """
+    Write KiForge settings to disk for reuse across sessions.
+
+    Use scope="project" to save .kiforge.json beside the KiCad project, or
+    scope="global" to save the user-wide defaults file returned by
+    get_global_settings_path(). Only known DEFAULT_SETTINGS keys are persisted.
+
+    Args:
+        settings: Current option values (typically from the Studio dialog).
+        project_dir: Required when scope is "project".
+        scope: Either "project" or "global".
+
+    Returns:
+        str: Path of the file that was written.
+
+    Raises:
+        ValueError: If scope is "project" but project_dir is missing or invalid.
+    """
+    payload = {key: settings.get(key, DEFAULT_SETTINGS[key]) for key in DEFAULT_SETTINGS}
+
+    if scope == "global":
+        target = get_global_settings_path()
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+    else:
+        if not project_dir or not os.path.isdir(project_dir):
+            raise ValueError("A valid project directory is required for project-scoped settings.")
+        target = os.path.join(project_dir, ".kiforge.json")
+
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=4)
+    return target
+
+
+def load_gitignore_patterns(output_dir_name: str) -> list[str]:
+    """
+    Collect the gitignore patterns KiForge should ensure exist in a KiCad project.
+
+    The output directory name (for example kiforge/) is always included first.
+    Remaining patterns are read from the install-dir template when available;
+    otherwise a built-in KiCad 10 fallback list is used.
+
+    Args:
+        output_dir_name: Relative name of the KiForge export folder in the project.
+
+    Returns:
+        list[str]: Ignore patterns (no comment lines) in merge order.
+    """
+    patterns = [f"{output_dir_name}/"]
+    template_path = get_gitignore_template_path()
+    if template_path:
+        try:
+            with open(template_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#"):
+                        patterns.append(stripped)
+            return patterns
+        except Exception as e:
+            logger.warning(f"Failed to read gitignore template at {template_path}: {e}")
+    patterns.extend(_BUILTIN_GITIGNORE_PATTERNS)
+    return patterns
+
+
+def update_project_gitignore(project_dir: str, output_dir_name: str) -> bool:
+    """
+    Keep a KiCad project's .gitignore in sync with KiForge and KiCad 10 artifacts.
+
+    Called automatically after a successful export (when generate_cd is enabled)
+    and when CD release workflow files are generated from the Studio dialog or CLI.
+    Patterns come from load_gitignore_patterns(), which reads the editable template
+    beside the installed kiforge.py when present.
+
+    If .gitignore already exists, only patterns that are not yet listed are appended.
+    If it does not exist, a new file is created with a KiForge output header plus the
+    full template body (or the built-in fallback patterns).
+
+    Args:
+        project_dir: KiCad project root that should receive or update .gitignore.
+        output_dir_name: Export folder name to ignore (for example kiforge/).
+
+    Returns:
+        bool: True if the file was created or changed; False if every pattern was
+              already present.
+    """
+    gitignore_path = os.path.join(project_dir, ".gitignore")
+    target_ignores = load_gitignore_patterns(output_dir_name)
+    gitignore_updated = False
+
+    if os.path.exists(gitignore_path):
+        with open(gitignore_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        lines = [line.strip() for line in content.splitlines()]
+        missing = [
+            item for item in target_ignores
+            if item not in lines and f"/{item}" not in lines and f"./{item}" not in lines
+        ]
+        if missing:
+            with open(gitignore_path, "a", encoding="utf-8") as f:
+                if not content.endswith("\n"):
+                    f.write("\n")
+                f.write("\n# KiCad & KiForge patterns added by KiForge\n")
+                for item in missing:
+                    f.write(f"{item}\n")
+            gitignore_updated = True
+    else:
+        template_path = get_gitignore_template_path()
+        header = ["# KiForge output directory", f"{output_dir_name}/", ""]
+        if template_path and os.path.isfile(template_path):
+            with open(template_path, "r", encoding="utf-8") as f:
+                body = f.read().rstrip()
+        else:
+            body = "\n".join([
+                "# KiCad temporary and lock files",
+                "*.lck", "*.tmp", "fp-info-cache", "_autosave-*", "",
+                "# KiCad backup files",
+                "*.bak", "*-backups/", "*.kicad_pcb-bak", "*.kicad_sch-bak", "*.kicad_prl",
+                "*.pdf", "*.svg", "bom/", "",
+                "# KiCad 10 Local History / Auto-backups",
+                ".history/",
+            ])
+        with open(gitignore_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(header) + body + "\n")
+        gitignore_updated = True
+
+    return gitignore_updated
+
+
+def export_options_from_context(context: "ExportContext") -> dict:
+    """
+    Copy export and CD-related flags from a resolved ExportContext into a plain dict.
+
+    Used when generating CD workflow YAML after export so the release pipeline
+    matches the same toggles the user selected in the GUI or CLI (Gerbers, STEP,
+    format_jlc, generate_cd, and so on). Legacy generate_ci
+    option keys are mapped to generate_cd for backward compatibility.
+
+    Args:
+        context: A resolved ExportContext from the current run.
+
+    Returns:
+        dict: Option flags suitable for generate_cd_files().
+    """
+    keys = (
+        "export_gerbers", "export_drills", "export_pos", "export_bom", "export_ibom",
+        "export_sch_pdf", "export_step", "export_3d", "export_svg", "format_jlc",
+        "generate_cd", "version",
+    )
+    options = {key: context.options.get(key, DEFAULT_SETTINGS.get(key, True)) for key in keys}
+    if "generate_cd" not in context.options and context.options.get("generate_ci") is not None:
+        options["generate_cd"] = context.options.get("generate_ci")
+    return options
 
 # Legacy active process tracking for cancellation support (Deprecated)
 _active_process = None
@@ -382,16 +663,18 @@ class ExportContext:
             version = _extract_rev(self.sch_file)
             if not version:
                 version = _extract_rev(self.pcb_file)
-            
-        if version:
-            version_str = version.strip()
-            if "/" in version_str:
-                version_str = version_str.split("/")[-1]
-            if version_str:
-                # If version starts with a digit (e.g. "1.0.0"), prepend "v" for a clean "vX.X.X" format
-                if version_str[0].isdigit():
-                    version_str = f"v{version_str}"
-                self.pcb_name = f"{self.pcb_name}_{version_str}"
+
+        if not version:
+            version = "0.1.0"
+
+        version_str = version.strip()
+        if "/" in version_str:
+            version_str = version_str.split("/")[-1]
+        if version_str:
+            # If version starts with a digit (e.g. "1.0.0"), prepend "v" for a clean "vX.X.X" format
+            if version_str[0].isdigit():
+                version_str = f"v{version_str}"
+            self.pcb_name = f"{self.pcb_name}_{version_str}"
 
         # Resolve output directories
         if os.path.isabs(self.output_dir_name):
@@ -407,8 +690,14 @@ class ExportContext:
         self.logger.info(f"Resolved project: {self.pcb_name} in {self.project_dir}")
         self.logger.info(f"Target Output Directory: {self.output_dir}")
         self.logger.info(f"Resolved KiCad Python: {self.kicad_python}")
-        
-        # Load settings and rotation offsets from .kiforge.json if it exists
+
+        # Merge saved settings (global → project); runtime options override
+        merged_settings = load_merged_settings(self.project_dir)
+        for key in DEFAULT_SETTINGS:
+            if key not in self.options:
+                self.options[key] = merged_settings[key]
+
+        # Load rotation offsets from .kiforge.json if present
         json_offsets = {}
         settings_file = os.path.join(self.project_dir, ".kiforge.json")
         if os.path.isfile(settings_file):
@@ -416,7 +705,6 @@ class ExportContext:
                 with open(settings_file, 'r', encoding='utf-8') as f:
                     settings = json.load(f)
                     json_offsets = settings.get("rotation_offsets", {})
-                    # If it's a string representation of json (unlikely but possible), parse it
                     if isinstance(json_offsets, str):
                         try:
                             json_offsets = json.loads(json_offsets)
@@ -424,7 +712,7 @@ class ExportContext:
                             json_offsets = {}
             except Exception as e:
                 self.logger.warning(f"Failed to load settings from {settings_file}: {e}")
-                
+
         # Merge rotation offsets (options take precedence over .kiforge.json)
         merged = json_offsets.copy() if isinstance(json_offsets, dict) else {}
         opt_offsets = self.options.get("rotation_offsets", {})
@@ -623,7 +911,9 @@ class DrillExportTask(ExportTask):
         super().__init__("Exporting Drill Files")
 
     def is_applicable(self, context: ExportContext) -> bool:
-        return context.options.get("export_drills", True) and bool(context.pcb_file)
+        drills_requested = context.options.get("export_drills", True)
+        gerbers_requested = context.options.get("export_gerbers", True)
+        return (drills_requested or gerbers_requested) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
         cmd = [
@@ -702,10 +992,15 @@ class Step3dExportTask(ExportTask):
         return context.options.get("export_step", True) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Export STEP with --subst-models for external VRML→STEP substitution.
+
+        KiCad 10 footprint-embedded 3D geometry is exported natively by kicad-cli.
+        Per-component model failures are logged as warnings so the rest of the pipeline
+        can continue when a partial STEP file is produced.
+        """
         output_step = os.path.join(context.output_dir, f"{context.pcb_name}.step")
         cmd = [
             context.kicad_cli, "pcb", "export", "step",
-            "--no-optimize-step",
             "--subst-models",
             "-f",
             "-o", output_step,
@@ -715,13 +1010,24 @@ class Step3dExportTask(ExportTask):
             return self._run_subprocess(cmd, context)
         except RuntimeError as e:
             err_msg = str(e)
-            if "Cannot use VRML models" in err_msg or "non-mesh formats" in err_msg:
+            if any(marker in err_msg for marker in _STEP_EXPORT_WARNINGS):
+                if os.path.isfile(output_step) and os.path.getsize(output_step) > 0:
+                    context.logger.warning(
+                        "STEP export completed with warnings (some 3D models were skipped): "
+                        f"{err_msg}"
+                    )
+                    return True
                 context.logger.warning(
-                    f"STEP export completed with warnings (some components only have VRML models and were skipped): {err_msg}"
+                    "STEP export reported model warnings and produced no output file; continuing export. "
+                    f"{err_msg}"
+                )
+                return True
+            if os.path.isfile(output_step) and os.path.getsize(output_step) > 0:
+                context.logger.warning(
+                    f"STEP export finished with errors but produced output; continuing: {err_msg}"
                 )
                 return True
             raise
-
 
 
 class Render3dExportTask(ExportTask):
@@ -976,7 +1282,11 @@ class JlcBomFormatTask(ExportTask):
         super().__init__("Formatting JLCPCB BOM")
 
     def is_applicable(self, context: ExportContext) -> bool:
-        return context.options.get("export_bom", True) and bool(context.sch_file)
+        return (
+            context.options.get("format_jlc", True)
+            and context.options.get("export_bom", True)
+            and bool(context.sch_file)
+        )
 
     def run(self, context: ExportContext) -> bool:
         raw_bom_path = os.path.join(context.output_dir, "raw_bom.csv")
@@ -998,7 +1308,11 @@ class JlcCplFormatTask(ExportTask):
         super().__init__("Formatting JLCPCB CPL")
 
     def is_applicable(self, context: ExportContext) -> bool:
-        return context.options.get("export_pos", True) and bool(context.pcb_file)
+        return (
+            context.options.get("format_jlc", True)
+            and context.options.get("export_pos", True)
+            and bool(context.pcb_file)
+        )
 
     def run(self, context: ExportContext) -> bool:
         raw_pos_path = os.path.join(context.output_dir, "raw_pos.csv")
@@ -1085,9 +1399,9 @@ class ExportRunner:
                 pass
 
 
-def generate_ci_files(project_dir: str, output_dir_name: str, options: dict) -> tuple[str, bool]:
+def generate_cd_files(project_dir: str, output_dir_name: str, options: dict) -> tuple[str, bool]:
     """
-    Generates both GitHub Actions and Gitea Actions release workflows and updates .gitignore.
+    Generates both GitHub Actions and Gitea Actions release CD workflows and updates .gitignore.
     Returns a tuple of (message, success).
     """
     github_dir = os.path.join(project_dir, ".github", "workflows")
@@ -1131,6 +1445,7 @@ jobs:
           export_gerbers: '{'true' if options.get('export_gerbers', True) else 'false'}'
           export_drills: '{'true' if options.get('export_drills', True) else 'false'}'
           export_ibom: '{'true' if options.get('export_ibom', True) else 'false'}'
+          format_jlc: '{'true' if options.get('format_jlc', True) else 'false'}'
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
@@ -1174,6 +1489,7 @@ jobs:
           export_gerbers: '{'true' if options.get('export_gerbers', True) else 'false'}'
           export_drills: '{'true' if options.get('export_drills', True) else 'false'}'
           export_ibom: '{'true' if options.get('export_ibom', True) else 'false'}'
+          format_jlc: '{'true' if options.get('format_jlc', True) else 'false'}'
 
       - name: Create Release and Upload Assets
         uses: https://github.com/softprops/action-gh-release@v2
@@ -1184,64 +1500,7 @@ jobs:
         with open(gitea_yaml_path, 'w', encoding='utf-8') as f:
             f.write(gitea_yaml_content)
             
-        # Update .gitignore
-        gitignore_path = os.path.join(project_dir, ".gitignore")
-        gitignore_updated = False
-        
-        target_ignores = [
-            f"{output_dir_name}/",
-            "*.lck",
-            "*.tmp",
-            "fp-info-cache",
-            "_autosave-*",
-            "*.bak",
-            "*-backups/",
-            "*.kicad_pcb-bak",
-            "*.kicad_sch-bak",
-            ".history/",
-        ]
-        
-        if os.path.exists(gitignore_path):
-            with open(gitignore_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            lines = [line.strip() for line in content.splitlines()]
-            missing = []
-            for item in target_ignores:
-                if item not in lines and f"/{item}" not in lines and f"./{item}" not in lines:
-                    missing.append(item)
-                    
-            if missing:
-                with open(gitignore_path, 'a', encoding='utf-8') as f:
-                    if not content.endswith("\n"):
-                        f.write("\n")
-                    f.write("\n# KiCad & KiForge patterns added by KiForge\n")
-                    for item in missing:
-                        f.write(f"{item}\n")
-                gitignore_updated = True
-        else:
-            default_ignores = [
-                "# KiForge output directory",
-                f"{output_dir_name}/",
-                "",
-                "# KiCad temporary and lock files",
-                "*.lck",
-                "*.tmp",
-                "fp-info-cache",
-                "_autosave-*",
-                "",
-                "# KiCad backup files",
-                "*.bak",
-                "*-backups/",
-                "*.kicad_pcb-bak",
-                "*.kicad_sch-bak",
-                "",
-                "# KiCad 10 Local History / Auto-backups",
-                ".history/",
-            ]
-            with open(gitignore_path, 'w', encoding='utf-8') as f:
-                f.write("\n".join(default_ignores) + "\n")
-            gitignore_updated = True
+        gitignore_updated = update_project_gitignore(project_dir, output_dir_name)
             
         msg = (
             f"CD workflows generated successfully:\n"
@@ -1249,12 +1508,23 @@ jobs:
             f"  - Gitea: .gitea/workflows/release.yml"
         )
         if gitignore_updated:
-            msg += f"\n\nAnd KiCad & KiForge ignore patterns added/updated in .gitignore."
+            template_hint = get_gitignore_template_path()
+            if template_hint:
+                msg += (
+                    f"\n\nKiCad & KiForge ignore patterns added/updated in .gitignore "
+                    f"(template: {template_hint})."
+                )
+            else:
+                msg += f"\n\nKiCad & KiForge ignore patterns added/updated in .gitignore."
         else:
             msg += f"\n\nAll KiCad & KiForge patterns were already ignored in .gitignore."
         return msg, True
     except Exception as e:
-        return f"Failed to generate CI files: {e}", False
+        return f"Failed to generate CD files: {e}", False
+
+
+# Backward-compatible alias
+generate_ci_files = generate_cd_files
 
 
 # Main library run_export entrypoint
@@ -1278,7 +1548,24 @@ def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=Tr
             return False
             
     runner = ExportRunner(context)
-    return runner.execute()
+    success = runner.execute()
+
+    generate_cd = context.options.get("generate_cd", context.options.get("generate_ci", True))
+    if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+        if generate_cd:
+            context.logger.info(
+                "Skipping CD workflow generation inside GitHub Actions (workflows already present)."
+            )
+        generate_cd = False
+    if success and generate_cd:
+        cd_options = export_options_from_context(context)
+        cd_msg, cd_ok = generate_cd_files(context.project_dir, context.output_dir_name, cd_options)
+        if cd_ok:
+            context.logger.info(f"CD workflow files updated: {cd_msg.replace(chr(10), ' ')}")
+        else:
+            context.logger.warning(f"CD workflow generation failed: {cd_msg}")
+
+    return success
 
 
 def parse_cli_args(args=None):
@@ -1296,8 +1583,12 @@ def parse_cli_args(args=None):
     parser.add_argument("--export-gerbers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--export-drills", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--export-ibom", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--format-jlc", action=argparse.BooleanOptionalAction, default=True,
+                        help="Apply JLCPCB BOM/CPL column formatting and rotation offsets")
     parser.add_argument("--version-tag", "--version_tag", dest="version_tag", default=None, help="Version tag to append to output filenames")
-    parser.add_argument("--generate-ci", action="store_true", help="Generate GitHub Actions release workflow and update .gitignore instead of exporting")
+    parser.add_argument("--generate-cd", action="store_true", dest="generate_cd",
+                        help="Generate GitHub/Gitea release CD workflow and update .gitignore instead of exporting")
+    parser.add_argument("--generate-ci", action="store_true", dest="generate_cd", help=argparse.SUPPRESS)
     return parser.parse_args(args)
 
 
@@ -1305,7 +1596,7 @@ if __name__ == "__main__":
     setup_logger()
     args = parse_cli_args()
     
-    if args.generate_ci:
+    if args.generate_cd:
         options = {
             "export_3d": args.export_3d,
             "export_svg": args.export_svg,
@@ -1316,9 +1607,10 @@ if __name__ == "__main__":
             "export_gerbers": args.export_gerbers,
             "export_drills": args.export_drills,
             "export_ibom": args.export_ibom,
+            "format_jlc": args.format_jlc,
             "version": args.version_tag
         }
-        msg, success = generate_ci_files(args.project_path, args.output_dir, options)
+        msg, success = generate_cd_files(args.project_path, args.output_dir, options)
         print(msg)
         sys.exit(0 if success else 1)
         
@@ -1333,6 +1625,7 @@ if __name__ == "__main__":
             "export_gerbers": args.export_gerbers,
             "export_drills": args.export_drills,
             "export_ibom": args.export_ibom,
+            "format_jlc": args.format_jlc,
             "version": args.version_tag
         }
         

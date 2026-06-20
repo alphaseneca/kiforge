@@ -22,6 +22,8 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertTrue(args.export_gerbers)
         self.assertTrue(args.export_drills)
         self.assertTrue(args.export_ibom)
+        self.assertTrue(args.format_jlc)
+        self.assertFalse(args.generate_cd)
 
     def test_custom_paths(self):
         """Verify project path and output directory custom arguments."""
@@ -73,6 +75,61 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertTrue(isinstance(path, str))
         self.assertTrue(len(path) > 0)
 
+    def test_generate_cd_only_flag(self):
+        """Verify --generate-cd sets generate_cd mode without running export."""
+        args = kiforge.parse_cli_args(["--generate-cd"])
+        self.assertTrue(args.generate_cd)
+
+    def test_github_actions_skips_cd_on_export(self):
+        """Verify CD workflow generation is skipped when GITHUB_ACTIONS is set."""
+        import tempfile
+        import shutil
+        from unittest.mock import patch
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            pcb_path = os.path.join(temp_dir, "board.kicad_pcb")
+            with open(pcb_path, "w", encoding="utf-8") as f:
+                f.write("(kicad_pcb (version 20240108)\n")
+
+            options = {
+                "generate_cd": True,
+                "export_gerbers": False,
+                "export_drills": False,
+                "export_pos": False,
+                "export_bom": False,
+                "export_ibom": False,
+                "export_sch_pdf": False,
+                "export_step": False,
+                "export_3d": False,
+                "export_svg": False,
+            }
+            context = kiforge.ExportContext(temp_dir, "out", options)
+            original_setup_logger = kiforge.setup_logger
+            kiforge.setup_logger = lambda dir: None
+            try:
+                self.assertTrue(context.resolve())
+            finally:
+                kiforge.setup_logger = original_setup_logger
+
+            with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False):
+                with patch.object(kiforge, "generate_cd_files") as mock_cd:
+                    with patch.object(kiforge.ExportRunner, "execute", return_value=True):
+                        kiforge.run_export(context=context)
+                        mock_cd.assert_not_called()
+
+            env_backup = os.environ.pop("GITHUB_ACTIONS", None)
+            try:
+                with patch.object(kiforge, "generate_cd_files", return_value=("CD updated", True)) as mock_cd:
+                    with patch.object(kiforge.ExportRunner, "execute", return_value=True):
+                        kiforge.run_export(context=context)
+                        mock_cd.assert_called_once()
+            finally:
+                if env_backup is not None:
+                    os.environ["GITHUB_ACTIONS"] = env_backup
+        finally:
+            shutil.rmtree(temp_dir)
+
     def test_context_cancellation(self):
         """Verify ExportContext thread-safe cancellation functions as expected."""
         options = {"export_bom": True}
@@ -109,8 +166,8 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertEqual(context.rotation_offsets.get("R0603"), 90.0)
         self.assertEqual(context.rotation_offsets.get("U1"), 180.0)
 
-    def test_ci_generation(self):
-        """Verify centralized CI file generation creates correct workflow files and .gitignore entry."""
+    def test_cd_generation(self):
+        """Verify centralized CD file generation creates correct workflow files and .gitignore entry."""
         import tempfile
         import shutil
         
@@ -122,7 +179,7 @@ class TestKiForgeCLI(unittest.TestCase):
                 f.write("*.log\n")
                 
             options = {"export_3d": False, "export_bom": True}
-            msg, success = kiforge.generate_ci_files(temp_dir, "kiforge_test_ci", options)
+            msg, success = kiforge.generate_cd_files(temp_dir, "kiforge_test_ci", options)
             self.assertTrue(success)
             
             # Check GitHub workflow file
@@ -146,8 +203,68 @@ class TestKiForgeCLI(unittest.TestCase):
             with open(gitignore_path, 'r', encoding='utf-8') as f:
                 git_content = f.read()
                 self.assertIn("kiforge_test_ci/", git_content)
+                self.assertIn(".history/", git_content)
         finally:
             shutil.rmtree(temp_dir)
+
+    def test_gitignore_template_patterns(self):
+        """Verify gitignore template includes KiCad 10 patterns."""
+        patterns = kiforge.load_gitignore_patterns("kiforge_out")
+        self.assertIn("kiforge_out/", patterns)
+        self.assertIn(".history/", patterns)
+        self.assertIn("*.kicad_prl", patterns)
+        self.assertIn("bom/", patterns)
+
+    def test_global_settings_save_and_merge(self):
+        """Verify global settings persist and merge with project settings."""
+        import tempfile
+        import shutil
+
+        temp_dir = tempfile.mkdtemp()
+        global_path = kiforge.get_global_settings_path()
+        backup = None
+        if os.path.isfile(global_path):
+            with open(global_path, "r", encoding="utf-8") as f:
+                backup = f.read()
+
+        try:
+            kiforge.save_settings({"format_jlc": False, "output_dir": "global_out"}, scope="global")
+            merged = kiforge.load_merged_settings(temp_dir)
+            self.assertFalse(merged["format_jlc"])
+            self.assertEqual(merged["output_dir"], "global_out")
+
+            project_settings = os.path.join(temp_dir, ".kiforge.json")
+            with open(project_settings, "w", encoding="utf-8") as f:
+                import json
+                json.dump({"output_dir": "project_out"}, f)
+            merged = kiforge.load_merged_settings(temp_dir)
+            self.assertEqual(merged["output_dir"], "project_out")
+            self.assertFalse(merged["format_jlc"])
+        finally:
+            shutil.rmtree(temp_dir)
+            if backup is not None:
+                os.makedirs(os.path.dirname(global_path), exist_ok=True)
+                with open(global_path, "w", encoding="utf-8") as f:
+                    f.write(backup)
+            elif os.path.isfile(global_path):
+                os.remove(global_path)
+
+    def test_drill_runs_when_only_gerbers_enabled(self):
+        """Verify drill export runs when gerbers are enabled even if drills flag is false."""
+        task = kiforge.DrillExportTask()
+        context = kiforge.ExportContext(".", "kiforge_out", {"export_gerbers": True, "export_drills": False})
+        context.pcb_file = "dummy.kicad_pcb"
+        self.assertTrue(task.is_applicable(context))
+
+    def test_jlc_format_tasks_respect_format_jlc_flag(self):
+        """Verify JLC formatting tasks are skipped when format_jlc is false."""
+        bom_task = kiforge.JlcBomFormatTask()
+        cpl_task = kiforge.JlcCplFormatTask()
+        context = kiforge.ExportContext(".", "kiforge_out", {"format_jlc": False, "export_bom": True, "export_pos": True})
+        context.pcb_file = "dummy.kicad_pcb"
+        context.sch_file = "dummy.kicad_sch"
+        self.assertFalse(bom_task.is_applicable(context))
+        self.assertFalse(cpl_task.is_applicable(context))
 
     def test_version_tag_resolution(self):
         """Verify version resolution and normalization from environment, options, and file extraction."""
@@ -188,9 +305,29 @@ class TestKiForgeCLI(unittest.TestCase):
                 kiforge.setup_logger = original_setup_logger
             # Should read "1.2.3-sch" and normalize to "v1.2.3-sch"
             self.assertEqual(context.pcb_name, "myboard_v1.2.3-sch")
+
+            # Case 3: Default to v0.1.0 when no rev, env, or option is available
+            plain_dir = tempfile.mkdtemp()
+            try:
+                plain_pcb = os.path.join(plain_dir, "plain.kicad_pcb")
+                with open(plain_pcb, "w", encoding="utf-8") as f:
+                    f.write("(kicad_pcb (version 20240108)\n")
+                context = kiforge.ExportContext(plain_dir, "out", {})
+                kiforge.setup_logger = lambda dir: None
+                try:
+                    self.assertTrue(context.resolve())
+                finally:
+                    kiforge.setup_logger = original_setup_logger
+                self.assertEqual(context.pcb_name, "plain_v0.1.0")
+            finally:
+                shutil.rmtree(plain_dir)
             
         finally:
             shutil.rmtree(temp_dir)
+
+    def test_generate_ci_files_alias(self):
+        """Verify deprecated generate_ci_files alias still works."""
+        self.assertIs(kiforge.generate_ci_files, kiforge.generate_cd_files)
 
     def test_step3d_export_task_vrml_warning(self):
         """Verify that Step3dExportTask intercepts VRML model export errors, logs a warning, and returns True."""
