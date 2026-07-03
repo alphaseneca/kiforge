@@ -61,7 +61,7 @@ inputs:
     required: false
     default: 'true'
   format_jlc:
-    description: 'Also produce JLC-ready BOM/CPL via Fabrication Toolkit (fallback formatter in CI) (true/false)'
+    description: 'Also produce JLC-ready BOM/CPL from KiCad CSV exports (true/false)'
     required: false
     default: 'true'
   pos_side:

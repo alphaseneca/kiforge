@@ -430,7 +430,115 @@ class TestKiForgeCLI(unittest.TestCase):
         cmd = captured["cmd"]
         self.assertEqual(cmd[cmd.index("--fields") + 1], kiforge.BOM_EXPORT_DEFAULTS["fields"])
         self.assertEqual(cmd[cmd.index("--group-by") + 1], kiforge.BOM_EXPORT_DEFAULTS["group_by"])
-        self.assertNotIn("LCSC", " ".join(cmd))
+        self.assertIn("ID", cmd[cmd.index("--fields") + 1])
+
+    def test_lcsc_part_number_from_id(self):
+        """JLC LCSC Part # is copied from ID only when ID matches ^C\\d+$."""
+        row = {"ID": "C125111"}
+        self.assertEqual(kiforge.JLCPCBFormatter._lcsc_part_number(row), "C125111")
+        self.assertEqual(kiforge.JLCPCBFormatter._lcsc_part_number({"ID": "R0603"}), "")
+        self.assertEqual(kiforge.JLCPCBFormatter._lcsc_part_number({"ID": "c125111"}), "")
+        self.assertEqual(kiforge.JLCPCBFormatter._lcsc_part_number({"ID": "C125111X"}), "")
+        self.assertEqual(
+            kiforge.JLCPCBFormatter._lcsc_part_number({"LCSC Part #": "C125111"}),
+            "",
+        )
+
+    def test_resolve_jlc_gerber_layers_two_layer_board(self):
+        """JLC gerber export includes only manufacturing layers on a 2-layer board."""
+        pcb = os.path.join("tests", "sample_project", "sample.kicad_pcb")
+        layers = kiforge.resolve_jlc_gerber_layers(pcb)
+        self.assertEqual(
+            layers,
+            [
+                "F.Cu", "B.Cu",
+                "F.Paste", "B.Paste", "F.SilkS", "B.SilkS",
+                "F.Mask", "B.Mask", "Edge.Cuts",
+                "Dwgs.User", "Cmts.User",
+            ],
+        )
+        self.assertNotIn("F.Fab", layers)
+        self.assertNotIn("User.1", layers)
+
+    def test_gerber_export_defaults(self):
+        """Gerber export uses JLC manufacturing layers and zone refill."""
+        from unittest.mock import patch
+
+        task = kiforge.GerberExportTask()
+        pcb = os.path.join("tests", "sample_project", "sample.kicad_pcb")
+        context = kiforge.ExportContext(".", "out", {})
+        context.pcb_file = pcb
+        context.kicad_cli = "kicad-cli"
+        context.temp_gerber_dir = "out/temp_gerbers"
+        captured = {}
+
+        def fake_run(cmd, ctx, **kwargs):
+            captured["cmd"] = cmd
+            return True
+
+        with patch.object(task, "_run_subprocess", side_effect=fake_run):
+            self.assertTrue(task.run(context))
+        cmd = captured["cmd"]
+        layer_arg = cmd[cmd.index("--layers") + 1]
+        self.assertIn("F.Cu", layer_arg)
+        self.assertIn("Edge.Cuts", layer_arg)
+        self.assertNotIn("F.Fab", layer_arg)
+        self.assertIn("--check-zones", cmd)
+        self.assertIn("--use-drill-file-origin", cmd)
+        self.assertNotIn("--no-protel-ext", cmd)
+
+    def test_drill_export_defaults(self):
+        """Drill export matches JLC Excellon settings (merged PTH/NPTH, absolute origin)."""
+        from unittest.mock import patch
+
+        task = kiforge.DrillExportTask()
+        context = kiforge.ExportContext(".", "out", {})
+        context.pcb_file = "board.kicad_pcb"
+        context.kicad_cli = "kicad-cli"
+        context.temp_gerber_dir = "out/temp_gerbers"
+        captured = {}
+
+        def fake_run(cmd, ctx, **kwargs):
+            captured["cmd"] = cmd
+            return True
+
+        with patch.object(task, "_run_subprocess", side_effect=fake_run):
+            self.assertTrue(task.run(context))
+        cmd = captured["cmd"]
+        self.assertNotIn("--excellon-separate-th", cmd)
+        self.assertEqual(cmd[cmd.index("--drill-origin") + 1], "absolute")
+        self.assertEqual(cmd[cmd.index("--excellon-units") + 1], "mm")
+        self.assertEqual(cmd[cmd.index("--excellon-zeros-format") + 1], "decimal")
+        self.assertEqual(cmd[cmd.index("--excellon-oval-format") + 1], "alternate")
+
+    def test_gerber_zip_skips_job_file(self):
+        """Gerber ZIP omits KiCad job files not needed by fab houses."""
+        import zipfile
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            gerber_dir = os.path.join(temp_dir, "temp_gerbers")
+            os.makedirs(gerber_dir)
+            with open(os.path.join(gerber_dir, "board-F_Cu.gtl"), "w", encoding="utf-8") as f:
+                f.write("gerber")
+            with open(os.path.join(gerber_dir, "board-job.gbrjob"), "w", encoding="utf-8") as f:
+                f.write("job")
+
+            task = kiforge.GerberPackTask()
+            context = kiforge.ExportContext(".", temp_dir, {"export_gerbers": True})
+            context.pcb_file = "board.kicad_pcb"
+            context.pcb_name = "board"
+            context.output_dir = temp_dir
+            context.temp_gerber_dir = gerber_dir
+            self.assertTrue(task.run(context))
+
+            zip_path = os.path.join(temp_dir, "board_gerbers.zip")
+            with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+            self.assertIn("board-F_Cu.gtl", names)
+            self.assertNotIn("board-job.gbrjob", names)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_ibom_bom_field_mapping(self):
         """InteractiveHtmlBom CLI args mirror BOM_EXPORT_DEFAULTS."""
@@ -587,7 +695,7 @@ class TestKiForgeCLI(unittest.TestCase):
 
             bom_task = kiforge.BomOutputTask()
             pos_task = kiforge.PosOutputTask()
-            jlc_task = kiforge.FabricationToolkitTask()
+            jlc_task = kiforge.JlcFormatTask()
             context = kiforge.ExportContext(".", "out", {"format_jlc": False, "export_bom": True, "export_pos": True})
             context.pcb_file = "dummy.kicad_pcb"
             context.sch_file = "dummy.kicad_sch"
@@ -637,8 +745,8 @@ class TestKiForgeCLI(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_jlc_fallback_formatter_from_kicad_exports(self):
-        """When Fabrication Toolkit is absent, fallback formatter creates JLC CSVs."""
+    def test_format_jlc_exports_from_kicad_csvs(self):
+        """JLC copies follow JLCPCB KiCad Method 1 column layout."""
         import tempfile
         import csv
 
@@ -647,112 +755,72 @@ class TestKiForgeCLI(unittest.TestCase):
         os.makedirs(out_dir)
         try:
             bom_path = os.path.join(out_dir, "board_v1.0_bom.csv")
+            pos_path = os.path.join(out_dir, "board_v1.0_pos.csv")
             with open(bom_path, "w", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=["Reference", "Value", "Footprint", "DNP"])
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["Reference", "Value", "Footprint", "${DNP}", "${QUANTITY}", "ID"],
+                )
                 writer.writeheader()
-                writer.writerow({"Reference": "R1", "Value": "10k", "Footprint": "R_0603", "DNP": ""})
-
-            context = kiforge.ExportContext(".", "out", {"export_bom": True, "export_pos": False})
-            context.pcb_name = "board_v1.0"
-            context.output_dir = out_dir
-            context.logger = kiforge.logger
-
-            from unittest.mock import patch
-            with patch.object(kiforge, "fabrication_toolkit_is_available", return_value=False):
-                self.assertTrue(kiforge.apply_jlc_fallback_from_kicad_exports(context))
-            self.assertTrue(os.path.isfile(os.path.join(out_dir, "board_v1.0_bom_jlc.csv")))
-        finally:
-            shutil.rmtree(temp_dir)
-
-    def test_fabrication_toolkit_install_from_zip(self):
-        """Fabrication Toolkit can be installed from the GitHub release zip."""
-        import io
-        import zipfile
-        from unittest.mock import patch
-
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w") as archive:
-            archive.writestr("plugins/cli.py", "def main():\n    pass\n")
-            archive.writestr("plugins/__init__.py", "")
-        payload = buffer.getvalue()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(kiforge, "fabrication_toolkit_plugin_dir", return_value=os.path.join(tmp, "ft")):
-                with patch.object(kiforge, "_fabrication_toolkit_zip_url", return_value="https://example.com/ft.zip"):
-                    with patch.object(kiforge.urllib.request, "urlopen") as mock_urlopen:
-                        mock_resp = mock_urlopen.return_value.__enter__.return_value
-                        mock_resp.read.return_value = payload
-                        self.assertTrue(kiforge.install_fabrication_toolkit_from_release())
-            self.assertTrue(os.path.isfile(os.path.join(tmp, "ft", "cli.py")))
-
-    def test_fabrication_toolkit_cli_invocation_uses_runpy(self):
-        """Fabrication Toolkit CLI must use runpy (PCM IDs contain hyphens)."""
-        cmd, env = kiforge.build_fabrication_toolkit_cli_invocation(
-            r"C:\Program Files\KiCad\10.0\bin\python.exe",
-            "board.kicad_pcb",
-            "board_v1.0",
-            {},
-        )
-        self.assertEqual(cmd[0], r"C:\Program Files\KiCad\10.0\bin\python.exe")
-        self.assertEqual(cmd[1], "-c")
-        self.assertIn("runpy.run_module", cmd[2])
-        self.assertIn("board.kicad_pcb", cmd[2])
-        self.assertIn("plugins", env["PYTHONPATH"])
-
-    def test_verify_fabrication_toolkit_cli_after_install(self):
-        """Installed Fabrication Toolkit CLI launches with KiCad Python."""
-        import io
-        import zipfile
-        from unittest.mock import patch
-
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w") as archive:
-            archive.writestr("plugins/cli.py", "def main():\n    pass\n")
-            archive.writestr("plugins/__init__.py", "")
-        payload = buffer.getvalue()
-
-        py = kiforge.get_kicad_python_path()
-        if not os.path.isfile(py):
-            self.skipTest("KiCad Python not available")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            third = os.path.join(tmp, "3rdparty")
-            with patch.object(kiforge, "ensure_kicad_third_party_dir", return_value=third):
-                with patch.object(kiforge, "_fabrication_toolkit_zip_url", return_value="https://example.com/ft.zip"):
-                    with patch.object(kiforge.urllib.request, "urlopen") as mock_urlopen:
-                        mock_resp = mock_urlopen.return_value.__enter__.return_value
-                        mock_resp.read.return_value = payload
-                        self.assertTrue(kiforge.install_fabrication_toolkit_from_release())
-                cli_path = kiforge.fabrication_toolkit_cli_path()
-                with open(cli_path, "w", encoding="utf-8") as handle:
-                    handle.write(
-                        "import argparse\n"
-                        "if __name__ == '__main__':\n"
-                        "    argparse.ArgumentParser(prog='Fabrication Toolkit').parse_args()\n"
-                    )
-                self.assertTrue(kiforge.verify_fabrication_toolkit_cli(py, {}))
-
-    def test_fabrication_toolkit_copy_outputs(self):
-        """Fabrication Toolkit production/ files are copied into the KiForge output folder."""
-        temp_dir = tempfile.mkdtemp()
-        out_dir = os.path.join(temp_dir, "out")
-        production_dir = os.path.join(temp_dir, "production")
-        os.makedirs(out_dir)
-        os.makedirs(production_dir)
-        try:
-            with open(os.path.join(production_dir, "bom.csv"), "w", encoding="utf-8") as f:
-                f.write("Designator,Comment\nR1,10k\n")
-            with open(os.path.join(production_dir, "positions.csv"), "w", encoding="utf-8") as f:
-                f.write("Designator,Mid X,Mid Y,Rotation,Layer\nR1,1,2,0,Top\n")
+                writer.writerow({
+                    "Reference": "R1",
+                    "Value": "10k",
+                    "Footprint": "R_0603",
+                    "${DNP}": "",
+                    "${QUANTITY}": "1",
+                    "ID": "C125111",
+                })
+                writer.writerow({
+                    "Reference": "C1",
+                    "Value": "100n",
+                    "Footprint": "C_0603",
+                    "${DNP}": "",
+                    "${QUANTITY}": "1",
+                    "ID": "custom-cap",
+                })
+            with open(pos_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["Ref", "Val", "Package", "PosX", "PosY", "Rot", "Side"]
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Ref": "R1", "Val": "10k", "Package": "R_0603",
+                    "PosX": "12.5", "PosY": "8.0", "Rot": "90", "Side": "top",
+                })
 
             context = kiforge.ExportContext(".", "out", {"export_bom": True, "export_pos": True})
             context.pcb_name = "board_v1.0"
             context.output_dir = out_dir
             context.logger = kiforge.logger
 
-            self.assertTrue(kiforge.copy_fabrication_toolkit_jlc_outputs(context, production_dir))
-            self.assertTrue(os.path.isfile(os.path.join(out_dir, "board_v1.0_bom_jlc.csv")))
-            self.assertTrue(os.path.isfile(os.path.join(out_dir, "board_v1.0_cpl_jlc.csv")))
+            self.assertTrue(kiforge.format_jlc_exports(context))
+            jlc_bom = os.path.join(out_dir, "board_v1.0_bom_jlc.csv")
+            jlc_cpl = os.path.join(out_dir, "board_v1.0_cpl_jlc.csv")
+            self.assertTrue(os.path.isfile(jlc_bom))
+            self.assertTrue(os.path.isfile(jlc_cpl))
+
+            with open(jlc_bom, encoding="utf-8-sig", newline="") as f:
+                bom_reader = csv.DictReader(f)
+                self.assertEqual(bom_reader.fieldnames, list(kiforge.JLC_BOM_COLUMNS))
+                row = next(bom_reader)
+                self.assertEqual(row["Comment"], "10k")
+                self.assertEqual(row["Designator"], "R1")
+                self.assertEqual(row["Footprint"], "R_0603")
+                self.assertEqual(row[kiforge.JLC_BOM_PART_COLUMN], "C125111")
+                self.assertEqual(row["Quantity"], "1")
+                row2 = next(bom_reader)
+                self.assertEqual(row2["Designator"], "C1")
+                self.assertEqual(row2[kiforge.JLC_BOM_PART_COLUMN], "")
+
+            with open(jlc_cpl, encoding="utf-8-sig", newline="") as f:
+                cpl_reader = csv.DictReader(f)
+                self.assertEqual(cpl_reader.fieldnames, list(kiforge.JLC_CPL_COLUMNS))
+                row = next(cpl_reader)
+                self.assertEqual(row["Designator"], "R1")
+                self.assertEqual(row["Mid X"], "12.5")
+                self.assertEqual(row["Mid Y"], "8.0")
+                self.assertEqual(row["Rotation"], "90")
+                self.assertEqual(row["Layer"], "Top")
         finally:
             shutil.rmtree(temp_dir)
 

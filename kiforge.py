@@ -5,8 +5,7 @@ KiForge — KiCad 10 Manufacturing & Documentation Exporter
 
 Single source of truth for manufacturing and documentation exports. KiForge runs
 ``kicad-cli`` in a structured pipeline, produces both unedited KiCad BOM/placement
-CSVs and JLC-ready copies via JLCPCB Fabrication Toolkit (with a lightweight
-fallback formatter when the plugin is not installed), and can generate
+CSVs and optional JLC-ready copies via a built-in formatter, and can generate
 GitHub/Gitea release workflows for downstream KiCad projects.
 
 Entry points
@@ -43,8 +42,13 @@ user-configurable and flow through CLI, GitHub Action, CD YAML, and
    and :func:`build_cd_substitutions`.
 3. **Runtime options** (``RUNTIME_OPTION_SPECS``) — per-run only (e.g.
    ``sync_title_block_rev``); not saved to ``.kiforge.json``.
-4. **Fixed pipelines** — :data:`BOM_EXPORT_DEFAULTS` (raw BOM + iBOM columns/grouping)
-   and :data:`RENDER_3D_DEFAULTS` (3D PNG renders). Not exposed as parameters.
+4. **Fixed pipelines** — :data:`BOM_EXPORT_DEFAULTS` (raw BOM + iBOM columns/grouping),
+   :data:`RENDER_3D_DEFAULTS` (3D PNG renders), :data:`GERBER_EXPORT_DEFAULTS` /
+   :data:`DRILL_EXPORT_DEFAULTS` (JLC-aligned gerber/drill). Not exposed as parameters.
+
+Symbol fields for assembly: put JLC/LCSC numbers in **ID** (e.g. ``C125111``); **MPN**
+is exported in the raw BOM only. JLC ``LCSC Part #`` is derived from ``ID`` when it
+matches ``^C\\d+$``.
 
 See ``ARCHITECTURE.md`` §7 for the full configuration reference.
 
@@ -85,7 +89,7 @@ Key types
 ---------
 PathResolver     Resolve ``kicad-cli`` and KiCad Python across platforms.
 ExportContext    Resolved paths, options, subprocess env, cancellation, offsets.
-JLCPCBFormatter  Fallback BOM/CPL formatter when Fabrication Toolkit is absent.
+JLCPCBFormatter  Formats JLC-upload BOM/CPL from KiCad CSV exports.
 ExportTask       Abstract export step; subclasses implement ``is_applicable`` / ``run``.
 ExportRunner     Ordered pipeline driver with progress and cleanup.
 generate_cd_files  Write CD workflow YAML and update project ``.gitignore``.
@@ -188,6 +192,8 @@ KIFORGE_ACTION_REF = "alphaseneca/kiforge@main"
 #   "export_params" and flattened onto ExportContext.options at run time.
 # - BOM_EXPORT_DEFAULTS / RENDER_3D_DEFAULTS: hardcoded kicad-cli arguments for
 #   BOM CSV and 3D PNGs — intentionally NOT in export_params (no CLI/Action/CD).
+# - GERBER_EXPORT_DEFAULTS / DRILL_EXPORT_DEFAULTS: JLCPCB-aligned gerber/drill
+#   export (manufacturing layers only, merged drill file).
 # - DEFAULT_IBOM_SETTINGS: HTML BOM presentation only (tracks, dark mode, …);
 #   column layout comes from BOM_EXPORT_DEFAULTS via build_ibom_cli_args().
 # - RUNTIME_OPTION_SPECS: per-run flags (title-block sync); never saved.
@@ -235,6 +241,34 @@ RENDER_3D_DEFAULTS = {
     "height": 1080,
     "preset": "2",
 }
+
+# Gerber/drill export aligned with JLCPCB KiCad 9 guide (manufacturing layers only).
+# kicad-cli defaults already match Protel extensions, X2, and netlist attributes when
+# --no-protel-ext, --no-x2, and --no-netlist are omitted.
+GERBER_EXPORT_DEFAULTS = {
+    "check_zones": True,
+    "use_drill_file_origin": True,
+}
+
+DRILL_EXPORT_DEFAULTS = {
+    "format": "excellon",
+    "drill_origin": "absolute",
+    "excellon_units": "mm",
+    "excellon_zeros_format": "decimal",
+    "excellon_oval_format": "alternate",
+}
+
+# Non-manufacturing outputs to omit from the Gerber ZIP.
+GERBER_ZIP_SKIP_SUFFIXES = (".gbrjob",)
+
+_JLC_GERBER_TAIL_LAYERS = (
+    "F.Paste", "B.Paste", "F.SilkS", "B.SilkS", "F.Mask", "B.Mask", "Edge.Cuts",
+    "Dwgs.User", "Cmts.User",
+)
+
+_JLC_GERBER_FALLBACK_LAYERS = (
+    "F.Cu", "B.Cu", *_JLC_GERBER_TAIL_LAYERS,
+)
 
 # Registry: each entry maps one export_params key → CLI flag, Action input, CD placeholder.
 EXPORT_PARAM_SPECS = (
@@ -1641,269 +1675,151 @@ class ExportContext:
 
 
 # ---------------------------------------------------------------------------
-# JLCPCB Fabrication Toolkit integration
+# JLCPCB BOM/CPL formatting (KiCad Method 1 — kicad-cli export + column remap)
+# https://jlcpcb.com/help/article/how-to-generate-the-bom-and-centroid-file-from-kicad
 # ---------------------------------------------------------------------------
 
-FABRICATION_TOOLKIT_PACKAGE = "com_github_bennymeg_JLC-Plugin-for-KiCad"
-FABRICATION_TOOLKIT_CLI_MODULE = f"{FABRICATION_TOOLKIT_PACKAGE}.cli"
-FABRICATION_TOOLKIT_PRODUCTION_DIR = "production"
-FABRICATION_TOOLKIT_REPO = "bennymeg/Fabrication-Toolkit"
-FABRICATION_TOOLKIT_RELEASE_FALLBACK = "5.3.1"
+# JLCPCB SMT assembly upload layout (BOM + centroid / CPL).
+# Method 1 sample headers + Quantity (KiCad ${QUANTITY} / grouped ref count).
+JLC_BOM_PART_COLUMN = "LCSC Part #"
+JLC_BOM_COLUMNS = ("Comment", "Designator", "Footprint", JLC_BOM_PART_COLUMN, "Quantity")
+JLC_CPL_COLUMNS = ("Designator", "Mid X", "Mid Y", "Rotation", "Layer")
+
+# LCSC/JLC library part numbers use a leading C followed by digits (e.g. C125111).
+LCSC_PART_ID_PATTERN = re.compile(r"^C\d+$")
 
 
-def resolve_kicad_third_party_dir() -> str | None:
-    """Return KiCad's 3rdparty directory when Fabrication Toolkit may be installed."""
-    for key in ("KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY"):
-        base = os.environ.get(key, "").strip()
-        if base and os.path.isdir(base):
-            return base
-
-    candidates: list[str] = []
-    if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-        for version in ("10.0", "9.0", "8.0"):
-            candidates.append(os.path.join(appdata, "kicad", version, "3rdparty"))
-    elif sys.platform == "darwin":
-        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "kicad")
-        for version in ("10.0", "9.0", "8.0"):
-            candidates.append(os.path.join(base, version, "3rdparty"))
-    else:
-        xdg = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
-        for version in ("10.0", "9.0", "8.0"):
-            candidates.append(os.path.join(xdg, "kicad", version, "3rdparty"))
-
-    for candidate in candidates:
-        if os.path.isdir(candidate):
-            return candidate
-    return None
-
-
-def ensure_kicad_third_party_dir() -> str:
-    """Return KiCad 3rdparty root, creating the default 10.0 location if needed."""
-    existing = resolve_kicad_third_party_dir()
-    if existing:
-        return existing
-
-    if sys.platform == "win32":
-        base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "kicad", "10.0", "3rdparty")
-    elif sys.platform == "darwin":
-        base = os.path.join(
-            os.path.expanduser("~"), "Library", "Application Support", "kicad", "10.0", "3rdparty"
-        )
-    else:
-        xdg = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
-        base = os.path.join(xdg, "kicad", "10.0", "3rdparty")
-
-    os.makedirs(os.path.join(base, "plugins"), exist_ok=True)
-    return base
-
-
-def fabrication_toolkit_plugin_dir() -> str:
-    return os.path.join(ensure_kicad_third_party_dir(), "plugins", FABRICATION_TOOLKIT_PACKAGE)
-
-
-def fabrication_toolkit_plugins_dir() -> str:
-    return os.path.join(ensure_kicad_third_party_dir(), "plugins")
-
-
-def fabrication_toolkit_cli_path() -> str:
-    return os.path.join(fabrication_toolkit_plugin_dir(), "cli.py")
-
-
-def fabrication_toolkit_is_available() -> bool:
-    """True when Fabrication Toolkit is installed under KiCad 3rdparty."""
-    plugin_dir = fabrication_toolkit_plugin_dir()
-    return (
-        os.path.isfile(os.path.join(plugin_dir, "cli.py"))
-        and os.path.isfile(os.path.join(plugin_dir, "__init__.py"))
-    )
-
-
-def _fabrication_toolkit_zip_url() -> str:
-    api_url = f"https://api.github.com/repos/{FABRICATION_TOOLKIT_REPO}/releases/latest"
-    try:
-        request = urllib.request.Request(api_url, headers={"User-Agent": "KiForge-Studio/1.0"})
-        with urllib.request.urlopen(request, timeout=15) as response:
-            release = json.loads(response.read().decode("utf-8"))
-        tag = release.get("tag_name", FABRICATION_TOOLKIT_RELEASE_FALLBACK)
-        for asset in release.get("assets", []):
-            name = asset.get("name", "")
-            if name.startswith("Fabrication-Toolkit-") and name.endswith(".zip"):
-                return asset["browser_download_url"]
-        return (
-            f"https://github.com/{FABRICATION_TOOLKIT_REPO}/releases/download/"
-            f"{tag}/Fabrication-Toolkit-{tag}.zip"
-        )
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        logger.warning("Could not resolve latest Fabrication Toolkit release: %s", exc)
-        tag = FABRICATION_TOOLKIT_RELEASE_FALLBACK
-        return (
-            f"https://github.com/{FABRICATION_TOOLKIT_REPO}/releases/download/"
-            f"{tag}/Fabrication-Toolkit-{tag}.zip"
-        )
-
-
-def install_fabrication_toolkit_from_release() -> bool:
-    """Download and install JLCPCB Fabrication Toolkit into KiCad 3rdparty plugins."""
-    dest = fabrication_toolkit_plugin_dir()
-    url = _fabrication_toolkit_zip_url()
-    logger.info("Downloading Fabrication Toolkit from %s", url)
-    try:
-        request = urllib.request.Request(url, headers={"User-Agent": "KiForge-Studio/1.0"})
-        with urllib.request.urlopen(request, timeout=120) as response:
-            payload = response.read()
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        logger.warning("Fabrication Toolkit download failed: %s", exc)
-        return False
-
-    try:
-        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            if os.path.isdir(dest):
-                shutil.rmtree(dest)
-            os.makedirs(dest, exist_ok=True)
-            for member in archive.namelist():
-                if not member.startswith("plugins/") or member.endswith("/"):
-                    continue
-                rel_path = member[len("plugins/"):]
-                target = os.path.join(dest, rel_path)
-                parent = os.path.dirname(target)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                with archive.open(member) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-    except (zipfile.BadZipFile, OSError, shutil.Error) as exc:
-        logger.warning("Fabrication Toolkit install failed: %s", exc)
-        return False
-
-    return fabrication_toolkit_is_available()
-
-
-def ensure_fabrication_toolkit_available(context: "ExportContext") -> bool:
-    """Verify Fabrication Toolkit is present; download/install from GitHub if missing."""
-    kicad_python = context.kicad_python or get_kicad_python_path()
-
-    if fabrication_toolkit_is_available() and verify_fabrication_toolkit_cli(
-        kicad_python, context.env
-    ):
-        context.logger.info("Fabrication Toolkit successfully verified.")
-        return True
-
-    context.logger.info(
-        "Fabrication Toolkit not found. Attempting to install from GitHub release..."
-    )
-    if context.progress_callback:
-        context.progress_callback(None, None, "Installing JLCPCB Fabrication Toolkit...")
-
-    if install_fabrication_toolkit_from_release() and verify_fabrication_toolkit_cli(
-        kicad_python, context.env
-    ):
-        context.logger.info("Fabrication Toolkit successfully installed and verified.")
-        return True
-
-    context.logger.warning("Failed to install Fabrication Toolkit from GitHub release.")
-    return False
-
-
-def build_fabrication_toolkit_env(base_env: dict | None) -> dict:
-    """Ensure KiCad 3rdparty plugins are on PYTHONPATH for Fabrication Toolkit CLI."""
-    env = dict(base_env or os.environ)
-    plugins_dir = fabrication_toolkit_plugins_dir()
-    prefix = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = plugins_dir + (os.pathsep + prefix if prefix else "")
-    return env
-
-
-def build_fabrication_toolkit_cli_invocation(
-    kicad_python: str,
-    pcb_file: str,
-    pcb_name: str,
-    base_env: dict | None = None,
-) -> tuple[list[str], dict]:
+class JLCPCBFormatter:
     """
-    Build argv/env to run Fabrication Toolkit via KiCad Python.
+    Build JLC-upload BOM/CPL CSVs from KiCad ``kicad-cli`` exports.
 
-    ``python -m`` cannot load PCM plugin IDs that contain hyphens, so KiForge
-    uses ``runpy.run_module`` with an explicit plugins path instead.
+    BOM output columns: ``Comment``, ``Designator``, ``Footprint``,
+    ``LCSC Part #``, ``Quantity``. CPL output columns: ``Designator``, ``Mid X``,
+    ``Mid Y``, ``Rotation``, ``Layer`` (mm, Top/Bottom).
+
+    Raw KiCad CSVs are unchanged. When ``format_jlc`` is on, writes
+    ``*_bom_jlc.csv`` and ``*_cpl_jlc.csv`` beside ``*_bom.csv`` / ``*_pos.csv``.
+    ``LCSC Part #`` is copied from symbol ``ID`` only when ``ID`` matches ``^C\\d+$``.
     """
-    plugins_dir = fabrication_toolkit_plugins_dir()
-    ft_env = build_fabrication_toolkit_env(base_env)
-    argv = [
-        "cli",
-        "-p",
-        pcb_file,
-        "-e",
-        "-t",
-        "-nB",
-        "--archiveName",
-        pcb_name,
-    ]
-    snippet = (
-        "import sys, runpy\n"
-        f"sys.path.insert(0, {plugins_dir!r})\n"
-        f"sys.argv = {json.dumps(argv)}\n"
-        f"runpy.run_module({FABRICATION_TOOLKIT_CLI_MODULE!r}, run_name='__main__')\n"
-    )
-    return [kicad_python, "-c", snippet], ft_env
+
+    @staticmethod
+    def _row_value(row: dict, *keys: str) -> str:
+        for key in keys:
+            value = row.get(key, "")
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _is_dnp(row: dict) -> bool:
+        dnp = JLCPCBFormatter._row_value(row, "${DNP}", "DNP")
+        return dnp.lower() in ("1", "dnp", "true", "yes")
+
+    @staticmethod
+    def _lcsc_part_number(row: dict) -> str:
+        """Copy symbol ``ID`` into LCSC Part # only when it matches ``^C\\d+$``."""
+        id_value = JLCPCBFormatter._row_value(row, "ID")
+        if id_value and LCSC_PART_ID_PATTERN.match(id_value):
+            return id_value
+        return ""
+
+    @staticmethod
+    def _normalize_layer(side: str) -> str:
+        normalized = side.strip().lower()
+        if normalized in ("bottom", "back", "b.cu", "b", "bot"):
+            return "Bottom"
+        return "Top"
+
+    @staticmethod
+    def format_bom(raw_bom_path: str, output_bom_path: str) -> None:
+        """Map KiCad BOM CSV columns to JLCPCB's upload format."""
+        if not os.path.exists(raw_bom_path):
+            return
+
+        with open(raw_bom_path, "r", newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle))
+
+        jlc_rows = []
+        for row in rows:
+            if JLCPCBFormatter._is_dnp(row):
+                continue
+
+            designator = JLCPCBFormatter._row_value(row, "Reference", "Designator", "References")
+            comment = JLCPCBFormatter._row_value(row, "Value", "Comment")
+            footprint = JLCPCBFormatter._row_value(row, "Footprint")
+            quantity = (
+                JLCPCBFormatter._row_value(row, "${QUANTITY}", "QUANTITY", "Quantity", "Qty")
+                or "1"
+            )
+            lcsc = JLCPCBFormatter._lcsc_part_number(row)
+
+            jlc_rows.append({
+                "Comment": comment,
+                "Designator": designator,
+                "Footprint": footprint,
+                JLC_BOM_PART_COLUMN: lcsc,
+                "Quantity": quantity,
+            })
+
+        with open(output_bom_path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(JLC_BOM_COLUMNS))
+            writer.writeheader()
+            writer.writerows(jlc_rows)
+
+    @staticmethod
+    def format_cpl(raw_pos_path: str, output_cpl_path: str, rotation_offsets: dict = None) -> None:
+        """Map KiCad placement CSV columns to JLCPCB centroid (CPL) format."""
+        if not os.path.exists(raw_pos_path):
+            return
+
+        with open(raw_pos_path, "r", newline="", encoding="utf-8-sig") as handle:
+            lines = handle.readlines()
+
+        clean_lines = [line for line in lines if not line.strip().startswith("#")]
+        rows = list(csv.DictReader(clean_lines))
+
+        offsets = dict(rotation_offsets or {})
+        jlc_cpl_rows = []
+        for row in rows:
+            designator = JLCPCBFormatter._row_value(row, "Ref", "Designator", "Reference")
+            val = JLCPCBFormatter._row_value(row, "Val", "Value")
+            package = JLCPCBFormatter._row_value(row, "Package", "Footprint")
+            pos_x = JLCPCBFormatter._row_value(row, "PosX", "Mid X")
+            pos_y = JLCPCBFormatter._row_value(row, "PosY", "Mid Y")
+            rot_str = JLCPCBFormatter._row_value(row, "Rot", "Rotation")
+            side = JLCPCBFormatter._row_value(row, "Side", "Layer")
+
+            try:
+                rotation = float(rot_str) if rot_str else 0.0
+            except ValueError:
+                rotation = 0.0
+
+            for pattern, offset in offsets.items():
+                needle = pattern.lower()
+                if needle in package.lower() or needle in val.lower():
+                    rotation = (rotation + offset) % 360.0
+                    break
+
+            rotation_text = (
+                f"{rotation:.2f}" if rotation % 1 else str(int(rotation))
+            )
+
+            jlc_cpl_rows.append({
+                "Designator": designator,
+                "Mid X": pos_x,
+                "Mid Y": pos_y,
+                "Rotation": rotation_text,
+                "Layer": JLCPCBFormatter._normalize_layer(side),
+            })
+
+        with open(output_cpl_path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(JLC_CPL_COLUMNS))
+            writer.writeheader()
+            writer.writerows(jlc_cpl_rows)
 
 
-def verify_fabrication_toolkit_cli(
-    kicad_python: str,
-    base_env: dict | None = None,
-) -> bool:
-    """Return True when Fabrication Toolkit CLI can be launched with KiCad Python."""
-    if not fabrication_toolkit_is_available():
-        return False
-    plugins_dir = fabrication_toolkit_plugins_dir()
-    snippet = (
-        "import sys, runpy\n"
-        f"sys.path.insert(0, {plugins_dir!r})\n"
-        "sys.argv = ['cli', '--help']\n"
-        f"runpy.run_module({FABRICATION_TOOLKIT_CLI_MODULE!r}, run_name='__main__')\n"
-    )
-    env = build_fabrication_toolkit_env(base_env)
-    try:
-        result = subprocess.run(
-            [kicad_python, "-c", snippet],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
-def copy_fabrication_toolkit_jlc_outputs(
-    context: "ExportContext",
-    production_dir: str,
-) -> bool:
-    """Copy Fabrication Toolkit bom.csv / positions.csv into the KiForge output folder."""
-    copied = False
-    if context.options.get("export_bom", True):
-        src = os.path.join(production_dir, "bom.csv")
-        dst = os.path.join(context.output_dir, f"{context.pcb_name}_bom_jlc.csv")
-        if os.path.isfile(src):
-            shutil.copy2(src, dst)
-            context.logger.info(f"Saved JLCPCB BOM (Fabrication Toolkit): {os.path.basename(dst)}")
-            copied = True
-        else:
-            context.logger.warning("Fabrication Toolkit bom.csv not found in %s", production_dir)
-
-    if context.options.get("export_pos", True):
-        src = os.path.join(production_dir, "positions.csv")
-        dst = os.path.join(context.output_dir, f"{context.pcb_name}_cpl_jlc.csv")
-        if os.path.isfile(src):
-            shutil.copy2(src, dst)
-            context.logger.info(f"Saved JLCPCB CPL (Fabrication Toolkit): {os.path.basename(dst)}")
-            copied = True
-        else:
-            context.logger.warning("Fabrication Toolkit positions.csv not found in %s", production_dir)
-    return copied
-
-
-def apply_jlc_fallback_from_kicad_exports(context: "ExportContext") -> bool:
-    """Fallback JLC CSVs from KiCad exports when Fabrication Toolkit is unavailable."""
+def format_jlc_exports(context: "ExportContext") -> bool:
+    """Build JLC-upload CSVs from versioned KiCad BOM/POS exports."""
     ok = True
     if context.options.get("export_bom", True):
         bom_path = os.path.join(context.output_dir, f"{context.pcb_name}_bom.csv")
@@ -1912,12 +1828,16 @@ def apply_jlc_fallback_from_kicad_exports(context: "ExportContext") -> bool:
             try:
                 JLCPCBFormatter.format_bom(bom_path, jlc_bom_path)
                 context.logger.info(
-                    f"Saved JLCPCB BOM (fallback formatter): {os.path.basename(jlc_bom_path)}"
+                    "Saved JLCPCB BOM: %s",
+                    os.path.basename(jlc_bom_path),
                 )
             except Exception as exc:
-                context.logger.error("Fallback JLC BOM formatting failed: %s", exc, exc_info=True)
-                context.add_warning(f"JLCPCB BOM fallback failed: {exc}")
+                context.logger.error("JLC BOM formatting failed: %s", exc, exc_info=True)
+                context.add_warning(f"JLCPCB BOM formatting failed: {exc}")
                 ok = False
+        else:
+            context.add_warning(f"KiCad BOM not found for JLC formatting: {bom_path}")
+            ok = False
     if context.options.get("export_pos", True):
         pos_path = os.path.join(context.output_dir, f"{context.pcb_name}_pos.csv")
         jlc_cpl_path = os.path.join(context.output_dir, f"{context.pcb_name}_cpl_jlc.csv")
@@ -1925,118 +1845,17 @@ def apply_jlc_fallback_from_kicad_exports(context: "ExportContext") -> bool:
             try:
                 JLCPCBFormatter.format_cpl(pos_path, jlc_cpl_path, context.rotation_offsets)
                 context.logger.info(
-                    f"Saved JLCPCB CPL (fallback formatter): {os.path.basename(jlc_cpl_path)}"
+                    "Saved JLCPCB CPL: %s",
+                    os.path.basename(jlc_cpl_path),
                 )
             except Exception as exc:
-                context.logger.error("Fallback JLC CPL formatting failed: %s", exc, exc_info=True)
-                context.add_warning(f"JLCPCB CPL fallback failed: {exc}")
+                context.logger.error("JLC CPL formatting failed: %s", exc, exc_info=True)
+                context.add_warning(f"JLCPCB CPL formatting failed: {exc}")
                 ok = False
+        else:
+            context.add_warning(f"KiCad placement file not found for JLC formatting: {pos_path}")
+            ok = False
     return ok
-
-
-# ---------------------------------------------------------------------------
-# JLCPCB BOM/CPL fallback formatter (used when Fabrication Toolkit is absent)
-# ---------------------------------------------------------------------------
-
-class JLCPCBFormatter:
-    """
-    Lightweight fallback when JLCPCB Fabrication Toolkit is not installed.
-
-    Prefer the Fabrication Toolkit plugin (KiCad PCM) for JLC-ready BOM/CPL.
-    KiForge always keeps unedited KiCad ``*_bom.csv`` and ``*_pos.csv`` exports.
-    """
-    
-    @staticmethod
-    def format_bom(raw_bom_path: str, output_bom_path: str) -> None:
-        """Converts raw KiCad BOM to the JLCPCB format with LCSC Part Numbers resolved and DNP filtered"""
-        if not os.path.exists(raw_bom_path):
-            return
-            
-        with open(raw_bom_path, 'r', newline='', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-            
-        jlc_rows = []
-        lcsc_aliases = ['LCSC', 'LCSC Part', 'LCSC Part #', 'JLCPCB Part', 'JLCPCB Part #', 'LCSC_Part']
-        
-        for row in rows:
-            dnp = row.get('${DNP}', '').strip().lower() or row.get('DNP', '').strip().lower()
-            if dnp in ['1', 'dnp', 'true', 'yes']:
-                continue
-                
-            designator = row.get('Reference', '').strip() or row.get('Designator', '').strip()
-            comment = row.get('Value', '').strip() or row.get('Comment', '').strip()
-            footprint = row.get('Footprint', '').strip()
-            qty = row.get('${QUANTITY}', '').strip() or row.get('QUANTITY', '').strip() or row.get('Quantity', '').strip() or row.get('Qty', '1').strip()
-            
-            lcsc_val = ''
-            for alias in lcsc_aliases:
-                if alias in row and row[alias]:
-                    lcsc_val = row[alias].strip()
-                    break
-                    
-            jlc_rows.append({
-                'Designator': designator,
-                'Comment': comment,
-                'Footprint': footprint,
-                'LCSC': lcsc_val,
-                'Quantity': qty
-            })
-            
-        with open(output_bom_path, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=['Designator', 'Comment', 'Footprint', 'LCSC', 'Quantity'])
-            writer.writeheader()
-            writer.writerows(jlc_rows)
-
-    @staticmethod
-    def format_cpl(raw_pos_path: str, output_cpl_path: str, rotation_offsets: dict = None) -> None:
-        """Converts raw KiCad position file to the JLCPCB CPL format and applies rotation offsets"""
-        if not os.path.exists(raw_pos_path):
-            return
-            
-        with open(raw_pos_path, 'r', newline='', encoding='utf-8-sig') as f:
-            lines = f.readlines()
-            
-        clean_lines = [line for line in lines if not line.strip().startswith('#')]
-        reader = csv.DictReader(clean_lines)
-        rows = list(reader)
-        
-        offsets = dict(rotation_offsets or {})
-        
-        jlc_cpl_rows = []
-        for row in rows:
-            ref = row.get('Ref', '').strip()
-            val = row.get('Val', '').strip()
-            package = row.get('Package', '').strip()
-            pos_x = row.get('PosX', '').strip()
-            pos_y = row.get('PosY', '').strip()
-            rot_str = row.get('Rot', '').strip()
-            side = row.get('Side', '').strip()
-            
-            try:
-                rotation = float(rot_str)
-            except ValueError:
-                rotation = 0.0
-                
-            for pattern, offset in offsets.items():
-                if pattern.lower() in package.lower() or pattern.lower() in val.lower():
-                    rotation = (rotation + offset) % 360.0
-                    break
-                    
-            layer = 'Bottom' if side.lower() in ['bottom', 'back', 'b.cu'] else 'Top'
-                
-            jlc_cpl_rows.append({
-                'Designator': ref,
-                'Mid X': pos_x,
-                'Mid Y': pos_y,
-                'Layer': layer,
-                'Rotation': f"{rotation:.2f}" if rotation % 1 != 0 else f"{int(rotation)}"
-            })
-            
-        with open(output_cpl_path, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=['Designator', 'Mid X', 'Mid Y', 'Layer', 'Rotation'])
-            writer.writeheader()
-            writer.writerows(jlc_cpl_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -2146,8 +1965,86 @@ class ExportTask:
                 context.active_process = None
 
 
+def _parse_pcb_layers(pcb_file: str) -> list[tuple[str, str]]:
+    """Return (canonical_name, type) pairs from a board's ``(layers ...)`` section."""
+    try:
+        with open(pcb_file, encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return []
+    match = re.search(r"\(layers\s+(.*?)\)\s*\(setup", content, re.DOTALL)
+    if not match:
+        return []
+    return re.findall(r'\(\d+\s+"([^"]+)"\s+(\w+)', match.group(1))
+
+
+def resolve_jlc_gerber_layers(pcb_file: str) -> list[str]:
+    """
+    JLCPCB manufacturing layers present on the board (KiCad 9 gerber guide).
+
+    Copper: F.Cu, inner signal layers in stack order, B.Cu. Also paste, silk,
+    mask, edge cuts, and user drawing/comment layers (Dwgs.User, Cmts.User).
+    Other user, fab, and courtyard layers are omitted.
+    """
+    parsed = _parse_pcb_layers(pcb_file)
+    if not parsed:
+        return list(_JLC_GERBER_FALLBACK_LAYERS)
+
+    names_present = {name for name, _ in parsed}
+    result: list[str] = []
+    inner: list[str] = []
+
+    for name, layer_type in parsed:
+        if name == "F.Cu":
+            result.append(name)
+        elif layer_type == "signal" and name not in ("F.Cu", "B.Cu"):
+            inner.append(name)
+
+    if "B.Cu" in names_present:
+        result.extend(inner)
+        result.append("B.Cu")
+    elif inner:
+        result.extend(inner)
+
+    for layer in _JLC_GERBER_TAIL_LAYERS:
+        if layer in names_present:
+            result.append(layer)
+
+    return result if result else list(_JLC_GERBER_FALLBACK_LAYERS)
+
+
+def build_gerber_export_cmd(context: ExportContext) -> list[str]:
+    """Build kicad-cli argv for JLC-aligned Gerber export."""
+    layers = resolve_jlc_gerber_layers(context.pcb_file)
+    cmd = [
+        context.kicad_cli, "pcb", "export", "gerbers",
+        "--layers", ",".join(layers),
+    ]
+    if GERBER_EXPORT_DEFAULTS.get("check_zones"):
+        cmd.append("--check-zones")
+    if GERBER_EXPORT_DEFAULTS.get("use_drill_file_origin"):
+        cmd.append("--use-drill-file-origin")
+    cmd.extend(["-o", context.temp_gerber_dir, context.pcb_file])
+    return cmd
+
+
+def build_drill_export_cmd(context: ExportContext) -> list[str]:
+    """Build kicad-cli argv for JLC-aligned Excellon drill export."""
+    d = DRILL_EXPORT_DEFAULTS
+    return [
+        context.kicad_cli, "pcb", "export", "drill",
+        "--format", d["format"],
+        "--drill-origin", d["drill_origin"],
+        "--excellon-units", d["excellon_units"],
+        "--excellon-zeros-format", d["excellon_zeros_format"],
+        "--excellon-oval-format", d["excellon_oval_format"],
+        "-o", context.temp_gerber_dir,
+        context.pcb_file,
+    ]
+
+
 class GerberExportTask(ExportTask):
-    """Export PCB copper and mask layers to ``temp_gerbers/`` via kicad-cli."""
+    """Export JLC manufacturing gerber layers to ``temp_gerbers/`` via kicad-cli."""
 
     def __init__(self):
         super().__init__("Exporting Gerber Layers")
@@ -2156,17 +2053,11 @@ class GerberExportTask(ExportTask):
         return context.options.get("export_gerbers", True) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
-        cmd = [
-            context.kicad_cli, "pcb", "export", "gerbers",
-            "--use-drill-file-origin",
-            "-o", context.temp_gerber_dir,
-            context.pcb_file
-        ]
-        return self._run_subprocess(cmd, context)
+        return self._run_subprocess(build_gerber_export_cmd(context), context)
 
 
 class DrillExportTask(ExportTask):
-    """Export Excellon drill files; runs when drills or gerbers are enabled."""
+    """Export JLC-aligned Excellon drill files; runs when drills or gerbers are enabled."""
     def __init__(self):
         super().__init__("Exporting Drill Files")
 
@@ -2176,15 +2067,7 @@ class DrillExportTask(ExportTask):
         return (drills_requested or gerbers_requested) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
-        cmd = [
-            context.kicad_cli, "pcb", "export", "drill",
-            "--excellon-separate-th",
-            "--excellon-units", "mm",
-            "--drill-origin", "plot",
-            "-o", context.temp_gerber_dir,
-            context.pcb_file
-        ]
-        return self._run_subprocess(cmd, context)
+        return self._run_subprocess(build_drill_export_cmd(context), context)
 
 
 class PlacementExportTask(ExportTask):
@@ -2225,9 +2108,9 @@ class BomExportTask(ExportTask):
     Export KiCad BOM CSV to ``raw_bom.csv``.
 
     Uses fixed :data:`BOM_EXPORT_DEFAULTS` (fields, group-by, ref delimiter).
-    LCSC/JLC columns are not included in the raw file; JLC copies are produced
-    separately when ``format_jlc`` is enabled. Missing symbol fields (ID, MPN)
-    appear as empty columns.
+    Raw BOM includes symbol ``ID`` and ``MPN``; JLC-upload copies map ``ID`` to
+    ``LCSC Part #`` when it matches ``^C\\d+$``. Missing symbol fields appear as
+    empty columns.
     """
     def __init__(self):
         super().__init__("Exporting Bill of Materials")
@@ -2573,6 +2456,8 @@ class GerberPackTask(ExportTask):
                 with zipfile.ZipFile(gerber_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                     for root, _, files in os.walk(context.temp_gerber_dir):
                         for file in files:
+                            if file.endswith(GERBER_ZIP_SKIP_SUFFIXES):
+                                continue
                             file_full_path = os.path.join(root, file)
                             arcname = os.path.relpath(file_full_path, context.temp_gerber_dir)
                             zipf.write(file_full_path, arcname)
@@ -2642,13 +2527,8 @@ class PosOutputTask(ExportTask):
         return True
 
 
-# Legacy names kept for external importers and older tests.
-JlcBomFormatTask = BomOutputTask
-JlcCplFormatTask = PosOutputTask
-
-
-class FabricationToolkitTask(ExportTask):
-    """Produce JLC-ready BOM/CPL via JLCPCB Fabrication Toolkit (auto-install if missing)."""
+class JlcFormatTask(ExportTask):
+    """Produce JLC-ready BOM/CPL from KiCad CSV exports."""
 
     def __init__(self):
         super().__init__("Generating JLCPCB BOM/CPL")
@@ -2663,32 +2543,7 @@ class FabricationToolkitTask(ExportTask):
     def run(self, context: ExportContext) -> bool:
         if context.is_aborted():
             return False
-
-        if ensure_fabrication_toolkit_available(context):
-            production_dir = os.path.join(context.project_dir, FABRICATION_TOOLKIT_PRODUCTION_DIR)
-            cmd, ft_env = build_fabrication_toolkit_cli_invocation(
-                context.kicad_python,
-                context.pcb_file,
-                context.pcb_name,
-                context.env,
-            )
-            ft_failure = (
-                "Fabrication Toolkit could not run; JLC CSVs were generated "
-                "with KiForge fallback formatting."
-            )
-            if self._run_subprocess(cmd, context, env=ft_env, failure_message=ft_failure):
-                if copy_fabrication_toolkit_jlc_outputs(context, production_dir):
-                    return True
-                context.add_warning(
-                    "Fabrication Toolkit ran but bom.csv / positions.csv were missing; "
-                    "using KiForge fallback formatter."
-                )
-        else:
-            context.add_warning(
-                "JLCPCB BOM/CPL copies were generated with KiForge fallback formatting "
-                "because Fabrication Toolkit could not be installed."
-            )
-        return apply_jlc_fallback_from_kicad_exports(context)
+        return format_jlc_exports(context)
 
 
 # ---------------------------------------------------------------------------
@@ -2721,11 +2576,11 @@ class ExportRunner:
         self.tasks.append(SvgExportTask())
         self.tasks.append(InteractiveBomTask())
         
-        # 2. Post-processing: version KiCad BOM/POS; optional JLC copies via Fabrication Toolkit
+        # 2. Post-processing: version KiCad BOM/POS; optional JLC copies
         self.tasks.append(GerberPackTask())
         self.tasks.append(BomOutputTask())
         self.tasks.append(PosOutputTask())
-        self.tasks.append(FabricationToolkitTask())
+        self.tasks.append(JlcFormatTask())
 
     def _is_applicable(self, task: "ExportTask") -> bool:
         """Evaluate task applicability without letting a faulty check abort the pipeline."""

@@ -64,7 +64,7 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `export_3d` | Export front & back 3D PNG renders | `'true'` |
 | `export_svg` | Export front & back copper layer SVGs | `'true'` |
 | `export_ibom` | Export Interactive HTML BOM | `'true'` |
-| `format_jlc` | Also produce JLC-ready BOM/CPL via Fabrication Toolkit (fallback formatter in CI) | `'true'` |
+| `format_jlc` | Also produce JLC-ready BOM/CPL from KiCad CSV exports | `'true'` |
 | `pos_side` | Placement CSV side: `both`, `front` (top), or `back` (bottom) | `'both'` |
 | `pos_smd_only` | Placement CSV: SMD parts only | `'true'` |
 | `pos_exclude_dnp` | Placement CSV: exclude DNP parts | `'true'` |
@@ -72,7 +72,7 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `sync_title_block_rev` | Sync schematic title-block `(rev …)` to the export version | `'true'` |
 | `version` | Override version suffix for output filenames | _(auto from Git tag)_ |
 
-> **Export parameters:** The `pos_*` and `step_*` inputs map to configurable `kicad-cli` flags (`export_params` in `.kiforge.json`). BOM columns, iBOM grouping, and 3D render quality are fixed inside KiForge (`BOM_EXPORT_DEFAULTS`, `RENDER_3D_DEFAULTS`). Raw `*_bom.csv` uses the standard field layout; JLC copies still come from Fabrication Toolkit or the fallback formatter.
+> **Export parameters:** The `pos_*` and `step_*` inputs map to `export_params` in `.kiforge.json`. BOM columns, gerber/drill layers, iBOM grouping, and 3D render quality are fixed (`BOM_EXPORT_DEFAULTS`, `GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`, `RENDER_3D_DEFAULTS`). Raw `*_bom.csv` includes `ID` and `MPN`; JLC copies are produced by `JLCPCBFormatter` when `format_jlc` is on.
 
 > **Version tagging:** All output filenames are versioned automatically on every run — locally and in CD. On tag push, KiForge reads `GITHUB_REF_NAME` (e.g. `myboard_v1.0.0_gerbers.zip`, `myboard_v1.0.0_sch.pdf`). Locally, the version comes from `--version-tag`, the latest git tag (when enabled), or defaults to `v0.1.0`. During export only, schematic PDFs sync the title-block `(rev …)` to that version via a temporary staged copy (`--sync-title-block-rev`, on by default in CI and Studio Run Export).
 
@@ -101,15 +101,20 @@ KiForge writes all files into `output_dir/` on the GitHub Actions runner — not
 
 ---
 
-## JLCPCB Fabrication Toolkit
+## JLC-ready BOM/CPL
 
-KiForge **auto-installs** Fabrication Toolkit from the latest GitHub release when `format_jlc` is enabled and the plugin is not already present — same flow as InteractiveHtmlBom (`pip install` on first use).
+When `format_jlc` is enabled (default), KiForge exports with `kicad-cli`, then `JLCPCBFormatter` writes JLC-upload copies ([JLCPCB KiCad Method 1](https://jlcpcb.com/help/article/how-to-generate-the-bom-and-centroid-file-from-kicad)).
 
-When available, KiForge runs its CLI and copies `bom.csv` / `positions.csv` from the project `production/` folder into `*_bom_jlc.csv` and `*_cpl_jlc.csv`.
+**Raw BOM columns:** `Reference`, `Value`, `Footprint`, `Description`, `${QUANTITY}`, `${DNP}`, `ID`, `MPN`
 
-KiCad `*_bom.csv` and `*_pos.csv` are always unedited `kicad-cli` exports.
+| KiCad export | JLC file | Mapping |
+|---|---|---|
+| `*_bom.csv` | `*_bom_jlc.csv` | Value→Comment, Reference→Designator, `ID`→`LCSC Part #` when `^C\d+$`, `${QUANTITY}`→Quantity |
+| `*_pos.csv` | `*_cpl_jlc.csv` | Ref→Designator, PosX/Y→Mid X/Y, Rot→Rotation, Side→Layer |
 
-If auto-install fails, a built-in fallback formatter still produces JLC-shaped CSVs.
+Placement uses CSV, millimetres, drill-file origin, and configurable side/SMD/DNP via `export_params`. Add **ID** on symbols for JLC numbers (`C125111`); **MPN** for manufacturer data in the raw BOM only.
+
+Disable JLC copies only: `format_jlc: false` or `--no-format-jlc`.
 
 ---
 

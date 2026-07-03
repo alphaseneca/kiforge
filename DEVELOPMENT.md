@@ -25,8 +25,8 @@ kiforge/
 
 | Scope | Path | Contents |
 |---|---|---|
-| Project | `<project>/.kiforge.json` | Export toggles, output dir, rotation offsets, `ibom` options |
-| Global | `%APPDATA%/kiforge/settings.json` (Windows) | Same keys; loaded first, project overrides |
+| Project | `<project>/.kiforge.json` | `exports`, `export_params`, `ibom`, `rotation_offsets`, output dir |
+| Global | `%APPDATA%/kiforge/settings.json` (Windows) | Same keys; project overrides |
 
 Load order: built-in defaults → global → project → runtime dialog/CLI flags.
 
@@ -64,15 +64,14 @@ Output filenames always include a version suffix (`_vX.Y.Z`):
 Verify BOM/POS pairs (raw KiCad + optional JLC copies):
 
 ```
-sample_v0.1.2_bom.csv      # KiCad raw BOM (always when export_bom)
-sample_v0.1.2_pos.csv      # KiCad raw placement (always when export_pos)
-sample_v0.1.2_bom_jlc.csv  # JLCPCB (Fabrication Toolkit, or fallback in CI)
-sample_v0.1.2_cpl_jlc.csv  # JLCPCB CPL (Fabrication Toolkit, or fallback in CI)
+sample_v0.1.2_bom.csv      # Reference, Value, Footprint, Description, ${QUANTITY}, ${DNP}, ID, MPN
+sample_v0.1.2_pos.csv      # Ref, Val, Package, PosX, PosY, Rot, Side
+sample_v0.1.2_bom_jlc.csv  # Comment, Designator, Footprint, LCSC Part #, Quantity
+sample_v0.1.2_cpl_jlc.csv  # Designator, Mid X, Mid Y, Rotation, Layer
+sample_v0.1.2_gerbers.zip  # JLC manufacturing layers + Dwgs.User + Cmts.User
 ```
 
-### JLCPCB Fabrication Toolkit
-
-Auto-installed from GitHub on first export when missing (same pattern as InteractiveHtmlBom). Pre-installed in the Docker image at build time.
+`JlcFormatTask` / `JLCPCBFormatter` produce JLC copies from the raw CSVs when `format_jlc` is enabled. `ID` values matching `^C\d+$` populate `LCSC Part #`.
 
 ## CD workflow generation
 

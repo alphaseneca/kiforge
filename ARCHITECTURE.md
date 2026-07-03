@@ -54,7 +54,7 @@ sequenceDiagram
     participant Context as ExportContext
     participant Runner as ExportRunner
     participant Task as ExportTask
-    participant FT as FabricationToolkitTask
+    participant JLC as JlcFormatTask
 
     User->>Context: Instantiate(project_path, options)
     User->>Context: resolve()
@@ -76,8 +76,8 @@ sequenceDiagram
     end
     
     Note over Runner: Post-Processing Steps
-    Runner->>Task: BomOutputTask / PosOutputTask / FabricationToolkitTask
-    Note over Task: Version KiCad CSVs; JLC copies via Fabrication Toolkit or fallback
+    Runner->>Task: BomOutputTask / PosOutputTask / JlcFormatTask
+    Note over Task: Version KiCad CSVs; optional JLC copies via JLCPCBFormatter
     
     Runner-->>User: Pipeline Complete (bool)
 ```
@@ -147,28 +147,22 @@ KiCad's internal scripting environment has unique constraints:
 
 KiForge always writes **unedited KiCad** CSVs when BOM/placement export is enabled:
 
-| File | Source |
+| File | Source | Columns (representative) |
+| --- | --- | --- |
+| `{name}_bom.csv` | `kicad-cli sch export bom` | `Reference`, `Value`, `Footprint`, `Description`, `${QUANTITY}`, `${DNP}`, `ID`, `MPN` |
+| `{name}_pos.csv` | `kicad-cli pcb export pos` | `Ref`, `Val`, `Package`, `PosX`, `PosY`, `Rot`, `Side` |
+
+When `format_jlc` is enabled (default), `JlcFormatTask` calls `JLCPCBFormatter` to write **JLC-upload** copies ([JLCPCB KiCad Method 1](https://jlcpcb.com/help/article/how-to-generate-the-bom-and-centroid-file-from-kicad)):
+
+| File | Pipeline |
 | --- | --- |
-| `{name}_bom.csv` | `kicad-cli sch export bom` (raw columns) |
-| `{name}_pos.csv` | `kicad-cli pcb export pos` (raw columns) |
+| `{name}_bom_jlc.csv` | Column remap + `ID` → `LCSC Part #` when `^C\d+$` |
+| `{name}_cpl_jlc.csv` | Ref/PosX/PosY/Rot/Side → centroid columns; optional `rotation_offsets` |
 
-When `format_jlc` is enabled (default), KiForge also writes **JLC-ready** copies:
+JLC BOM columns: `Comment`, `Designator`, `Footprint`, `LCSC Part #`, `Quantity`.  
+JLC CPL columns: `Designator`, `Mid X`, `Mid Y`, `Rotation`, `Layer` (millimetres, Top/Bottom).
 
-| File | Primary source |
-| --- | --- |
-| `{name}_bom_jlc.csv` | [JLCPCB Fabrication Toolkit](https://github.com/bennymeg/Fabrication-Toolkit) `production/bom.csv` |
-| `{name}_cpl_jlc.csv` | Fabrication Toolkit `production/positions.csv` |
-
-### Fabrication Toolkit (`FabricationToolkitTask`)
-
-* Detects Fabrication Toolkit under KiCad `3rdparty`; if missing, **downloads the GitHub release zip** and installs it (same idea as InteractiveHtmlBom `pip install`).
-* Invokes `python -m com_github_bennymeg_JLC-Plugin-for-KiCad.cli` with `-e` (exclude DNP), `-t` (auto rotation translate), and `-nB` (no project backup).
-* Copies `bom.csv` and `positions.csv` from the project `production/` folder into the KiForge output directory with versioned `_bom_jlc` / `_cpl_jlc` names.
-* **Install once** from KiCad PCM is optional — KiForge auto-installs from GitHub on first export when needed.
-
-### Fallback formatter (`JLCPCBFormatter`)
-
-When Fabrication Toolkit is not installed (e.g. headless Docker CI), KiForge uses a lightweight built-in formatter on the KiCad CSVs. This is a best-effort substitute — install Fabrication Toolkit for full JLC compatibility, LCSC field handling, and rotation rules.
+**Symbol fields:** `ID` carries JLC/LCSC part numbers (e.g. `C125111`); `MPN` stays in the raw BOM only. Only `ID` values matching `^C\d+$` populate `LCSC Part #` in `*_bom_jlc.csv`.
 
 Disable JLC copies only (KiCad CSVs still export): `format_jlc: false` or `--no-format-jlc`.
 
@@ -176,8 +170,7 @@ Disable JLC copies only (KiCad CSVs still export): `format_jlc: false` or `--no-
 
 ## 7. Settings & Gitignore Template
 
-KiForge is a thin orchestration layer over `kicad-cli`, Fabrication Toolkit,
-and InteractiveHtmlBom. Configuration is split by **what changes per project**
+KiForge is a thin orchestration layer over `kicad-cli` and InteractiveHtmlBom. Configuration is split by **what changes per project**
 vs **what is fixed by convention**.
 
 ### Merge order
@@ -224,6 +217,7 @@ Saved JSON structure:
 | Runtime | `RUNTIME_OPTION_SPECS` | _(none)_ | Yes | Per-run behavior (title-block sync) |
 | BOM layout | `BOM_EXPORT_DEFAULTS` | _(none)_ | No | Raw CSV + iBOM columns/grouping |
 | 3D renders | `RENDER_3D_DEFAULTS` | _(none)_ | No | `kicad-cli pcb render` flags |
+| Gerbers / drills | `GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS` | _(none)_ | No | JLC-aligned manufacturing export |
 
 ¹ iBOM presentation flags are CLI-only from Studio settings; not baked into CD YAML.
 
@@ -262,13 +256,24 @@ group_by: Value,ID,Footprint,DNP
 ref_range_delimiter: (empty)
 ```
 
-Raw `*_bom.csv` uses these fields. LCSC/JLC data appears only in `*_bom_jlc.csv`
-(Fabrication Toolkit or `JLCPCBFormatter` fallback).
+Raw `*_bom.csv` exports symbol `ID` and `MPN`. JLC `LCSC Part #` is filled from `ID`
+only when it matches `^C\d+$` (e.g. `C125111`).
 
 ### Fixed 3D renders (`RENDER_3D_DEFAULTS`)
 
 Preset 2, floor, perspective, zoom 0.8, quality high, 1920×1080. Not exposed as
 parameters anywhere.
+
+### Fixed Gerber / drill export (`GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`)
+
+Aligned with [JLCPCB's KiCad 9 gerber guide](https://jlcpcb.com/help/article/how-to-generate-gerber-and-drill-files-in-kicad-9).
+Only manufacturing layers are plotted (copper stack, paste, silk, mask, edge cuts,
+plus `Dwgs.User` / `Cmts.User` for User.Drawings and User.Comments); other
+user/fab/courtyard layers are omitted. Gerber export uses `--check-zones` and
+`--use-drill-file-origin`; Protel extensions, X2, and netlist attributes rely on
+`kicad-cli` defaults. Drill export uses Excellon, mm, absolute origin, decimal
+zeros, alternate oval format, and a single merged PTH+NPTH file. `.gbrjob` files
+are excluded from the Gerber ZIP.
 
 ### Key functions
 
@@ -282,6 +287,8 @@ parameters anywhere.
 | `build_cd_substitutions()` | Options → CD template placeholders |
 | `export_options_from_context()` | Post-export CD sync from a finished run |
 | `build_ibom_cli_args()` | iBOM argv from `ibom` + `BOM_EXPORT_DEFAULTS` |
+| `resolve_jlc_gerber_layers()` | Manufacturing + user drawing/comment layers present on the board |
+| `build_gerber_export_cmd()` / `build_drill_export_cmd()` | JLC-aligned `kicad-cli` argv for gerber/drill tasks |
 
 Legacy flat export keys and `generate_ci` are still read for backward compatibility.
 
