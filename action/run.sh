@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # KiForge composite GitHub Action runner.
 #
+# Maps action.yml INPUT_* variables to the same CLI flags as `python kiforge.py`.
+# Configurable: EXPORT_SETTING_KEYS toggles + EXPORT_PARAM_SPECS + RUNTIME_OPTION_SPECS.
+# Not passed through: BOM_EXPORT_DEFAULTS, RENDER_3D_DEFAULTS (hardcoded in kiforge.py).
+#
 # Builds the KiForge Docker image, runs kiforge.py inside kicad/kicad:10.0, and
-# restores workspace ownership on the output folder. Invoked from action.yml;
-# inputs are passed via INPUT_* environment variables.
+# restores workspace ownership on the output folder.
 set -euo pipefail
 
 action_path="${KIFORGE_ACTION_PATH:?KIFORGE_ACTION_PATH is required}"
@@ -11,22 +14,43 @@ workspace="${KIFORGE_WORKSPACE:?KIFORGE_WORKSPACE is required}"
 project_path="${INPUT_PROJECT_PATH:-.}"
 output_dir="${INPUT_OUTPUT_DIR:-kiforge}"
 
+append_bool_toggle() {
+  local env_name="$1"
+  local flag="$2"
+  local value="${!env_name:-true}"
+  if [[ "$value" == "false" ]]; then
+    args+=("--no-${flag}")
+  fi
+}
+
 build_cli_args() {
   local -a args=()
   args+=("--project-path" "$project_path")
   args+=("--output-dir" "$output_dir")
 
-  [[ "${INPUT_EXPORT_3D:-true}" != "false" ]] || args+=("--no-export-3d")
-  [[ "${INPUT_EXPORT_SVG:-true}" != "false" ]] || args+=("--no-export-svg")
-  [[ "${INPUT_EXPORT_BOM:-true}" != "false" ]] || args+=("--no-export-bom")
-  [[ "${INPUT_EXPORT_SCH_PDF:-true}" != "false" ]] || args+=("--no-export-sch-pdf")
-  [[ "${INPUT_EXPORT_POS:-true}" != "false" ]] || args+=("--no-export-pos")
-  [[ "${INPUT_EXPORT_STEP:-true}" != "false" ]] || args+=("--no-export-step")
-  [[ "${INPUT_EXPORT_GERBERS:-true}" != "false" ]] || args+=("--no-export-gerbers")
-  [[ "${INPUT_EXPORT_DRILLS:-true}" != "false" ]] || args+=("--no-export-drills")
-  [[ "${INPUT_EXPORT_IBOM:-true}" != "false" ]] || args+=("--no-export-ibom")
-  [[ "${INPUT_FORMAT_JLC:-true}" != "false" ]] || args+=("--no-format-jlc")
-  [[ "${INPUT_SYNC_TITLE_BLOCK_REV:-true}" != "false" ]] || args+=("--no-sync-title-block-rev")
+  # Export toggles (EXPORT_SETTING_KEYS)
+  append_bool_toggle INPUT_EXPORT_3D export-3d
+  append_bool_toggle INPUT_EXPORT_SVG export-svg
+  append_bool_toggle INPUT_EXPORT_BOM export-bom
+  append_bool_toggle INPUT_EXPORT_SCH_PDF export-sch-pdf
+  append_bool_toggle INPUT_EXPORT_POS export-pos
+  append_bool_toggle INPUT_EXPORT_STEP export-step
+  append_bool_toggle INPUT_EXPORT_GERBERS export-gerbers
+  append_bool_toggle INPUT_EXPORT_DRILLS export-drills
+  append_bool_toggle INPUT_EXPORT_IBOM export-ibom
+  append_bool_toggle INPUT_FORMAT_JLC format-jlc
+
+  # Export parameters (EXPORT_PARAM_SPECS)
+  if [[ -n "${INPUT_POS_SIDE:-}" ]]; then
+    args+=("--pos-side" "${INPUT_POS_SIDE}")
+  fi
+  append_bool_toggle INPUT_POS_SMD_ONLY pos-smd-only
+  append_bool_toggle INPUT_POS_EXCLUDE_DNP pos-exclude-dnp
+  append_bool_toggle INPUT_STEP_SUBST_MODELS step-subst-models
+
+  # Runtime options (RUNTIME_OPTION_SPECS)
+  append_bool_toggle INPUT_SYNC_TITLE_BLOCK_REV sync-title-block-rev
+
   if [[ -n "${INPUT_VERSION:-}" ]]; then
     args+=("--version-tag" "${INPUT_VERSION}")
   fi

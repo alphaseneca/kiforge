@@ -37,6 +37,11 @@ jobs:
           export_drills: '{{EXPORT_DRILLS}}'
           export_ibom: '{{EXPORT_IBOM}}'
           format_jlc: '{{FORMAT_JLC}}'
+          pos_side: '{{POS_SIDE}}'
+          pos_smd_only: '{{POS_SMD_ONLY}}'
+          pos_exclude_dnp: '{{POS_EXCLUDE_DNP}}'
+          step_subst_models: '{{STEP_SUBST_MODELS}}'
+          sync_title_block_rev: '{{SYNC_TITLE_BLOCK_REV}}'
 
       - name: Create release and upload assets
         uses: https://github.com/softprops/action-gh-release@v2

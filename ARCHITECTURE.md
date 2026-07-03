@@ -54,7 +54,7 @@ sequenceDiagram
     participant Context as ExportContext
     participant Runner as ExportRunner
     participant Task as ExportTask
-    participant Formatter as JLCPCBFormatter
+    participant FT as FabricationToolkitTask
 
     User->>Context: Instantiate(project_path, options)
     User->>Context: resolve()
@@ -76,8 +76,8 @@ sequenceDiagram
     end
     
     Note over Runner: Post-Processing Steps
-    Runner->>Task: BomOutputTask / PosOutputTask
-    Note over Task: Rename raw CSVs; optional JLCPCBFormatter
+    Runner->>Task: BomOutputTask / PosOutputTask / FabricationToolkitTask
+    Note over Task: Version KiCad CSVs; JLC copies via Fabrication Toolkit or fallback
     
     Runner-->>User: Pipeline Complete (bool)
 ```
@@ -143,27 +143,54 @@ KiCad's internal scripting environment has unique constraints:
 
 ---
 
-## 6. JLCPCB Standardizations
+## 6. JLCPCB BOM/CPL (dual outputs)
 
-### BOM Filtering (`JLCPCBFormatter.format_bom`)
-* Ignores components marked with `DNP` (Do Not Populate) fields.
-* Standardizes columns into: `Designator`, `Comment`, `Footprint`, `LCSC`, and `Quantity`.
-* Automatically maps multiple common custom field names (e.g. `LCSC Part #`, `JLCPCB Part`) to the unified `LCSC` column.
+KiForge always writes **unedited KiCad** CSVs when BOM/placement export is enabled:
 
-### CPL Rotation Offsets (`JLCPCBFormatter.format_cpl`)
-* Converts raw position layouts into `Designator`, `Mid X`, `Mid Y`, `Layer`, and `Rotation`.
-* Downstream manufacturers like JLCPCB use standard component feeders that require specific rotational alignment relative to KiCad's CAD layout orientation.
-* KiForge applies footprint package patterns and component designators against `rotation_offsets` from merged settings (`.kiforge.json` or runtime options):
-  ```python
-  rotation = (rotation + offset) % 360.0
-  ```
-* **Optional formatting**: Set `format_jlc: false` in settings or pass `--no-format-jlc` on the CLI to skip JLCPCB BOM/CPL post-processing while still keeping raw `{name}_bom.csv` and `{name}_pos.csv`.
+| File | Source |
+| --- | --- |
+| `{name}_bom.csv` | `kicad-cli sch export bom` (raw columns) |
+| `{name}_pos.csv` | `kicad-cli pcb export pos` (raw columns) |
+
+When `format_jlc` is enabled (default), KiForge also writes **JLC-ready** copies:
+
+| File | Primary source |
+| --- | --- |
+| `{name}_bom_jlc.csv` | [JLCPCB Fabrication Toolkit](https://github.com/bennymeg/Fabrication-Toolkit) `production/bom.csv` |
+| `{name}_cpl_jlc.csv` | Fabrication Toolkit `production/positions.csv` |
+
+### Fabrication Toolkit (`FabricationToolkitTask`)
+
+* Detects Fabrication Toolkit under KiCad `3rdparty`; if missing, **downloads the GitHub release zip** and installs it (same idea as InteractiveHtmlBom `pip install`).
+* Invokes `python -m com_github_bennymeg_JLC-Plugin-for-KiCad.cli` with `-e` (exclude DNP), `-t` (auto rotation translate), and `-nB` (no project backup).
+* Copies `bom.csv` and `positions.csv` from the project `production/` folder into the KiForge output directory with versioned `_bom_jlc` / `_cpl_jlc` names.
+* **Install once** from KiCad PCM is optional — KiForge auto-installs from GitHub on first export when needed.
+
+### Fallback formatter (`JLCPCBFormatter`)
+
+When Fabrication Toolkit is not installed (e.g. headless Docker CI), KiForge uses a lightweight built-in formatter on the KiCad CSVs. This is a best-effort substitute — install Fabrication Toolkit for full JLC compatibility, LCSC field handling, and rotation rules.
+
+Disable JLC copies only (KiCad CSVs still export): `format_jlc: false` or `--no-format-jlc`.
 
 ---
 
 ## 7. Settings & Gitignore Template
 
-KiForge settings merge in this order: built-in defaults → global file → project `.kiforge.json` → runtime GUI/CLI flags.
+KiForge is a thin orchestration layer over `kicad-cli`, Fabrication Toolkit,
+and InteractiveHtmlBom. Configuration is split by **what changes per project**
+vs **what is fixed by convention**.
+
+### Merge order
+
+At export time, effective settings are built in this order (later wins):
+
+1. Built-in defaults in `kiforge.py`
+2. Global `settings.json` (OS-specific path via `get_global_settings_path()`)
+3. Project `.kiforge.json` (when a project directory is known)
+4. Runtime CLI flags or Studio dialog state for the current run
+
+`build_cli_options(flatten_params=False)` only attaches `export_params` from the
+CLI when flags are explicitly passed, so step 3 is not overwritten by defaults.
 
 | Scope | Location |
 | --- | --- |
@@ -176,14 +203,95 @@ Saved JSON structure:
 {
   "output_dir": "kiforge",
   "exports": { "export_gerbers": true, "format_jlc": true, "generate_cd": true, ... },
+  "export_params": {
+    "pos_side": "both",
+    "pos_smd_only": true,
+    "pos_exclude_dnp": true,
+    "step_subst_models": true
+  },
   "ibom": { "include_tracks": false, "dark_mode": false, ... },
   "rotation_offsets": { "0603": 90 }
 }
 ```
 
+### Configuration layers (single source of truth in `kiforge.py`)
+
+| Layer | Python source | JSON key | CLI / Action / CD | Purpose |
+| --- | --- | --- | --- | --- |
+| Export toggles | `EXPORT_SETTING_KEYS` | `exports` | Yes | Which outputs to produce |
+| Export parameters | `EXPORT_PARAM_SPECS` | `export_params` | Yes | Placement CSV & STEP flags |
+| iBOM presentation | `DEFAULT_IBOM_SETTINGS` | `ibom` | Partial¹ | HTML BOM UI options |
+| Runtime | `RUNTIME_OPTION_SPECS` | _(none)_ | Yes | Per-run behavior (title-block sync) |
+| BOM layout | `BOM_EXPORT_DEFAULTS` | _(none)_ | No | Raw CSV + iBOM columns/grouping |
+| 3D renders | `RENDER_3D_DEFAULTS` | _(none)_ | No | `kicad-cli pcb render` flags |
+
+¹ iBOM presentation flags are CLI-only from Studio settings; not baked into CD YAML.
+
+The same registries drive CLI flags (`parse_cli_args` / `build_cli_options`),
+GitHub Action inputs (`action.yml` → `action/run.sh`), and generated CD workflow
+YAML (`build_cd_substitutions` → `templates/*-release.yml`).
+
+Each `EXPORT_PARAM_SPECS` entry provides: `key` (dict + flat `context.options`),
+`cli` (long option), `action_input` (`action.yml`), and `cd_placeholder`
+(`{{NAME}}` in `templates/*-release.yml`).
+
+Current `export_params` keys:
+
+| Key | Default | kicad-cli effect |
+| --- | --- | --- |
+| `pos_side` | `both` | `pcb export pos --side` (`front`/`back`/`both`) |
+| `pos_smd_only` | `true` | `--smd-only` |
+| `pos_exclude_dnp` | `true` | `--exclude-dnp` |
+| `step_subst_models` | `true` | `--subst-models` |
+
+STEP export always passes `--no-optimize-step` (fixed; not configurable).
+CLI aliases: `--top` → `pos_side=front`, `--bottom` → `pos_side=back`.
+
+Studio Advanced tab controls placement/STEP params; **Save** writes `export_params`
+to project or global JSON. Successful exports auto-save project settings.
+
+### Fixed BOM pipeline (`BOM_EXPORT_DEFAULTS`)
+
+Not configurable. Used by `BomExportTask` → `kicad-cli sch export bom` and
+`build_ibom_cli_args()` → InteractiveHtmlBom `--show-fields`, `--group-fields`,
+`--extra-fields`.
+
+```
+fields: Reference,Value,Footprint,Description,${QUANTITY},${DNP},ID,MPN
+group_by: Value,ID,Footprint,DNP
+ref_range_delimiter: (empty)
+```
+
+Raw `*_bom.csv` uses these fields. LCSC/JLC data appears only in `*_bom_jlc.csv`
+(Fabrication Toolkit or `JLCPCBFormatter` fallback).
+
+### Fixed 3D renders (`RENDER_3D_DEFAULTS`)
+
+Preset 2, floor, perspective, zoom 0.8, quality high, 1920×1080. Not exposed as
+parameters anywhere.
+
+### Key functions
+
+| Function | Role |
+| --- | --- |
+| `load_merged_settings()` | Layer global + project JSON onto defaults |
+| `save_settings()` | Persist `exports`, `export_params`, `ibom` |
+| `merge_export_params()` | Merge and validate placement/STEP dicts |
+| `apply_export_params_to_options()` | Flatten `export_params` for `ExportContext` |
+| `build_cli_options()` | CLI → options dict |
+| `build_cd_substitutions()` | Options → CD template placeholders |
+| `export_options_from_context()` | Post-export CD sync from a finished run |
+| `build_ibom_cli_args()` | iBOM argv from `ibom` + `BOM_EXPORT_DEFAULTS` |
+
 Legacy flat export keys and `generate_ci` are still read for backward compatibility.
 
 CD workflow generation and `.gitignore` updates read editable files from `templates/` (shipped beside the installed `kiforge.py` in the plugin zip). Edit `templates/kiforge.gitignore`, `templates/github-release.yml`, and `templates/gitea-release.yml` in the repo — never duplicate them under `plugins/templates/` in git.
+
+Regenerate workflows from Studio (**Set up workflows**) or:
+
+```bash
+python kiforge.py --generate-cd --project-path . --output-dir kiforge
+```
 
 When Gerbers are enabled, drill export runs automatically so the Gerber ZIP always includes drill files. JLC formatting (`format_jlc`) and CD generation (`generate_cd`) default to on and can be disabled per run or in saved settings.
 

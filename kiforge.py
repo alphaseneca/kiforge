@@ -4,9 +4,10 @@ KiForge — KiCad 10 Manufacturing & Documentation Exporter
 ==========================================================
 
 Single source of truth for manufacturing and documentation exports. KiForge runs
-``kicad-cli`` in a structured pipeline, optionally post-processes BOM and placement
-CSVs for JLCPCB, and can generate GitHub/Gitea release workflows for downstream
-KiCad projects.
+``kicad-cli`` in a structured pipeline, produces both unedited KiCad BOM/placement
+CSVs and JLC-ready copies via JLCPCB Fabrication Toolkit (with a lightweight
+fallback formatter when the plugin is not installed), and can generate
+GitHub/Gitea release workflows for downstream KiCad projects.
 
 Entry points
 ------------
@@ -24,8 +25,28 @@ Library (KiCad GUI plugin via ``kiforge_studio.py``)::
 Settings merge order
 --------------------
 Built-in defaults → global ``settings.json`` → project ``.kiforge.json`` → runtime
-CLI/GUI flags. Saved JSON uses nested ``exports`` and ``ibom`` groups; legacy flat
-keys and ``generate_ci`` are still accepted.
+CLI/GUI flags. Saved JSON uses nested ``exports``, ``export_params``, and ``ibom``
+groups; legacy flat keys and ``generate_ci`` are still accepted.
+
+Configuration layers
+--------------------
+KiForge separates *what to export* from *how kicad-cli exports it* from *one-off run
+behavior*. Only the middle layer (``export_params``) and export toggles are
+user-configurable and flow through CLI, GitHub Action, CD YAML, and
+``.kiforge.json``. BOM layout and 3D render flags are fixed constants.
+
+1. **Export toggles** (``exports`` / ``EXPORT_SETTING_KEYS``) — which artifacts
+   to produce (Gerbers, BOM, STEP, …).
+2. **Export parameters** (``export_params`` / ``EXPORT_PARAM_SPECS``) — placement
+   CSV and STEP ``kicad-cli`` flags. Declared once in :data:`EXPORT_PARAM_SPECS`;
+   consumed by Studio, :func:`parse_cli_args`, ``action.yml`` → ``action/run.sh``,
+   and :func:`build_cd_substitutions`.
+3. **Runtime options** (``RUNTIME_OPTION_SPECS``) — per-run only (e.g.
+   ``sync_title_block_rev``); not saved to ``.kiforge.json``.
+4. **Fixed pipelines** — :data:`BOM_EXPORT_DEFAULTS` (raw BOM + iBOM columns/grouping)
+   and :data:`RENDER_3D_DEFAULTS` (3D PNG renders). Not exposed as parameters.
+
+See ``ARCHITECTURE.md`` §7 for the full configuration reference.
 
 Version suffix (output filenames)
 ---------------------------------
@@ -64,7 +85,7 @@ Key types
 ---------
 PathResolver     Resolve ``kicad-cli`` and KiCad Python across platforms.
 ExportContext    Resolved paths, options, subprocess env, cancellation, offsets.
-JLCPCBFormatter  Stateless BOM/CPL column reformatting for JLCPCB upload.
+JLCPCBFormatter  Fallback BOM/CPL formatter when Fabrication Toolkit is absent.
 ExportTask       Abstract export step; subclasses implement ``is_applicable`` / ``run``.
 ExportRunner     Ordered pipeline driver with progress and cleanup.
 generate_cd_files  Write CD workflow YAML and update project ``.gitignore``.
@@ -74,6 +95,7 @@ import os
 import sys
 import csv
 import html
+import io
 import zipfile
 import shutil
 import tempfile
@@ -83,6 +105,8 @@ import site
 import threading
 import json
 import re
+import urllib.error
+import urllib.request
 
 # Ensure the user's local site-packages folder is in sys.path
 # This is critical for KiCad's isolated Python environment to recognize --user pip packages.
@@ -156,6 +180,20 @@ KIFORGE_ACTION_REF = "alphaseneca/kiforge@main"
 
 # ---------------------------------------------------------------------------
 # Defaults & persisted settings
+#
+# Configuration model (first principles)
+# --------------------------------------
+# - EXPORT_SETTING_KEYS: boolean toggles persisted under JSON key "exports".
+# - EXPORT_PARAM_SPECS: metadata table for placement/STEP flags; keys stored in
+#   "export_params" and flattened onto ExportContext.options at run time.
+# - BOM_EXPORT_DEFAULTS / RENDER_3D_DEFAULTS: hardcoded kicad-cli arguments for
+#   BOM CSV and 3D PNGs — intentionally NOT in export_params (no CLI/Action/CD).
+# - DEFAULT_IBOM_SETTINGS: HTML BOM presentation only (tracks, dark mode, …);
+#   column layout comes from BOM_EXPORT_DEFAULTS via build_ibom_cli_args().
+# - RUNTIME_OPTION_SPECS: per-run flags (title-block sync); never saved.
+#
+# Merge order at export time: defaults → global settings.json → .kiforge.json →
+# explicit CLI/GUI overrides (see load_merged_settings, build_cli_options).
 # ---------------------------------------------------------------------------
 
 DEFAULT_EXPORT_SETTINGS = {
@@ -174,15 +212,89 @@ DEFAULT_EXPORT_SETTINGS = {
 
 EXPORT_SETTING_KEYS = tuple(DEFAULT_EXPORT_SETTINGS.keys())
 
-# Set only when starting an export run (CLI, Studio Run Export, GitHub Action).
-# Never loaded from or saved to .kiforge.json / settings.json.
+# Placement + STEP kicad-cli flags (persisted, configurable, CD/CLI/Action parity).
+DEFAULT_EXPORT_PARAMS = {
+    "pos_side": "both",
+    "pos_smd_only": True,
+    "pos_exclude_dnp": True,
+    "step_subst_models": True,
+}
+
+# Raw KiCad BOM CSV + InteractiveHtmlBom column/group layout (fixed).
+BOM_EXPORT_DEFAULTS = {
+    "fields": "Reference,Value,Footprint,Description,${QUANTITY},${DNP},ID,MPN",
+    "group_by": "Value,ID,Footprint,DNP",
+    "ref_range_delimiter": "",
+}
+
+# 3D PNG render flags for kicad-cli pcb render (fixed).
+RENDER_3D_DEFAULTS = {
+    "zoom": 0.8,
+    "quality": "high",
+    "width": 1920,
+    "height": 1080,
+    "preset": "2",
+}
+
+# Registry: each entry maps one export_params key → CLI flag, Action input, CD placeholder.
+EXPORT_PARAM_SPECS = (
+    {
+        "key": "pos_side",
+        "type": "choice",
+        "choices": ("both", "front", "back"),
+        "cli": "--pos-side",
+        "help": "Placement CSV: board side (both, front/top, back/bottom)",
+        "action_input": "pos_side",
+        "cd_placeholder": "POS_SIDE",
+    },
+    {
+        "key": "pos_smd_only",
+        "type": "bool",
+        "cli": "--pos-smd-only",
+        "help": "Placement CSV: include SMD parts only",
+        "action_input": "pos_smd_only",
+        "cd_placeholder": "POS_SMD_ONLY",
+    },
+    {
+        "key": "pos_exclude_dnp",
+        "type": "bool",
+        "cli": "--pos-exclude-dnp",
+        "help": "Placement CSV: exclude do-not-populate parts",
+        "action_input": "pos_exclude_dnp",
+        "cd_placeholder": "POS_EXCLUDE_DNP",
+    },
+    {
+        "key": "step_subst_models",
+        "type": "bool",
+        "cli": "--step-subst-models",
+        "help": "STEP export: substitute missing 3D models",
+        "action_input": "step_subst_models",
+        "cd_placeholder": "STEP_SUBST_MODELS",
+    },
+)
+
+EXPORT_PARAM_KEYS = tuple(spec["key"] for spec in EXPORT_PARAM_SPECS)
+assert set(EXPORT_PARAM_KEYS) == set(DEFAULT_EXPORT_PARAMS), "EXPORT_PARAM_SPECS keys must match DEFAULT_EXPORT_PARAMS"
+
+# Per-run flags (CLI / Action / CD). Not loaded from or saved to .kiforge.json.
 DEFAULT_EXPORT_RUNTIME_OPTIONS = {
     "sync_title_block_rev": True,
 }
 
+RUNTIME_OPTION_SPECS = (
+    {
+        "key": "sync_title_block_rev",
+        "type": "bool",
+        "cli": "--sync-title-block-rev",
+        "help": "Sync schematic title-block (rev) to export version via staged copy",
+        "action_input": "sync_title_block_rev",
+        "cd_placeholder": "SYNC_TITLE_BLOCK_REV",
+    },
+)
+
 
 def apply_export_runtime_options(options: dict | None) -> dict:
-    """Attach export-only runtime flags (not persisted settings)."""
+    """Attach per-run flags from RUNTIME_OPTION_SPECS (never loaded from JSON)."""
     merged = dict(options or {})
     for key, default in DEFAULT_EXPORT_RUNTIME_OPTIONS.items():
         merged.setdefault(key, default)
@@ -453,6 +565,46 @@ def merge_export_settings(base: dict | None, overlay: dict | None) -> dict:
     return merged
 
 
+def merge_export_params(base: dict | None, overlay: dict | None) -> dict:
+    """
+    Merge placement/STEP parameter dicts into a full export_params object.
+
+    Starts from :data:`DEFAULT_EXPORT_PARAMS`, applies ``base`` (e.g. saved JSON),
+    then ``overlay`` (CLI or Studio). Validates ``pos_side`` against allowed values.
+    """
+    merged = DEFAULT_EXPORT_PARAMS.copy()
+    if base:
+        for key in EXPORT_PARAM_KEYS:
+            if key in base:
+                merged[key] = _coerce_setting_value(DEFAULT_EXPORT_PARAMS[key], base[key])
+    if overlay:
+        for key in EXPORT_PARAM_KEYS:
+            if key in overlay:
+                merged[key] = _coerce_setting_value(DEFAULT_EXPORT_PARAMS[key], overlay[key])
+    if merged.get("pos_side") not in ("both", "front", "back"):
+        merged["pos_side"] = "both"
+    return merged
+
+
+def apply_export_params_to_options(options: dict) -> dict:
+    """
+    Flatten nested ``export_params`` onto the options dict used by ExportContext.
+
+    Studio and save_settings store parameters under ``export_params``; export
+    tasks read flat keys (``pos_side``, ``step_subst_models``, …) from
+    ``context.options``. Does not touch BOM or render constants.
+    """
+    merged = dict(options)
+    flat_overlay = {key: options[key] for key in EXPORT_PARAM_KEYS if key in options}
+    params = merge_export_params(
+        options.get("export_params") if isinstance(options.get("export_params"), dict) else None,
+        flat_overlay or None,
+    )
+    merged.update(params)
+    merged["export_params"] = params
+    return merged
+
+
 _STEP_EXPORT_WARNINGS = (
     "Cannot use VRML models",
     "non-mesh formats",
@@ -530,6 +682,56 @@ def _cd_option_str(options: dict, key: str, default: bool = True) -> str:
     return "true" if options.get(key, default) else "false"
 
 
+def _export_toggle_cd_placeholder(export_key: str) -> str:
+    """Map export toggle keys to CD template placeholders (export_3d → EXPORT_3D)."""
+    return export_key.upper()
+
+
+def _cd_value_for_export_param(options: dict, spec: dict) -> str:
+    """Format one export_params value for CD workflow YAML substitution."""
+    key = spec["key"]
+    default = DEFAULT_EXPORT_PARAMS[key]
+    if spec["type"] == "bool":
+        return _cd_option_str(options, key, default)
+    return str(options.get(key, default))
+
+
+def _normalize_cd_options(options: dict) -> dict:
+    """Flatten export toggles and export_params for CD template substitution."""
+    return apply_export_runtime_options(apply_export_params_to_options(options or {}))
+
+
+def build_cd_substitutions(output_dir_name: str, options: dict) -> dict[str, str]:
+    """
+    Build all ``{{PLACEHOLDER}}`` values for CD workflow templates.
+
+    Derived from :data:`EXPORT_SETTING_KEYS`, :data:`EXPORT_PARAM_SPECS`, and
+    :data:`RUNTIME_OPTION_SPECS` so Studio, CLI ``--generate-cd``, and the
+    composite Action share one mapping table.
+    """
+    opts = _normalize_cd_options(options)
+    substitutions = {
+        "OUTPUT_DIR": output_dir_name,
+        "KIFORGE_ACTION_REF": KIFORGE_ACTION_REF,
+        "GITHUB_REF_NAME": "${{ github.ref_name }}",
+    }
+    for key in EXPORT_SETTING_KEYS:
+        if key == "generate_cd":
+            continue
+        substitutions[_export_toggle_cd_placeholder(key)] = _cd_option_str(
+            opts, key, DEFAULT_EXPORT_SETTINGS[key]
+        )
+    for spec in EXPORT_PARAM_SPECS:
+        substitutions[spec["cd_placeholder"]] = _cd_value_for_export_param(opts, spec)
+    for spec in RUNTIME_OPTION_SPECS:
+        placeholder = spec.get("cd_placeholder")
+        if placeholder:
+            substitutions[placeholder] = _cd_option_str(
+                opts, spec["key"], DEFAULT_EXPORT_RUNTIME_OPTIONS[spec["key"]]
+            )
+    return substitutions
+
+
 def render_cd_workflow_template(template_name: str, output_dir_name: str, options: dict) -> str:
     """
     Load a CD workflow YAML template and substitute export options.
@@ -539,21 +741,7 @@ def render_cd_workflow_template(template_name: str, output_dir_name: str, option
     template_path = require_template_path(template_name)
     with open(template_path, "r", encoding="utf-8") as f:
         content = f.read()
-    substitutions = {
-        "OUTPUT_DIR": output_dir_name,
-        "EXPORT_3D": _cd_option_str(options, "export_3d"),
-        "EXPORT_SVG": _cd_option_str(options, "export_svg"),
-        "EXPORT_BOM": _cd_option_str(options, "export_bom"),
-        "EXPORT_SCH_PDF": _cd_option_str(options, "export_sch_pdf"),
-        "EXPORT_POS": _cd_option_str(options, "export_pos"),
-        "EXPORT_STEP": _cd_option_str(options, "export_step"),
-        "EXPORT_GERBERS": _cd_option_str(options, "export_gerbers"),
-        "EXPORT_DRILLS": _cd_option_str(options, "export_drills"),
-        "EXPORT_IBOM": _cd_option_str(options, "export_ibom"),
-        "FORMAT_JLC": _cd_option_str(options, "format_jlc"),
-        "KIFORGE_ACTION_REF": KIFORGE_ACTION_REF,
-        "GITHUB_REF_NAME": "${{ github.ref_name }}",
-    }
+    substitutions = build_cd_substitutions(output_dir_name, options)
     for key, value in substitutions.items():
         content = content.replace(f"{{{{{key}}}}}", value)
     return content
@@ -580,6 +768,11 @@ def _coerce_setting_value(default, value):
 
 # ---------------------------------------------------------------------------
 # iBOM (Interactive HTML BOM) integration
+#
+# Presentation flags (tracks, dark mode, …) live in DEFAULT_IBOM_SETTINGS / ibom JSON.
+# BOM column order and grouping mirror BOM_EXPORT_DEFAULTS so the HTML table matches
+# the raw KiCad CSV. Custom symbol fields (ID, MPN) are passed via --extra-fields;
+# missing fields export as empty columns without error.
 # ---------------------------------------------------------------------------
 
 def merge_ibom_settings(base: dict | None, overlay: dict | None) -> dict:
@@ -596,8 +789,60 @@ def merge_ibom_settings(base: dict | None, overlay: dict | None) -> dict:
     return merged
 
 
-def build_ibom_cli_args(ibom_settings: dict | None, output_dir: str) -> list[str]:
-    """Build InteractiveHtmlBom CLI flags from saved/default iBOM settings."""
+_KICAD_TO_IBOM_FIELD_NAMES = {
+    "Reference": "References",
+    "${QUANTITY}": "Quantity",
+    "${DNP}": "DNP",
+}
+
+
+def ibom_show_fields_from_bom_fields(bom_fields: str) -> str:
+    """Map kicad-cli BOM field names to InteractiveHtmlBom column names."""
+    columns = []
+    for token in bom_fields.split(","):
+        token = token.strip()
+        if token:
+            columns.append(_KICAD_TO_IBOM_FIELD_NAMES.get(token, token))
+    return ",".join(columns)
+
+
+def ibom_group_fields_from_bom_group_by(bom_group_by: str) -> str:
+    """Map kicad-cli BOM group-by tokens to InteractiveHtmlBom group fields."""
+    columns = []
+    for token in bom_group_by.split(","):
+        token = token.strip()
+        if token:
+            columns.append(_KICAD_TO_IBOM_FIELD_NAMES.get(token, token))
+    return ",".join(columns)
+
+
+def ibom_extra_fields_from_bom_fields(bom_fields: str) -> str:
+    """Return custom schematic fields iBOM should load via --extra-fields."""
+    builtin = {
+        "Reference", "References", "Value", "Footprint", "Description",
+        "${QUANTITY}", "Quantity", "${DNP}", "DNP",
+    }
+    extra = []
+    for token in bom_fields.split(","):
+        token = token.strip()
+        if token and token not in builtin and token not in extra:
+            extra.append(token)
+    return ",".join(extra)
+
+
+def build_ibom_cli_args(
+    ibom_settings: dict | None,
+    output_dir: str,
+    extra_data_file: str | None = None,
+) -> list[str]:
+    """
+    Build InteractiveHtmlBom CLI argv from iBOM settings and BOM_EXPORT_DEFAULTS.
+
+    Maps kicad-cli field names to iBOM names (Reference→References, etc.), sets
+    ``--show-fields`` / ``--group-fields`` / ``--extra-fields``, and always passes
+    ``--no-browser`` for unattended export. ``extra_data_file`` should be the
+    staged PCB copy so DNP flags resolve correctly in CLI mode.
+    """
     settings = merge_ibom_settings(None, ibom_settings)
     args = []
     flag_map = {
@@ -612,7 +857,17 @@ def build_ibom_cli_args(ibom_settings: dict | None, output_dir: str) -> list[str
     for key, flag in flag_map.items():
         if settings.get(key):
             args.append(flag)
-    # KiForge batch export must never launch a browser (including on cancel races).
+    show_fields = ibom_show_fields_from_bom_fields(BOM_EXPORT_DEFAULTS["fields"])
+    group_fields = ibom_group_fields_from_bom_group_by(BOM_EXPORT_DEFAULTS["group_by"])
+    if show_fields:
+        args.extend(["--show-fields", show_fields])
+    if group_fields:
+        args.extend(["--group-fields", group_fields])
+    extra_fields = ibom_extra_fields_from_bom_fields(BOM_EXPORT_DEFAULTS["fields"])
+    if extra_fields:
+        args.extend(["--extra-fields", extra_fields])
+    if extra_data_file:
+        args.extend(["--extra-data-file", extra_data_file])
     args.append("--no-browser")
     args.extend(["--dest-dir", output_dir])
     return args
@@ -783,6 +1038,12 @@ def _apply_settings_layer(settings: dict, loaded: dict) -> None:
         settings[key] = settings["exports"][key]
 
     settings["ibom"] = merge_ibom_settings(settings.get("ibom"), loaded.get("ibom"))
+    settings["export_params"] = merge_export_params(
+        settings.get("export_params"),
+        loaded.get("export_params"),
+    )
+    for key in EXPORT_PARAM_KEYS:
+        settings[key] = settings["export_params"][key]
 
     if "rotation_offsets" in loaded:
         settings["rotation_offsets"] = _parse_rotation_offsets(loaded["rotation_offsets"])
@@ -806,6 +1067,7 @@ def load_merged_settings(project_dir=None):
     settings = DEFAULT_SETTINGS.copy()
     settings["exports"] = DEFAULT_EXPORT_SETTINGS.copy()
     settings["ibom"] = DEFAULT_IBOM_SETTINGS.copy()
+    settings["export_params"] = DEFAULT_EXPORT_PARAMS.copy()
     settings["rotation_offsets"] = {}
 
     global_path = get_global_settings_path()
@@ -832,8 +1094,8 @@ def save_settings(settings, project_dir=None, scope="project"):
 
     Use scope="project" to save .kiforge.json beside the KiCad project, or
     scope="global" to save the user-wide defaults file returned by
-    get_global_settings_path(). Export toggles are stored under ``exports``;
-    iBOM options under ``ibom``.
+    ``get_global_settings_path()``. Export toggles are stored under ``exports``;
+    placement/STEP flags under ``export_params``; iBOM presentation under ``ibom``.
 
     Args:
         settings: Current option values (typically from the Studio dialog).
@@ -852,6 +1114,7 @@ def save_settings(settings, project_dir=None, scope="project"):
         "output_dir": settings.get("output_dir", DEFAULT_SETTINGS["output_dir"]),
         "exports": exports,
         "ibom": merge_ibom_settings(None, settings.get("ibom")),
+        "export_params": merge_export_params(None, settings.get("export_params")),
     }
 
     if scope == "global":
@@ -942,9 +1205,9 @@ def export_options_from_context(context: "ExportContext") -> dict:
     Copy export and CD-related flags from a resolved ExportContext into a plain dict.
 
     Used when generating CD workflow YAML after export so the release pipeline
-    matches the same toggles the user selected in the GUI or CLI (Gerbers, STEP,
-    format_jlc, generate_cd, and so on). Legacy generate_ci
-    option keys are mapped to generate_cd for backward compatibility.
+    matches export toggles, export_params, and runtime options from the run.
+    BOM and 3D render behavior is fixed inside KiForge and is not substituted
+    into workflow YAML. Legacy ``generate_ci`` maps to ``generate_cd``.
 
     Args:
         context: A resolved ExportContext from the current run.
@@ -960,7 +1223,9 @@ def export_options_from_context(context: "ExportContext") -> dict:
     options = {key: context.options.get(key, DEFAULT_SETTINGS.get(key, True)) for key in keys}
     if "generate_cd" not in context.options and context.options.get("generate_ci") is not None:
         options["generate_cd"] = context.options.get("generate_ci")
-    return options
+    if isinstance(context.options.get("export_params"), dict):
+        options["export_params"] = context.options["export_params"]
+    return _normalize_cd_options(options)
 
 
 def _build_subprocess_env(kicad_cli: str | None) -> dict:
@@ -1254,6 +1519,15 @@ class ExportContext:
             self.options[key] = merged_exports[key]
         self.options["exports"] = merged_exports
 
+        merged_params = merge_export_params(
+            merged_settings.get("export_params"),
+            self.options.get("export_params") if isinstance(self.options.get("export_params"), dict) else None,
+        )
+        for key in EXPORT_PARAM_KEYS:
+            if key not in self.options:
+                self.options[key] = merged_params[key]
+        self.options["export_params"] = merged_params
+
     def _resolve_output_directories(self) -> None:
         """Create the versioned output folder and temporary gerber staging directory."""
         if os.path.isabs(self.output_dir_name):
@@ -1267,16 +1541,309 @@ class ExportContext:
 
 
 # ---------------------------------------------------------------------------
-# JLCPCB BOM/CPL post-processing
+# JLCPCB Fabrication Toolkit integration
+# ---------------------------------------------------------------------------
+
+FABRICATION_TOOLKIT_PACKAGE = "com_github_bennymeg_JLC-Plugin-for-KiCad"
+FABRICATION_TOOLKIT_CLI_MODULE = f"{FABRICATION_TOOLKIT_PACKAGE}.cli"
+FABRICATION_TOOLKIT_PRODUCTION_DIR = "production"
+FABRICATION_TOOLKIT_REPO = "bennymeg/Fabrication-Toolkit"
+FABRICATION_TOOLKIT_RELEASE_FALLBACK = "5.3.1"
+
+
+def resolve_kicad_third_party_dir() -> str | None:
+    """Return KiCad's 3rdparty directory when Fabrication Toolkit may be installed."""
+    for key in ("KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY"):
+        base = os.environ.get(key, "").strip()
+        if base and os.path.isdir(base):
+            return base
+
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+        for version in ("10.0", "9.0", "8.0"):
+            candidates.append(os.path.join(appdata, "kicad", version, "3rdparty"))
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "kicad")
+        for version in ("10.0", "9.0", "8.0"):
+            candidates.append(os.path.join(base, version, "3rdparty"))
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
+        for version in ("10.0", "9.0", "8.0"):
+            candidates.append(os.path.join(xdg, "kicad", version, "3rdparty"))
+
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def ensure_kicad_third_party_dir() -> str:
+    """Return KiCad 3rdparty root, creating the default 10.0 location if needed."""
+    existing = resolve_kicad_third_party_dir()
+    if existing:
+        return existing
+
+    if sys.platform == "win32":
+        base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "kicad", "10.0", "3rdparty")
+    elif sys.platform == "darwin":
+        base = os.path.join(
+            os.path.expanduser("~"), "Library", "Application Support", "kicad", "10.0", "3rdparty"
+        )
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
+        base = os.path.join(xdg, "kicad", "10.0", "3rdparty")
+
+    os.makedirs(os.path.join(base, "plugins"), exist_ok=True)
+    return base
+
+
+def fabrication_toolkit_plugin_dir() -> str:
+    return os.path.join(ensure_kicad_third_party_dir(), "plugins", FABRICATION_TOOLKIT_PACKAGE)
+
+
+def fabrication_toolkit_plugins_dir() -> str:
+    return os.path.join(ensure_kicad_third_party_dir(), "plugins")
+
+
+def fabrication_toolkit_cli_path() -> str:
+    return os.path.join(fabrication_toolkit_plugin_dir(), "cli.py")
+
+
+def fabrication_toolkit_is_available() -> bool:
+    """True when Fabrication Toolkit is installed under KiCad 3rdparty."""
+    plugin_dir = fabrication_toolkit_plugin_dir()
+    return (
+        os.path.isfile(os.path.join(plugin_dir, "cli.py"))
+        and os.path.isfile(os.path.join(plugin_dir, "__init__.py"))
+    )
+
+
+def _fabrication_toolkit_zip_url() -> str:
+    api_url = f"https://api.github.com/repos/{FABRICATION_TOOLKIT_REPO}/releases/latest"
+    try:
+        request = urllib.request.Request(api_url, headers={"User-Agent": "KiForge-Studio/1.0"})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            release = json.loads(response.read().decode("utf-8"))
+        tag = release.get("tag_name", FABRICATION_TOOLKIT_RELEASE_FALLBACK)
+        for asset in release.get("assets", []):
+            name = asset.get("name", "")
+            if name.startswith("Fabrication-Toolkit-") and name.endswith(".zip"):
+                return asset["browser_download_url"]
+        return (
+            f"https://github.com/{FABRICATION_TOOLKIT_REPO}/releases/download/"
+            f"{tag}/Fabrication-Toolkit-{tag}.zip"
+        )
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        logger.warning("Could not resolve latest Fabrication Toolkit release: %s", exc)
+        tag = FABRICATION_TOOLKIT_RELEASE_FALLBACK
+        return (
+            f"https://github.com/{FABRICATION_TOOLKIT_REPO}/releases/download/"
+            f"{tag}/Fabrication-Toolkit-{tag}.zip"
+        )
+
+
+def install_fabrication_toolkit_from_release() -> bool:
+    """Download and install JLCPCB Fabrication Toolkit into KiCad 3rdparty plugins."""
+    dest = fabrication_toolkit_plugin_dir()
+    url = _fabrication_toolkit_zip_url()
+    logger.info("Downloading Fabrication Toolkit from %s", url)
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "KiForge-Studio/1.0"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = response.read()
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        logger.warning("Fabrication Toolkit download failed: %s", exc)
+        return False
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            if os.path.isdir(dest):
+                shutil.rmtree(dest)
+            os.makedirs(dest, exist_ok=True)
+            for member in archive.namelist():
+                if not member.startswith("plugins/") or member.endswith("/"):
+                    continue
+                rel_path = member[len("plugins/"):]
+                target = os.path.join(dest, rel_path)
+                parent = os.path.dirname(target)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with archive.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+    except (zipfile.BadZipFile, OSError, shutil.Error) as exc:
+        logger.warning("Fabrication Toolkit install failed: %s", exc)
+        return False
+
+    return fabrication_toolkit_is_available()
+
+
+def ensure_fabrication_toolkit_available(context: "ExportContext") -> bool:
+    """Verify Fabrication Toolkit is present; download/install from GitHub if missing."""
+    kicad_python = context.kicad_python or get_kicad_python_path()
+
+    if fabrication_toolkit_is_available() and verify_fabrication_toolkit_cli(
+        kicad_python, context.env
+    ):
+        context.logger.info("Fabrication Toolkit successfully verified.")
+        return True
+
+    context.logger.info(
+        "Fabrication Toolkit not found. Attempting to install from GitHub release..."
+    )
+    if context.progress_callback:
+        context.progress_callback(None, None, "Installing JLCPCB Fabrication Toolkit...")
+
+    if install_fabrication_toolkit_from_release() and verify_fabrication_toolkit_cli(
+        kicad_python, context.env
+    ):
+        context.logger.info("Fabrication Toolkit successfully installed and verified.")
+        return True
+
+    context.logger.warning("Failed to install Fabrication Toolkit from GitHub release.")
+    return False
+
+
+def build_fabrication_toolkit_env(base_env: dict | None) -> dict:
+    """Ensure KiCad 3rdparty plugins are on PYTHONPATH for Fabrication Toolkit CLI."""
+    env = dict(base_env or os.environ)
+    plugins_dir = fabrication_toolkit_plugins_dir()
+    prefix = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = plugins_dir + (os.pathsep + prefix if prefix else "")
+    return env
+
+
+def build_fabrication_toolkit_cli_invocation(
+    kicad_python: str,
+    pcb_file: str,
+    pcb_name: str,
+    base_env: dict | None = None,
+) -> tuple[list[str], dict]:
+    """
+    Build argv/env to run Fabrication Toolkit via KiCad Python.
+
+    ``python -m`` cannot load PCM plugin IDs that contain hyphens, so KiForge
+    uses ``runpy.run_module`` with an explicit plugins path instead.
+    """
+    plugins_dir = fabrication_toolkit_plugins_dir()
+    ft_env = build_fabrication_toolkit_env(base_env)
+    argv = [
+        "cli",
+        "-p",
+        pcb_file,
+        "-e",
+        "-t",
+        "-nB",
+        "--archiveName",
+        pcb_name,
+    ]
+    snippet = (
+        "import sys, runpy\n"
+        f"sys.path.insert(0, {plugins_dir!r})\n"
+        f"sys.argv = {json.dumps(argv)}\n"
+        f"runpy.run_module({FABRICATION_TOOLKIT_CLI_MODULE!r}, run_name='__main__')\n"
+    )
+    return [kicad_python, "-c", snippet], ft_env
+
+
+def verify_fabrication_toolkit_cli(
+    kicad_python: str,
+    base_env: dict | None = None,
+) -> bool:
+    """Return True when Fabrication Toolkit CLI can be launched with KiCad Python."""
+    if not fabrication_toolkit_is_available():
+        return False
+    plugins_dir = fabrication_toolkit_plugins_dir()
+    snippet = (
+        "import sys, runpy\n"
+        f"sys.path.insert(0, {plugins_dir!r})\n"
+        "sys.argv = ['cli', '--help']\n"
+        f"runpy.run_module({FABRICATION_TOOLKIT_CLI_MODULE!r}, run_name='__main__')\n"
+    )
+    env = build_fabrication_toolkit_env(base_env)
+    try:
+        result = subprocess.run(
+            [kicad_python, "-c", snippet],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def copy_fabrication_toolkit_jlc_outputs(
+    context: "ExportContext",
+    production_dir: str,
+) -> bool:
+    """Copy Fabrication Toolkit bom.csv / positions.csv into the KiForge output folder."""
+    copied = False
+    if context.options.get("export_bom", True):
+        src = os.path.join(production_dir, "bom.csv")
+        dst = os.path.join(context.output_dir, f"{context.pcb_name}_bom_jlc.csv")
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+            context.logger.info(f"Saved JLCPCB BOM (Fabrication Toolkit): {os.path.basename(dst)}")
+            copied = True
+        else:
+            context.logger.warning("Fabrication Toolkit bom.csv not found in %s", production_dir)
+
+    if context.options.get("export_pos", True):
+        src = os.path.join(production_dir, "positions.csv")
+        dst = os.path.join(context.output_dir, f"{context.pcb_name}_cpl_jlc.csv")
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+            context.logger.info(f"Saved JLCPCB CPL (Fabrication Toolkit): {os.path.basename(dst)}")
+            copied = True
+        else:
+            context.logger.warning("Fabrication Toolkit positions.csv not found in %s", production_dir)
+    return copied
+
+
+def apply_jlc_fallback_from_kicad_exports(context: "ExportContext") -> bool:
+    """Fallback JLC CSVs from KiCad exports when Fabrication Toolkit is unavailable."""
+    ok = True
+    if context.options.get("export_bom", True):
+        bom_path = os.path.join(context.output_dir, f"{context.pcb_name}_bom.csv")
+        jlc_bom_path = os.path.join(context.output_dir, f"{context.pcb_name}_bom_jlc.csv")
+        if os.path.isfile(bom_path):
+            try:
+                JLCPCBFormatter.format_bom(bom_path, jlc_bom_path)
+                context.logger.info(
+                    f"Saved JLCPCB BOM (fallback formatter): {os.path.basename(jlc_bom_path)}"
+                )
+            except Exception as exc:
+                context.logger.error("Fallback JLC BOM formatting failed: %s", exc, exc_info=True)
+                context.add_warning(f"JLCPCB BOM fallback failed: {exc}")
+                ok = False
+    if context.options.get("export_pos", True):
+        pos_path = os.path.join(context.output_dir, f"{context.pcb_name}_pos.csv")
+        jlc_cpl_path = os.path.join(context.output_dir, f"{context.pcb_name}_cpl_jlc.csv")
+        if os.path.isfile(pos_path):
+            try:
+                JLCPCBFormatter.format_cpl(pos_path, jlc_cpl_path, context.rotation_offsets)
+                context.logger.info(
+                    f"Saved JLCPCB CPL (fallback formatter): {os.path.basename(jlc_cpl_path)}"
+                )
+            except Exception as exc:
+                context.logger.error("Fallback JLC CPL formatting failed: %s", exc, exc_info=True)
+                context.add_warning(f"JLCPCB CPL fallback failed: {exc}")
+                ok = False
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# JLCPCB BOM/CPL fallback formatter (used when Fabrication Toolkit is absent)
 # ---------------------------------------------------------------------------
 
 class JLCPCBFormatter:
     """
-    Convert raw KiCad CSV exports into JLCPCB upload format.
+    Lightweight fallback when JLCPCB Fabrication Toolkit is not installed.
 
-    :meth:`format_bom` filters DNP rows and normalizes LCSC column aliases.
-    :meth:`format_cpl` maps placement columns and applies per-footprint rotation
-    offsets from ``ExportContext.rotation_offsets``.
+    Prefer the Fabrication Toolkit plugin (KiCad PCM) for JLC-ready BOM/CPL.
+    KiForge always keeps unedited KiCad ``*_bom.csv`` and ``*_pos.csv`` exports.
     """
     
     @staticmethod
@@ -1396,7 +1963,14 @@ class ExportTask:
         """Executes the task's command or logic. Returns True if successful."""
         raise NotImplementedError
 
-    def _run_subprocess(self, cmd: list, context: ExportContext, *, env=None) -> bool:
+    def _run_subprocess(
+        self,
+        cmd: list,
+        context: ExportContext,
+        *,
+        env=None,
+        failure_message: str | None = None,
+    ) -> bool:
         """Execute a subprocess; record a warning and return False instead of raising."""
         if context.is_aborted():
             return False
@@ -1445,7 +2019,8 @@ class ExportTask:
                 err_output,
             )
             context.add_warning(
-                format_task_failure_message(self.name, e.stderr or "", e.stdout or "", cmd)
+                failure_message
+                or format_task_failure_message(self.name, e.stderr or "", e.stdout or "", cmd)
             )
             return False
         except OSError as e:
@@ -1513,7 +2088,13 @@ class DrillExportTask(ExportTask):
 
 
 class PlacementExportTask(ExportTask):
-    """Write KiCad placement CSV to ``raw_pos.csv`` in the output directory."""
+    """
+    Export KiCad placement CSV to ``raw_pos.csv``.
+
+    Reads ``pos_side``, ``pos_smd_only``, and ``pos_exclude_dnp`` from
+    ``context.options`` (from export_params). Always uses csv format, mm units,
+    and drill-file origin — matching standard manufacturing scripts.
+    """
     def __init__(self):
         super().__init__("Exporting Position Data")
 
@@ -1525,17 +2106,29 @@ class PlacementExportTask(ExportTask):
         cmd = [
             context.kicad_cli, "pcb", "export", "pos",
             "--format", "csv",
-            "--exclude-dnp",
             "--use-drill-file-origin",
             "--units", "mm",
-            context.pcb_file,
-            "-o", raw_pos_path
         ]
+        if context.options.get("pos_exclude_dnp", True):
+            cmd.append("--exclude-dnp")
+        if context.options.get("pos_smd_only", True):
+            cmd.append("--smd-only")
+        side = context.options.get("pos_side", "both")
+        if side not in ("front", "back", "both"):
+            side = "both"
+        cmd.extend(["--side", side, context.pcb_file, "-o", raw_pos_path])
         return self._run_subprocess(cmd, context)
 
 
 class BomExportTask(ExportTask):
-    """Write KiCad BOM CSV to ``raw_bom.csv`` (includes LCSC field aliases)."""
+    """
+    Export KiCad BOM CSV to ``raw_bom.csv``.
+
+    Uses fixed :data:`BOM_EXPORT_DEFAULTS` (fields, group-by, ref delimiter).
+    LCSC/JLC columns are not included in the raw file; JLC copies are produced
+    separately when ``format_jlc`` is enabled. Missing symbol fields (ID, MPN)
+    appear as empty columns.
+    """
     def __init__(self):
         super().__init__("Exporting Bill of Materials")
 
@@ -1546,10 +2139,10 @@ class BomExportTask(ExportTask):
         raw_bom_path = os.path.join(context.output_dir, "raw_bom.csv")
         cmd = [
             context.kicad_cli, "sch", "export", "bom",
-            "--fields", "Reference,Value,Footprint,Description,${QUANTITY},${DNP},LCSC,LCSC Part,LCSC Part #,JLCPCB Part,JLCPCB Part #,ID",
-            "--group-by", "Value,Footprint,LCSC,LCSC Part,LCSC Part #,JLCPCB Part,JLCPCB Part #,${DNP},ID",
-            "--ref-range-delimiter", "",
-            context.sch_file, "-o", raw_bom_path
+            "--fields", BOM_EXPORT_DEFAULTS["fields"],
+            "--group-by", BOM_EXPORT_DEFAULTS["group_by"],
+            "--ref-range-delimiter", BOM_EXPORT_DEFAULTS["ref_range_delimiter"],
+            context.sch_file, "-o", raw_bom_path,
         ]
         return self._run_subprocess(cmd, context)
 
@@ -1595,7 +2188,13 @@ class SchematicPdfExportTask(ExportTask):
 
 
 class Step3dExportTask(ExportTask):
-    """Export ``{pcb_name}.step``; treats non-fatal KiCad model warnings as partial success."""
+    """
+    Export ``{pcb_name}.step`` via kicad-cli.
+
+    Honors ``step_subst_models`` from export_params. Always passes
+    ``--no-optimize-step`` (fixed manufacturing default).
+    Treats non-fatal KiCad model warnings as partial success when a STEP file exists.
+    """
     def __init__(self):
         super().__init__("Exporting STEP 3D Model")
 
@@ -1605,13 +2204,10 @@ class Step3dExportTask(ExportTask):
     def run(self, context: ExportContext) -> bool:
         """Export STEP; keep partial output when KiCad reports non-fatal model warnings."""
         output_step = os.path.join(context.output_dir, f"{context.pcb_name}.step")
-        cmd = [
-            context.kicad_cli, "pcb", "export", "step",
-            "--subst-models",
-            "-f",
-            "-o", output_step,
-            context.pcb_file
-        ]
+        cmd = [context.kicad_cli, "pcb", "export", "step", "--no-optimize-step"]
+        if context.options.get("step_subst_models", True):
+            cmd.append("--subst-models")
+        cmd.extend(["-f", "-o", output_step, context.pcb_file])
         if self._run_subprocess(cmd, context):
             return True
         if os.path.isfile(output_step) and os.path.getsize(output_step) > 0:
@@ -1623,7 +2219,7 @@ class Step3dExportTask(ExportTask):
 
 
 class Render3dExportTask(ExportTask):
-    """Render front and back 3D PNG views of the board."""
+    """Render front/back 3D PNGs using fixed :data:`RENDER_3D_DEFAULTS`."""
     def __init__(self):
         super().__init__("Rendering 3D Views")
 
@@ -1631,13 +2227,20 @@ class Render3dExportTask(ExportTask):
         return context.options.get("export_3d", True) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
+        render_flags = [
+            "--preset", RENDER_3D_DEFAULTS["preset"], "--floor", "--perspective",
+            "--zoom", str(RENDER_3D_DEFAULTS["zoom"]),
+            "--quality", RENDER_3D_DEFAULTS["quality"],
+            "--width", str(RENDER_3D_DEFAULTS["width"]),
+            "--height", str(RENDER_3D_DEFAULTS["height"]),
+        ]
         # Render Front
         front_png = os.path.join(context.output_dir, f"{context.pcb_name}_3d_front.png")
         cmd_front = [
             context.kicad_cli, "pcb", "render", context.pcb_file,
             "--output", front_png,
-            "--rotate", "0,0,0", "--preset", "2", "--floor", "--perspective",
-            "--zoom", "0.8", "--quality", "high", "--width", "1920", "--height", "1080"
+            "--rotate", "0,0,0",
+            *render_flags,
         ]
         ok_front = self._run_subprocess(cmd_front, context)
         if not ok_front:
@@ -1648,8 +2251,8 @@ class Render3dExportTask(ExportTask):
         cmd_back = [
             context.kicad_cli, "pcb", "render", context.pcb_file,
             "--output", back_png,
-            "--rotate", "0,180,0", "--preset", "2", "--floor", "--perspective",
-            "--zoom", "0.8", "--quality", "high", "--width", "1920", "--height", "1080"
+            "--rotate", "0,180,0",
+            *render_flags,
         ]
         ok_back = self._run_subprocess(cmd_back, context)
         return ok_front or ok_back
@@ -1785,7 +2388,9 @@ class InteractiveBomTask(ExportTask):
         if ibom_available:
             ibom_temp_dir, ibom_input = stage_ibom_project_copy(context)
             ibom_cmd = ibom_run_cmd + build_ibom_cli_args(
-                context.options.get("ibom"), context.output_dir
+                context.options.get("ibom"),
+                context.output_dir,
+                extra_data_file=ibom_input,
             ) + [ibom_input]
             try:
                 success = self._run_subprocess(
@@ -1884,7 +2489,7 @@ class GerberPackTask(ExportTask):
 
 
 class BomOutputTask(ExportTask):
-    """Rename KiCad BOM export to a versioned filename and optionally produce JLCPCB CSV."""
+    """Rename KiCad BOM export to a versioned filename (unedited KiCad CSV)."""
 
     def __init__(self):
         super().__init__("Finalizing Bill of Materials")
@@ -1903,10 +2508,6 @@ class BomOutputTask(ExportTask):
                 os.remove(versioned_bom_path)
             os.replace(raw_bom_path, versioned_bom_path)
             context.logger.info(f"Saved KiCad BOM: {os.path.basename(versioned_bom_path)}")
-            if context.options.get("format_jlc", True):
-                jlc_bom_path = os.path.join(context.output_dir, f"{context.pcb_name}_bom_jlc.csv")
-                JLCPCBFormatter.format_bom(versioned_bom_path, jlc_bom_path)
-                context.logger.info(f"Saved JLCPCB BOM: {os.path.basename(jlc_bom_path)}")
         except Exception as e:
             context.logger.error(f"Error finalizing BOM: {e}", exc_info=True)
             context.add_warning(f"{self.name} failed: {e}")
@@ -1915,7 +2516,7 @@ class BomOutputTask(ExportTask):
 
 
 class PosOutputTask(ExportTask):
-    """Rename KiCad placement export to a versioned filename and optionally produce JLCPCB CPL."""
+    """Rename KiCad placement export to a versioned filename (unedited KiCad CSV)."""
 
     def __init__(self):
         super().__init__("Finalizing Component Placement")
@@ -1934,10 +2535,6 @@ class PosOutputTask(ExportTask):
                 os.remove(versioned_pos_path)
             os.replace(raw_pos_path, versioned_pos_path)
             context.logger.info(f"Saved KiCad placement: {os.path.basename(versioned_pos_path)}")
-            if context.options.get("format_jlc", True):
-                jlc_cpl_path = os.path.join(context.output_dir, f"{context.pcb_name}_cpl_jlc.csv")
-                JLCPCBFormatter.format_cpl(versioned_pos_path, jlc_cpl_path, context.rotation_offsets)
-                context.logger.info(f"Saved JLCPCB CPL: {os.path.basename(jlc_cpl_path)}")
         except Exception as e:
             context.logger.error(f"Error finalizing placement: {e}", exc_info=True)
             context.add_warning(f"{self.name} failed: {e}")
@@ -1948,6 +2545,50 @@ class PosOutputTask(ExportTask):
 # Legacy names kept for external importers and older tests.
 JlcBomFormatTask = BomOutputTask
 JlcCplFormatTask = PosOutputTask
+
+
+class FabricationToolkitTask(ExportTask):
+    """Produce JLC-ready BOM/CPL via JLCPCB Fabrication Toolkit (auto-install if missing)."""
+
+    def __init__(self):
+        super().__init__("Generating JLCPCB BOM/CPL")
+
+    def is_applicable(self, context: ExportContext) -> bool:
+        if not context.options.get("format_jlc", True):
+            return False
+        if not (context.options.get("export_bom", True) or context.options.get("export_pos", True)):
+            return False
+        return bool(context.pcb_file)
+
+    def run(self, context: ExportContext) -> bool:
+        if context.is_aborted():
+            return False
+
+        if ensure_fabrication_toolkit_available(context):
+            production_dir = os.path.join(context.project_dir, FABRICATION_TOOLKIT_PRODUCTION_DIR)
+            cmd, ft_env = build_fabrication_toolkit_cli_invocation(
+                context.kicad_python,
+                context.pcb_file,
+                context.pcb_name,
+                context.env,
+            )
+            ft_failure = (
+                "Fabrication Toolkit could not run; JLC CSVs were generated "
+                "with KiForge fallback formatting."
+            )
+            if self._run_subprocess(cmd, context, env=ft_env, failure_message=ft_failure):
+                if copy_fabrication_toolkit_jlc_outputs(context, production_dir):
+                    return True
+                context.add_warning(
+                    "Fabrication Toolkit ran but bom.csv / positions.csv were missing; "
+                    "using KiForge fallback formatter."
+                )
+        else:
+            context.add_warning(
+                "JLCPCB BOM/CPL copies were generated with KiForge fallback formatting "
+                "because Fabrication Toolkit could not be installed."
+            )
+        return apply_jlc_fallback_from_kicad_exports(context)
 
 
 # ---------------------------------------------------------------------------
@@ -1980,10 +2621,11 @@ class ExportRunner:
         self.tasks.append(SvgExportTask())
         self.tasks.append(InteractiveBomTask())
         
-        # 2. Post-processing: version raw BOM/POS and optionally emit JLCPCB CSVs
+        # 2. Post-processing: version KiCad BOM/POS; optional JLC copies via Fabrication Toolkit
         self.tasks.append(GerberPackTask())
         self.tasks.append(BomOutputTask())
         self.tasks.append(PosOutputTask())
+        self.tasks.append(FabricationToolkitTask())
 
     def _is_applicable(self, task: "ExportTask") -> bool:
         """Evaluate task applicability without letting a faulty check abort the pipeline."""
@@ -2140,7 +2782,7 @@ def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=Tr
     (skipped inside GitHub Actions itself).
     """
     if context is None:
-        options = apply_export_runtime_options({
+        options = apply_export_runtime_options(apply_export_params_to_options({
             "export_3d": export_3d,
             "export_svg": export_svg,
             "export_bom": export_bom,
@@ -2150,13 +2792,13 @@ def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=Tr
             "export_gerbers": export_gerbers,
             "export_drills": export_drills,
             "export_ibom": export_ibom,
-        })
+        }))
 
         context = ExportContext(project_path, output_dir, options, progress_callback)
         if not context.resolve():
             return False
     else:
-        context.options = apply_export_runtime_options(context.options)
+        context.options = apply_export_runtime_options(apply_export_params_to_options(context.options))
 
     runner = ExportRunner(context)
     success = runner.execute()
@@ -2192,33 +2834,125 @@ def print_export_summary(context: ExportContext, success: bool) -> None:
 
 
 def parse_cli_args(args=None):
-    """Parse CLI arguments for ``python kiforge.py`` (export and ``--generate-cd`` modes)."""
+    """
+    Parse CLI arguments for ``python kiforge.py``.
+
+    Export toggles are generated from EXPORT_SETTING_KEYS. Placement/STEP flags
+    are generated from EXPORT_PARAM_SPECS (plus ``--top`` / ``--bottom`` aliases).
+    Runtime flags come from RUNTIME_OPTION_SPECS. BOM and 3D render behavior is
+    not configurable on the CLI.
+    """
     import argparse
-    parser = argparse.ArgumentParser(description="KiForge - KiCad 10 Exporter CLI")
+
+    parser = argparse.ArgumentParser(
+        description="KiForge - KiCad 10 Exporter CLI",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--project-path", "--project_path", dest="project_path", default=".")
     parser.add_argument("--output-dir", "--output_dir", dest="output_dir", default="kiforge")
-    parser.add_argument("--export-3d", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--export-svg", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--export-bom", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--export-sch-pdf", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--export-pos", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--export-step", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--export-gerbers", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--export-drills", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--export-ibom", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--format-jlc", action=argparse.BooleanOptionalAction, default=True,
-                        help="Apply JLCPCB BOM/CPL column formatting and rotation offsets")
+    for key in EXPORT_SETTING_KEYS:
+        if key == "generate_cd":
+            continue
+        flag = f"--{key.replace('_', '-')}"
+        parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
-        "--sync-title-block-rev",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Sync schematic title-block (rev) to export version via staged copy (export runs only)",
+        "--version-tag",
+        "--version_tag",
+        dest="version_tag",
+        default=None,
+        help="Version tag to append to output filenames",
     )
-    parser.add_argument("--version-tag", "--version_tag", dest="version_tag", default=None, help="Version tag to append to output filenames")
-    parser.add_argument("--generate-cd", action="store_true", dest="generate_cd",
-                        help="Generate GitHub/Gitea release CD workflow and update .gitignore instead of exporting")
+    for spec in EXPORT_PARAM_SPECS:
+        kw = {"dest": spec["key"], "default": None, "help": spec["help"]}
+        if spec["type"] == "bool":
+            parser.add_argument(spec["cli"], action=argparse.BooleanOptionalAction, **kw)
+        elif spec["type"] == "choice":
+            parser.add_argument(spec["cli"], choices=spec["choices"], **kw)
+        elif spec["type"] == "float":
+            parser.add_argument(spec["cli"], type=float, **kw)
+        elif spec["type"] == "int":
+            parser.add_argument(spec["cli"], type=int, **kw)
+        else:
+            parser.add_argument(spec["cli"], type=str, **kw)
+    parser.add_argument(
+        "--top",
+        action="store_const",
+        const="front",
+        dest="pos_side",
+        default=None,
+        help="Placement CSV: top side only (alias for --pos-side front)",
+    )
+    parser.add_argument(
+        "--bottom",
+        action="store_const",
+        const="back",
+        dest="pos_side",
+        default=None,
+        help="Placement CSV: bottom side only (alias for --pos-side back)",
+    )
+    for spec in RUNTIME_OPTION_SPECS:
+        parser.add_argument(
+            spec["cli"],
+            action=argparse.BooleanOptionalAction,
+            dest=spec["key"],
+            default=DEFAULT_EXPORT_RUNTIME_OPTIONS[spec["key"]],
+            help=spec["help"],
+        )
+    parser.add_argument(
+        "--generate-cd",
+        action="store_true",
+        dest="generate_cd",
+        help="Generate GitHub/Gitea release CD workflow and update .gitignore instead of exporting",
+    )
     parser.add_argument("--generate-ci", action="store_true", dest="generate_cd", help=argparse.SUPPRESS)
     return parser.parse_args(args)
+
+
+def export_params_from_cli_args(args) -> dict | None:
+    """
+    Collect export_params keys explicitly set on the CLI.
+
+    Omitted flags return None so :func:`build_cli_options` does not override
+    values loaded from ``.kiforge.json`` during a normal export run.
+    """
+    params = {}
+    for spec in EXPORT_PARAM_SPECS:
+        value = getattr(args, spec["key"], None)
+        if value is not None:
+            params[spec["key"]] = value
+    return params or None
+
+
+def runtime_options_from_cli_args(args) -> dict:
+    """Collect per-run runtime flags from parsed CLI arguments."""
+    runtime = {}
+    for spec in RUNTIME_OPTION_SPECS:
+        runtime[spec["key"]] = getattr(args, spec["key"])
+    return apply_export_runtime_options(runtime)
+
+
+def build_cli_options(args, *, flatten_params: bool = False) -> dict:
+    """
+    Build an options dict from parsed CLI arguments.
+
+    When ``flatten_params`` is False (normal export), only CLI-provided
+    export_params are attached so :meth:`ExportContext.resolve` can merge
+    project/global ``.kiforge.json``. When True (``--generate-cd``), defaults
+    are flattened like Studio/CD workflow generation expects.
+    """
+    options = {
+        key: getattr(args, key, DEFAULT_EXPORT_SETTINGS[key])
+        for key in EXPORT_SETTING_KEYS
+        if key != "generate_cd"
+    }
+    options["version"] = args.version_tag
+    export_params = export_params_from_cli_args(args)
+    if export_params:
+        options["export_params"] = merge_export_params(None, export_params)
+    options.update(runtime_options_from_cli_args(args))
+    if flatten_params:
+        return apply_export_params_to_options(options)
+    return options
 
 
 if __name__ == "__main__":
@@ -2226,38 +2960,13 @@ if __name__ == "__main__":
     args = parse_cli_args()
     
     if args.generate_cd:
-        options = {
-            "export_3d": args.export_3d,
-            "export_svg": args.export_svg,
-            "export_bom": args.export_bom,
-            "export_sch_pdf": args.export_sch_pdf,
-            "export_pos": args.export_pos,
-            "export_step": args.export_step,
-            "export_gerbers": args.export_gerbers,
-            "export_drills": args.export_drills,
-            "export_ibom": args.export_ibom,
-            "format_jlc": args.format_jlc,
-            "version": args.version_tag
-        }
+        options = build_cli_options(args, flatten_params=True)
         msg, success = generate_cd_files(args.project_path, args.output_dir, options)
         print(msg)
         sys.exit(0 if success else 1)
         
     try:
-        options = apply_export_runtime_options({
-            "export_3d": args.export_3d,
-            "export_svg": args.export_svg,
-            "export_bom": args.export_bom,
-            "export_sch_pdf": args.export_sch_pdf,
-            "export_pos": args.export_pos,
-            "export_step": args.export_step,
-            "export_gerbers": args.export_gerbers,
-            "export_drills": args.export_drills,
-            "export_ibom": args.export_ibom,
-            "format_jlc": args.format_jlc,
-            "version": args.version_tag,
-            "sync_title_block_rev": args.sync_title_block_rev,
-        })
+        options = build_cli_options(args)
         
         context = ExportContext(args.project_path, args.output_dir, options)
         if not context.resolve():

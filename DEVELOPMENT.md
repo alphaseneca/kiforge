@@ -61,14 +61,18 @@ Output filenames always include a version suffix (`_vX.Y.Z`):
 - Or `v0.1.0` when no tag is found
 - CI uses `GITHUB_REF_NAME` on tag pushes
 
-Verify BOM/POS pairs:
+Verify BOM/POS pairs (raw KiCad + optional JLC copies):
 
 ```
-sample_v0.1.2_bom.csv      # KiCad raw BOM
-sample_v0.1.2_bom_jlc.csv  # JLCPCB formatted
-sample_v0.1.2_pos.csv      # KiCad placement
-sample_v0.1.2_cpl_jlc.csv  # JLCPCB CPL
+sample_v0.1.2_bom.csv      # KiCad raw BOM (always when export_bom)
+sample_v0.1.2_pos.csv      # KiCad raw placement (always when export_pos)
+sample_v0.1.2_bom_jlc.csv  # JLCPCB (Fabrication Toolkit, or fallback in CI)
+sample_v0.1.2_cpl_jlc.csv  # JLCPCB CPL (Fabrication Toolkit, or fallback in CI)
 ```
+
+### JLCPCB Fabrication Toolkit
+
+Auto-installed from GitHub on first export when missing (same pattern as InteractiveHtmlBom). Pre-installed in the Docker image at build time.
 
 ## CD workflow generation
 

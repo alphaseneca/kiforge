@@ -236,6 +236,8 @@ class TestKiForgeCLI(unittest.TestCase):
                 content = f.read()
                 self.assertIn("output_dir: 'kiforge_test_ci'", content)
                 self.assertIn("export_3d: 'false'", content)
+                self.assertIn("pos_side: 'both'", content)
+                self.assertIn("pos_smd_only: 'true'", content)
                 self.assertIn(kiforge.KIFORGE_ACTION_REF, content)
 
             # Check Gitea workflow file
@@ -401,8 +403,164 @@ class TestKiForgeCLI(unittest.TestCase):
         context.pcb_file = "dummy.kicad_pcb"
         self.assertTrue(task.is_applicable(context))
 
+    def test_export_params_defaults(self):
+        """Default export params align with the standard kicad-cli manufacturing script."""
+        merged = kiforge.merge_export_params(None, None)
+        self.assertEqual(merged["pos_side"], "both")
+        self.assertTrue(merged["pos_smd_only"])
+        self.assertTrue(merged["pos_exclude_dnp"])
+
+    def test_bom_export_defaults(self):
+        """Raw BOM export uses fixed BOM_EXPORT_DEFAULTS (not export_params)."""
+        from unittest.mock import patch
+
+        task = kiforge.BomExportTask()
+        context = kiforge.ExportContext(".", "out", {})
+        context.sch_file = "board.kicad_sch"
+        context.kicad_cli = "kicad-cli"
+        context.output_dir = "out"
+        captured = {}
+
+        def fake_run(cmd, ctx, **kwargs):
+            captured["cmd"] = cmd
+            return True
+
+        with patch.object(task, "_run_subprocess", side_effect=fake_run):
+            self.assertTrue(task.run(context))
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[cmd.index("--fields") + 1], kiforge.BOM_EXPORT_DEFAULTS["fields"])
+        self.assertEqual(cmd[cmd.index("--group-by") + 1], kiforge.BOM_EXPORT_DEFAULTS["group_by"])
+        self.assertNotIn("LCSC", " ".join(cmd))
+
+    def test_ibom_bom_field_mapping(self):
+        """InteractiveHtmlBom CLI args mirror BOM_EXPORT_DEFAULTS."""
+        args = kiforge.build_ibom_cli_args(
+            {"dark_mode": True},
+            "/tmp/out",
+            extra_data_file="/tmp/board.kicad_pcb",
+        )
+        self.assertIn("--show-fields", args)
+        self.assertIn("References,Value,Footprint,Description,Quantity,DNP,ID,MPN", args)
+        self.assertIn("--group-fields", args)
+        self.assertIn("Value,ID,Footprint,DNP", args)
+        self.assertIn("--extra-fields", args)
+        self.assertIn("ID,MPN", args)
+        self.assertIn("--extra-data-file", args)
+        self.assertIn("/tmp/board.kicad_pcb", args)
+
+    def test_export_params_save_and_load_round_trip(self):
+        """Placement/STEP options persist in project settings like other exports."""
+        import shutil
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            settings = kiforge.DEFAULT_SETTINGS.copy()
+            settings["exports"] = kiforge.DEFAULT_EXPORT_SETTINGS.copy()
+            settings["export_params"] = {
+                "pos_side": "front",
+                "pos_smd_only": False,
+                "pos_exclude_dnp": False,
+            }
+            kiforge.save_settings(settings, project_dir=temp_dir, scope="project")
+            loaded = kiforge.load_merged_settings(temp_dir)
+            self.assertEqual(loaded["export_params"]["pos_side"], "front")
+            self.assertFalse(loaded["export_params"]["pos_smd_only"])
+            self.assertFalse(loaded["export_params"]["pos_exclude_dnp"])
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_cd_workflow_includes_export_params(self):
+        """Advanced placement/STEP/render options are written into generated CD workflows."""
+        import shutil
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            options = kiforge.apply_export_params_to_options({
+                "export_bom": True,
+                "sync_title_block_rev": False,
+                "export_params": {
+                    "pos_side": "front",
+                    "pos_smd_only": False,
+                    "pos_exclude_dnp": False,
+                    "step_subst_models": False,
+                },
+            })
+            _, success = kiforge.generate_cd_files(temp_dir, "kiforge_out", options)
+            self.assertTrue(success)
+            workflow_path = os.path.join(temp_dir, ".github", "workflows", "release.yml")
+            with open(workflow_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            for spec in kiforge.EXPORT_PARAM_SPECS:
+                placeholder = spec["cd_placeholder"]
+                expected = kiforge.build_cd_substitutions("kiforge_out", options)[placeholder]
+                self.assertIn(f"{spec['action_input']}: '{expected}'", content)
+            self.assertIn("sync_title_block_rev: 'false'", content)
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_cli_export_param_flags(self):
+        """CLI exposes every export_params key declared in EXPORT_PARAM_SPECS."""
+        args = kiforge.parse_cli_args([
+            "--pos-side", "back",
+            "--no-pos-smd-only",
+            "--no-step-subst-models",
+        ])
+        options = kiforge.apply_export_params_to_options(kiforge.build_cli_options(args))
+        self.assertEqual(options["pos_side"], "back")
+        self.assertFalse(options["pos_smd_only"])
+        self.assertFalse(options["step_subst_models"])
+
+    def test_cli_top_bottom_aliases(self):
+        """--top and --bottom match the placement side conventions from shell scripts."""
+        top = kiforge.apply_export_params_to_options(
+            kiforge.build_cli_options(kiforge.parse_cli_args(["--top"]))
+        )
+        bottom = kiforge.apply_export_params_to_options(
+            kiforge.build_cli_options(kiforge.parse_cli_args(["--bottom"]))
+        )
+        self.assertEqual(top["pos_side"], "front")
+        self.assertEqual(bottom["pos_side"], "back")
+
+    def test_action_yml_declares_export_param_inputs(self):
+        """GitHub Action inputs stay aligned with EXPORT_PARAM_SPECS."""
+        action_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "action.yml")
+        with open(action_path, "r", encoding="utf-8") as f:
+            action_yaml = f.read()
+        for spec in kiforge.EXPORT_PARAM_SPECS:
+            self.assertIn(f"{spec['action_input']}:", action_yaml)
+        for spec in kiforge.RUNTIME_OPTION_SPECS:
+            self.assertIn(f"{spec['action_input']}:", action_yaml)
+
+    def test_placement_export_uses_export_params(self):
+        """Placement CSV export passes side/SMD/DNP flags to kicad-cli."""
+        from unittest.mock import patch
+
+        task = kiforge.PlacementExportTask()
+        context = kiforge.ExportContext(
+            ".",
+            "out",
+            kiforge.apply_export_params_to_options(
+                {"pos_side": "front", "pos_smd_only": True, "pos_exclude_dnp": False}
+            ),
+        )
+        context.pcb_file = "board.kicad_pcb"
+        context.kicad_cli = "kicad-cli"
+        context.output_dir = "out"
+        captured = {}
+
+        def fake_run(cmd, ctx, **kwargs):
+            captured["cmd"] = cmd
+            return True
+
+        with patch.object(task, "_run_subprocess", side_effect=fake_run):
+            self.assertTrue(task.run(context))
+        self.assertIn("--smd-only", captured["cmd"])
+        self.assertIn("--side", captured["cmd"])
+        self.assertIn("front", captured["cmd"])
+        self.assertNotIn("--exclude-dnp", captured["cmd"])
+
     def test_jlc_format_tasks_respect_format_jlc_flag(self):
-        """Verify BOM/POS finalize tasks always run; JLC files only when format_jlc is true."""
+        """JLC copies are produced only when format_jlc is enabled."""
         import tempfile
         import csv
 
@@ -429,6 +587,7 @@ class TestKiForgeCLI(unittest.TestCase):
 
             bom_task = kiforge.BomOutputTask()
             pos_task = kiforge.PosOutputTask()
+            jlc_task = kiforge.FabricationToolkitTask()
             context = kiforge.ExportContext(".", "out", {"format_jlc": False, "export_bom": True, "export_pos": True})
             context.pcb_file = "dummy.kicad_pcb"
             context.sch_file = "dummy.kicad_sch"
@@ -437,24 +596,21 @@ class TestKiForgeCLI(unittest.TestCase):
             context.output_dir = out_dir
             context.logger = kiforge.logger
 
-            self.assertTrue(bom_task.is_applicable(context))
-            self.assertTrue(pos_task.is_applicable(context))
             self.assertTrue(bom_task.run(context))
             self.assertTrue(pos_task.run(context))
+            self.assertFalse(jlc_task.is_applicable(context))
 
             versioned_bom = os.path.join(out_dir, "board_v1.0_bom.csv")
             versioned_pos = os.path.join(out_dir, "board_v1.0_pos.csv")
             self.assertTrue(os.path.isfile(versioned_bom))
             self.assertTrue(os.path.isfile(versioned_pos))
-            self.assertFalse(os.path.isfile(raw_bom))
-            self.assertFalse(os.path.isfile(raw_pos))
             self.assertFalse(os.path.isfile(os.path.join(out_dir, "board_v1.0_bom_jlc.csv")))
             self.assertFalse(os.path.isfile(os.path.join(out_dir, "board_v1.0_cpl_jlc.csv")))
         finally:
             shutil.rmtree(temp_dir)
 
-    def test_bom_output_task_produces_jlc_and_kicad_csv(self):
-        """Verify versioned KiCad BOM/POS are kept alongside JLCPCB CSVs."""
+    def test_bom_output_task_produces_kicad_csv(self):
+        """Verify versioned KiCad BOM is kept without JLC post-processing in BomOutputTask."""
         import tempfile
         import csv
 
@@ -476,8 +632,127 @@ class TestKiForgeCLI(unittest.TestCase):
 
             self.assertTrue(kiforge.BomOutputTask().run(context))
             self.assertTrue(os.path.isfile(os.path.join(out_dir, "sample_v1.0_bom.csv")))
-            self.assertTrue(os.path.isfile(os.path.join(out_dir, "sample_v1.0_bom_jlc.csv")))
+            self.assertFalse(os.path.isfile(os.path.join(out_dir, "sample_v1.0_bom_jlc.csv")))
             self.assertFalse(os.path.isfile(raw_bom))
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_jlc_fallback_formatter_from_kicad_exports(self):
+        """When Fabrication Toolkit is absent, fallback formatter creates JLC CSVs."""
+        import tempfile
+        import csv
+
+        temp_dir = tempfile.mkdtemp()
+        out_dir = os.path.join(temp_dir, "out")
+        os.makedirs(out_dir)
+        try:
+            bom_path = os.path.join(out_dir, "board_v1.0_bom.csv")
+            with open(bom_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["Reference", "Value", "Footprint", "DNP"])
+                writer.writeheader()
+                writer.writerow({"Reference": "R1", "Value": "10k", "Footprint": "R_0603", "DNP": ""})
+
+            context = kiforge.ExportContext(".", "out", {"export_bom": True, "export_pos": False})
+            context.pcb_name = "board_v1.0"
+            context.output_dir = out_dir
+            context.logger = kiforge.logger
+
+            from unittest.mock import patch
+            with patch.object(kiforge, "fabrication_toolkit_is_available", return_value=False):
+                self.assertTrue(kiforge.apply_jlc_fallback_from_kicad_exports(context))
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "board_v1.0_bom_jlc.csv")))
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_fabrication_toolkit_install_from_zip(self):
+        """Fabrication Toolkit can be installed from the GitHub release zip."""
+        import io
+        import zipfile
+        from unittest.mock import patch
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("plugins/cli.py", "def main():\n    pass\n")
+            archive.writestr("plugins/__init__.py", "")
+        payload = buffer.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(kiforge, "fabrication_toolkit_plugin_dir", return_value=os.path.join(tmp, "ft")):
+                with patch.object(kiforge, "_fabrication_toolkit_zip_url", return_value="https://example.com/ft.zip"):
+                    with patch.object(kiforge.urllib.request, "urlopen") as mock_urlopen:
+                        mock_resp = mock_urlopen.return_value.__enter__.return_value
+                        mock_resp.read.return_value = payload
+                        self.assertTrue(kiforge.install_fabrication_toolkit_from_release())
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "ft", "cli.py")))
+
+    def test_fabrication_toolkit_cli_invocation_uses_runpy(self):
+        """Fabrication Toolkit CLI must use runpy (PCM IDs contain hyphens)."""
+        cmd, env = kiforge.build_fabrication_toolkit_cli_invocation(
+            r"C:\Program Files\KiCad\10.0\bin\python.exe",
+            "board.kicad_pcb",
+            "board_v1.0",
+            {},
+        )
+        self.assertEqual(cmd[0], r"C:\Program Files\KiCad\10.0\bin\python.exe")
+        self.assertEqual(cmd[1], "-c")
+        self.assertIn("runpy.run_module", cmd[2])
+        self.assertIn("board.kicad_pcb", cmd[2])
+        self.assertIn("plugins", env["PYTHONPATH"])
+
+    def test_verify_fabrication_toolkit_cli_after_install(self):
+        """Installed Fabrication Toolkit CLI launches with KiCad Python."""
+        import io
+        import zipfile
+        from unittest.mock import patch
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("plugins/cli.py", "def main():\n    pass\n")
+            archive.writestr("plugins/__init__.py", "")
+        payload = buffer.getvalue()
+
+        py = kiforge.get_kicad_python_path()
+        if not os.path.isfile(py):
+            self.skipTest("KiCad Python not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            third = os.path.join(tmp, "3rdparty")
+            with patch.object(kiforge, "ensure_kicad_third_party_dir", return_value=third):
+                with patch.object(kiforge, "_fabrication_toolkit_zip_url", return_value="https://example.com/ft.zip"):
+                    with patch.object(kiforge.urllib.request, "urlopen") as mock_urlopen:
+                        mock_resp = mock_urlopen.return_value.__enter__.return_value
+                        mock_resp.read.return_value = payload
+                        self.assertTrue(kiforge.install_fabrication_toolkit_from_release())
+                cli_path = kiforge.fabrication_toolkit_cli_path()
+                with open(cli_path, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        "import argparse\n"
+                        "if __name__ == '__main__':\n"
+                        "    argparse.ArgumentParser(prog='Fabrication Toolkit').parse_args()\n"
+                    )
+                self.assertTrue(kiforge.verify_fabrication_toolkit_cli(py, {}))
+
+    def test_fabrication_toolkit_copy_outputs(self):
+        """Fabrication Toolkit production/ files are copied into the KiForge output folder."""
+        temp_dir = tempfile.mkdtemp()
+        out_dir = os.path.join(temp_dir, "out")
+        production_dir = os.path.join(temp_dir, "production")
+        os.makedirs(out_dir)
+        os.makedirs(production_dir)
+        try:
+            with open(os.path.join(production_dir, "bom.csv"), "w", encoding="utf-8") as f:
+                f.write("Designator,Comment\nR1,10k\n")
+            with open(os.path.join(production_dir, "positions.csv"), "w", encoding="utf-8") as f:
+                f.write("Designator,Mid X,Mid Y,Rotation,Layer\nR1,1,2,0,Top\n")
+
+            context = kiforge.ExportContext(".", "out", {"export_bom": True, "export_pos": True})
+            context.pcb_name = "board_v1.0"
+            context.output_dir = out_dir
+            context.logger = kiforge.logger
+
+            self.assertTrue(kiforge.copy_fabrication_toolkit_jlc_outputs(context, production_dir))
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "board_v1.0_bom_jlc.csv")))
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "board_v1.0_cpl_jlc.csv")))
         finally:
             shutil.rmtree(temp_dir)
 
@@ -570,7 +845,7 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertNotIn(";", kiforge.normalize_version_suffix("1.0;whoami"))
 
     def test_build_ibom_cli_args(self):
-        """Verify iBOM CLI flags are built from saved settings."""
+        """Verify iBOM CLI flags are built from saved settings and BOM defaults."""
         args = kiforge.build_ibom_cli_args(
             {"dark_mode": True, "include_tracks": False, "include_netlist": True},
             "/tmp/out",
@@ -578,6 +853,8 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertIn("--no-browser", args)
         self.assertIn("--dark-mode", args)
         self.assertIn("--include-nets", args)
+        self.assertIn("--show-fields", args)
+        self.assertIn("--group-fields", args)
         self.assertNotIn("--include-netlist", args)
         self.assertNotIn("--include-tracks", args)
         self.assertEqual(args[-2:], ["--dest-dir", "/tmp/out"])
@@ -804,13 +1081,68 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertTrue(task.run(context))
         self.assertTrue(any("STEP" in warning for warning in context.warnings))
 
-    def test_studio_ui_helpers_are_safe_without_progress(self):
-        """Cross-platform progress helpers must tolerate a missing dialog."""
+    def test_tab_icon_svg_cache_round_trip(self):
+        """Tab icons are cached as SVG beside global KiForge settings."""
+        from unittest.mock import patch
+        from plugins import kiforge_studio
+
+        sample_svg = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">'
+            b'<path d="M0 0h24v24H0z"/></svg>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(kiforge_studio, "_icon_cache_dir", return_value=tmp):
+                kiforge_studio._write_cached_icon_svg("export", sample_svg)
+                loaded = kiforge_studio._read_cached_icon_svg("export")
+                self.assertEqual(loaded, sample_svg)
+
+    def test_prepare_tab_icon_svg_adds_light_fill(self):
+        """CDN SVGs without fill are tinted for dark tab backgrounds."""
+        from plugins import kiforge_studio
+
+        raw = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">'
+            b'<path d="M0 0h24v24H0z"/></svg>'
+        )
+        prepared = kiforge_studio._prepare_tab_icon_svg(raw)
+        self.assertIn(b'fill="#e4e4e7"', prepared)
+        with_path_fill = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">'
+            b'<path fill="#000000" d="M0 0h24v24H0z"/></svg>'
+        )
+        self.assertIn(b'fill="#e4e4e7"', kiforge_studio._prepare_tab_icon_svg(with_path_fill))
+        self.assertNotIn(b'fill="#000000"', kiforge_studio._prepare_tab_icon_svg(with_path_fill))
+
+    def test_tab_icon_cdn_download_cached(self):
+        """CDN icon fetch writes SVG into the local cache."""
+        from unittest.mock import MagicMock, patch
+        from plugins import kiforge_studio
+
+        sample_svg = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">'
+            b'<path d="M0 0h24v24H0z"/></svg>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(kiforge_studio, "_icon_cache_dir", return_value=tmp):
+                mock_resp = MagicMock()
+                mock_resp.read.return_value = sample_svg
+                mock_resp.__enter__.return_value = mock_resp
+                mock_resp.__exit__.return_value = False
+                with patch.object(
+                    kiforge_studio.urllib.request,
+                    "urlopen",
+                    return_value=mock_resp,
+                ):
+                    data = kiforge_studio._download_icon_svg("export")
+                self.assertEqual(data, sample_svg)
+                self.assertEqual(kiforge_studio._read_cached_icon_svg("export"), sample_svg)
+
+    def test_destroy_progress_dialog_tolerates_none(self):
+        """Progress dialog teardown must not raise when no dialog exists."""
         try:
             from plugins import kiforge_studio
         except ImportError:
             self.skipTest("plugins package not available")
-        self.assertTrue(kiforge_studio._update_progress_dialog(None, 50, "Running..."))
         kiforge_studio._destroy_progress_dialog(None)
 
 

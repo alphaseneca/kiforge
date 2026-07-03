@@ -1,9 +1,19 @@
 """
 KiForge Studio — wxPython GUI for KiForge inside KiCad and standalone mode.
 
-Provides the settings dialog (export toggles, iBOM defaults, config load/save),
-background export with ``wx.ProgressDialog``, and CD workflow generation. Core
-export logic lives in ``kiforge.py``; this module handles UI threading only.
+Provides the settings dialog (export toggles, placement/STEP params, iBOM options,
+config load/save), background export with a themed progress dialog, and CD
+workflow generation. Core export logic lives in ``kiforge.py``; this module
+handles UI and threading only.
+
+Settings persisted by Studio map to kiforge configuration layers:
+
+- ``exports`` — export checkboxes (Gerbers, BOM, …)
+- ``export_params`` — Advanced placement/STEP controls
+- ``ibom`` — Interactive HTML BOM presentation checkboxes
+
+BOM column layout and 3D render quality are fixed in ``kiforge.py`` and are not
+edited from Studio. See ``ARCHITECTURE.md`` §7.
 
 Thread model
 ------------
@@ -19,10 +29,12 @@ Registration
 # pyrefly: ignore [missing-import]
 import sys
 import os
-import json
+import re
 import threading
 import time
 import logging
+import urllib.error
+import urllib.request
 
 # pyrefly: ignore [missing-import]
 import wx
@@ -44,6 +56,396 @@ except ImportError:
 
 logger = logging.getLogger("KiForge.Studio")
 
+# Shorter iBOM option labels for the Advanced tab.
+IBOM_OPTION_LABELS = {
+    "include_tracks": "Copper tracks",
+    "include_netlist": "Netlist",
+    "dark_mode": "Dark mode",
+    "checkboxes": "Checkboxes column",
+    "show_fabrication": "Fabrication layer",
+    "hide_pads": "Hide pads",
+    "highlight_pin1": "Highlight pin 1",
+}
+
+# ---------------------------------------------------------------------------
+# Studio palette
+# ---------------------------------------------------------------------------
+_PAD = 16
+_PAD_SM = 10
+_COLORS = {
+    "app_bg": wx.Colour(24, 24, 27),
+    "surface": wx.Colour(39, 39, 42),
+    "border": wx.Colour(63, 63, 70),
+    "text": wx.Colour(244, 244, 245),
+    "muted": wx.Colour(161, 161, 170),
+    "footer_bg": wx.Colour(24, 24, 27),
+    "input_bg": wx.Colour(33, 33, 38),
+    "input_fg": wx.Colour(244, 244, 245),
+    "accent": wx.Colour(217, 119, 6),
+}
+
+_BUTTON_RADIUS = 6
+_TAB_ICON_COLOUR = "#e4e4e7"  # light zinc — Material Symbols default to black without fill
+
+
+class _FlatButton(wx.Panel):
+    """Flat filled button with rounded corners; paints consistently on Windows and Linux."""
+
+    def __init__(self, parent, label: str, *, primary: bool = False, min_width: int = 0):
+        super().__init__(parent, style=wx.BORDER_NONE)
+        self._label = label
+        self._primary = primary
+        self._hover = False
+        self._pressed = False
+        self._enabled = True
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.SetBackgroundColour(parent.GetBackgroundColour() if parent else _COLORS["app_bg"])
+        self.SetMinSize((min_width, 32))
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
+        self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+        self.Bind(wx.EVT_ENTER_WINDOW, self._on_enter)
+        self.Bind(wx.EVT_LEAVE_WINDOW, self._on_leave)
+
+    def _on_enter(self, event):
+        if self._enabled:
+            self._hover = True
+            self.Refresh()
+        event.Skip()
+
+    def _on_leave(self, event):
+        self._hover = False
+        self._pressed = False
+        self.Refresh()
+        event.Skip()
+
+    def _on_left_down(self, event):
+        if not self._enabled:
+            return
+        self._pressed = True
+        self.CaptureMouse()
+        self.Refresh()
+
+    def _on_left_up(self, event):
+        if not self._enabled:
+            return
+        if self.HasCapture():
+            self.ReleaseMouse()
+        was_pressed = self._pressed
+        self._pressed = False
+        self.Refresh()
+        if was_pressed and self.ClientRect.Contains(event.GetPosition()):
+            event = wx.CommandEvent(wx.EVT_BUTTON.typeId, self.GetId())
+            event.SetEventObject(self)
+            wx.PostEvent(self, event)
+
+    def _on_paint(self, event):
+        dc = wx.AutoBufferedPaintDC(self)
+        width, height = self.GetSize()
+        parent = self.GetParent()
+        parent_bg = parent.GetBackgroundColour() if parent else _COLORS["app_bg"]
+        dc.SetBackground(wx.Brush(parent_bg))
+        dc.Clear()
+
+        if self._primary:
+            accent = _COLORS["accent"]
+            if not self._enabled:
+                fill = wx.Colour(accent.Red() // 2, accent.Green() // 2, accent.Blue() // 2)
+                text = _COLORS["muted"]
+                border = fill
+            elif self._pressed:
+                fill = wx.Colour(
+                    max(0, accent.Red() - 24),
+                    max(0, accent.Green() - 24),
+                    max(0, accent.Blue() - 24),
+                )
+                text = wx.Colour(255, 255, 255)
+                border = fill
+            elif self._hover:
+                fill = wx.Colour(
+                    min(255, accent.Red() + 16),
+                    min(255, accent.Green() + 16),
+                    min(255, accent.Blue() + 16),
+                )
+                text = wx.Colour(255, 255, 255)
+                border = fill
+            else:
+                fill = accent
+                text = wx.Colour(255, 255, 255)
+                border = fill
+        else:
+            if not self._enabled:
+                fill = _COLORS["input_bg"]
+                text = _COLORS["muted"]
+            elif self._pressed:
+                fill = _COLORS["border"]
+                text = _COLORS["text"]
+            elif self._hover:
+                fill = _COLORS["surface"]
+                text = _COLORS["text"]
+            else:
+                fill = _COLORS["input_bg"]
+                text = _COLORS["text"]
+            border = _COLORS["border"]
+
+        gc = wx.GraphicsContext.Create(dc)
+        if gc:
+            path = gc.CreatePath()
+            path.AddRoundedRectangle(0.5, 0.5, width - 1, height - 1, _BUTTON_RADIUS)
+            gc.SetBrush(wx.Brush(fill))
+            gc.SetPen(wx.Pen(border, 1))
+            gc.DrawPath(path)
+        else:
+            dc.SetBrush(wx.Brush(fill))
+            dc.SetPen(wx.Pen(border, 1))
+            dc.DrawRoundedRectangle(0, 0, width, height, _BUTTON_RADIUS)
+
+        dc.SetTextForeground(text)
+        font = self.GetFont()
+        if self._primary and self._enabled:
+            font.SetWeight(wx.FONTWEIGHT_BOLD)
+        dc.SetFont(font)
+        tw, th = dc.GetTextExtent(self._label)
+        dc.DrawText(self._label, (width - tw) // 2, (height - th) // 2)
+
+    def Enable(self, enable=True):
+        self._enabled = bool(enable)
+        self.Refresh()
+        return super().Enable(enable)
+
+    def Disable(self):
+        return self.Enable(False)
+
+
+class _ExportProgressDialog(wx.Dialog):
+    """Non-modal export progress window matching Studio theme."""
+
+    def __init__(self, parent):
+        super().__init__(
+            parent,
+            title="KiForge",
+            style=wx.DEFAULT_DIALOG_STYLE | wx.STAY_ON_TOP,
+        )
+        self._cancelled = False
+        self.SetBackgroundColour(_COLORS["app_bg"])
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        self.lbl_message = wx.StaticText(self, label="Initializing exporter…")
+        self.lbl_message.SetForegroundColour(_COLORS["text"])
+        sizer.Add(self.lbl_message, 0, wx.EXPAND | wx.ALL, _PAD)
+
+        self.gauge = wx.Gauge(self, range=100, size=(-1, 10))
+        sizer.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, _PAD)
+
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.AddStretchSpacer()
+        self.btn_cancel = _FlatButton(self, "Cancel", min_width=88)
+        self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
+        row.Add(self.btn_cancel, 0, wx.ALL, _PAD_SM)
+        sizer.Add(row, 0, wx.EXPAND)
+
+        self.SetSizer(sizer)
+        self.SetMinSize((380, 130))
+        self.Fit()
+        self.CentreOnParent()
+
+    def _on_cancel(self, event):
+        if self._cancelled:
+            return
+        self._cancelled = True
+        self.lbl_message.SetLabel("Cancelling…")
+        self.btn_cancel.Disable()
+        self.Layout()
+
+    def was_cancelled(self) -> bool:
+        return self._cancelled
+
+    def update(self, value: int, message: str | None) -> None:
+        if message:
+            self.lbl_message.SetLabel(message)
+        self.gauge.SetValue(max(0, min(100, int(value))))
+        self.Layout()
+
+
+_DIALOG_MIN_WIDTH = 440
+_DIALOG_MIN_HEIGHT = 400
+
+EXPORT_PRESET_RADIO_LABELS = (
+    "Full",
+    "JLCPCB",
+    "Documentation",
+    "Custom",
+)
+EXPORT_PRESET_CHOICES = (
+    ("full", "Full export"),
+    ("jlcpcb", "JLCPCB order"),
+    ("documentation", "Documentation"),
+    ("custom", "Custom"),
+)
+EXPORT_PRESETS = {
+    "full": {
+        "export_gerbers": True,
+        "export_drills": True,
+        "export_pos": True,
+        "export_bom": True,
+        "export_ibom": True,
+        "export_sch_pdf": True,
+        "export_step": True,
+        "export_3d": True,
+        "export_svg": True,
+        "format_jlc": True,
+    },
+    "jlcpcb": {
+        "export_gerbers": True,
+        "export_drills": True,
+        "export_pos": True,
+        "export_bom": True,
+        "export_ibom": False,
+        "export_sch_pdf": False,
+        "export_step": False,
+        "export_3d": False,
+        "export_svg": False,
+        "format_jlc": True,
+    },
+    "documentation": {
+        "export_gerbers": False,
+        "export_drills": False,
+        "export_pos": False,
+        "export_bom": False,
+        "export_ibom": True,
+        "export_sch_pdf": True,
+        "export_step": True,
+        "export_3d": True,
+        "export_svg": True,
+        "format_jlc": False,
+    },
+}
+_EXPORT_TOGGLE_KEYS = (
+    "export_gerbers", "export_drills", "export_pos", "export_bom", "export_ibom",
+    "export_sch_pdf", "export_step", "export_3d", "export_svg",
+)
+
+_TAB_ICON_NAMES = ("export", "advanced", "releases")
+# Google Material Symbols Outlined (fonts.gstatic.com) — downloaded once, cached locally.
+_TAB_ICON_CDN = {
+    "export": "file_download",
+    "advanced": "tune",
+    "releases": "label",
+}
+_CDN_SVG_URL = (
+    "https://fonts.gstatic.com/s/i/short-term/release/"
+    "materialsymbolsoutlined/{icon}/default/24px.svg"
+)
+_TAB_ICON_RASTER_SIZE = 48
+_tab_icon_bitmap_cache: dict[tuple[str, int], wx.Bitmap] = {}
+
+
+def _icon_cache_dir() -> str:
+    path = os.path.join(os.path.dirname(kiforge.get_global_settings_path()), "icon_cache")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _icon_cache_path(tab_name: str) -> str:
+    return os.path.join(_icon_cache_dir(), f"{tab_name}.svg")
+
+
+def _read_cached_icon_svg(tab_name: str) -> bytes | None:
+    path = _icon_cache_path(tab_name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+        return data if data.strip().startswith(b"<svg") else None
+    except Exception as exc:
+        logger.warning("Failed to read cached tab icon %s: %s", tab_name, exc)
+        return None
+
+
+def _write_cached_icon_svg(tab_name: str, data: bytes) -> None:
+    if not data.strip().startswith(b"<svg"):
+        return
+    try:
+        with open(_icon_cache_path(tab_name), "wb") as handle:
+            handle.write(data)
+    except Exception as exc:
+        logger.warning("Failed to cache tab icon %s: %s", tab_name, exc)
+
+
+def _download_icon_svg(tab_name: str) -> bytes | None:
+    icon_id = _TAB_ICON_CDN.get(tab_name)
+    if not icon_id:
+        return None
+    url = _CDN_SVG_URL.format(icon=icon_id)
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "KiForge-Studio/1.0"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = response.read()
+        if data.strip().startswith(b"<svg"):
+            _write_cached_icon_svg(tab_name, data)
+            return data
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        logger.warning("Tab icon CDN fetch failed for %s: %s", tab_name, exc)
+    return None
+
+
+def _fetch_icon_svg(tab_name: str) -> bytes | None:
+    """Return tab icon SVG from disk cache, refreshing from CDN when missing."""
+    cached = _read_cached_icon_svg(tab_name)
+    if cached:
+        return cached
+    return _download_icon_svg(tab_name)
+
+
+def _prepare_tab_icon_svg(svg_data: bytes) -> bytes:
+    """
+    Tint Material Symbol SVGs for dark notebook tabs.
+
+    CDN SVGs omit ``fill``; wx rasterizes them as black, which is invisible on
+    dark backgrounds. Force a light fill before :class:`wx.BitmapBundle.FromSVG`.
+    """
+    try:
+        text = svg_data.decode("utf-8")
+    except UnicodeDecodeError:
+        return svg_data
+    colour = _TAB_ICON_COLOUR
+    text = text.replace("currentColor", colour)
+    if re.search(r"<path[^>]*\sfill=", text, re.I):
+        text = re.sub(
+            r'(<path[^>]*\s)fill="[^"]*"',
+            rf'\1fill="{colour}"',
+            text,
+            flags=re.I,
+        )
+    else:
+        text = re.sub(r"<path\s+", f'<path fill="{colour}" ', text, flags=re.I)
+    if 'fill="' not in text.split(">", 1)[0]:
+        text = re.sub(r"<svg\s+", f'<svg fill="{colour}" ', text, count=1)
+    return text.encode("utf-8")
+
+
+def _load_tab_icon_bitmap(name: str, size: int = 20) -> wx.Bitmap | None:
+    """Rasterize a cached/CDN Material Symbol for notebook tabs."""
+    cache_key = (name, size)
+    if cache_key in _tab_icon_bitmap_cache:
+        cached_bmp = _tab_icon_bitmap_cache[cache_key]
+        return cached_bmp if cached_bmp.IsOk() else None
+
+    svg_data = _fetch_icon_svg(name)
+    if not svg_data:
+        _tab_icon_bitmap_cache[cache_key] = wx.Bitmap()
+        return None
+    try:
+        tinted = _prepare_tab_icon_svg(svg_data)
+        bundle = wx.BitmapBundle.FromSVG(tinted, (_TAB_ICON_RASTER_SIZE, _TAB_ICON_RASTER_SIZE))
+        bitmap = bundle.GetBitmap(wx.Size(size, size))
+        _tab_icon_bitmap_cache[cache_key] = bitmap
+        return bitmap if bitmap.IsOk() else None
+    except Exception as exc:
+        logger.warning("Failed to rasterize tab icon %s: %s", name, exc)
+        return None
+
 
 def _pump_ui_events():
     """Keep wx/KiCad responsive while a background export is running."""
@@ -60,43 +462,13 @@ def _pump_ui_events():
         pass
 
 
-def _update_progress_dialog(progress, value, message):
-    """
-    Update wx.ProgressDialog across platforms.
-
-    Returns False when the user clicks Cancel (or the dialog was closed).
-    """
-    if not progress:
-        return True
-    try:
-        value = max(0, min(100, int(value)))
-        result = progress.Update(value, message or "")
-        _pump_ui_events()
-        if isinstance(result, tuple):
-            return bool(result[0])
-        return bool(result)
-    except RuntimeError:
-        return True
-    except Exception as exc:
-        if exc.__class__.__name__ in ("PyAssertionError", "AssertionError"):
-            return True
-        logger.debug("Progress dialog update failed.", exc_info=True)
-        return True
-
-
 def _destroy_progress_dialog(progress):
-    """Close a wx.ProgressDialog safely on Windows, macOS, and Linux/GTK."""
     if not progress:
         return
     try:
         progress.Hide()
     except Exception:
         pass
-    if sys.platform == "win32":
-        try:
-            progress.Close()
-        except Exception:
-            pass
     try:
         progress.Destroy()
     except Exception:
@@ -105,11 +477,15 @@ def _destroy_progress_dialog(progress):
 
 class KiForgeStudioSettingsDialog(wx.Dialog):
     """
-    Main KiForge Studio dialog: project path, export toggles, iBOM options, and actions.
+    Main KiForge Studio dialog: project path, export toggles, and actions.
 
-    Settings are loaded via ``kiforge.load_merged_settings`` (global + project).
+    Settings load via ``kiforge.load_merged_settings`` (global + project).
+    ``_current_settings()`` writes ``exports``, ``export_params``, and ``ibom``
+    for ``kiforge.save_settings``. CD workflow YAML is regenerated when
+    **Sync with export settings** is enabled.
+
     Export runs on a background thread; the main thread polls progress with
-    ``wx.Timer``. Checkbox changes debounce-sync CD workflow YAML to the project.
+    ``wx.Timer``.
     """
     
     def __init__(self, parent, project_dir=None):
@@ -122,7 +498,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """
         super(KiForgeStudioSettingsDialog, self).__init__(
             parent, 
-            title="KiForge Studio - Exporter Settings", 
+            title="KiForge",
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.MAXIMIZE_BOX
         )
         self.project_dir = project_dir
@@ -137,11 +513,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_poll_val = -1
         self._export_poll_msg = ""
         self._export_running = False
+        self._applying_preset = False
+        self._settings_project_dir = project_dir
         
         self.init_ui()
         self.update_ui_from_settings()
         self._fit_dialog_to_screen()
         self.Center()
+        self._bind_keyboard_shortcuts()
 
         self._export_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._poll_export_progress, self._export_timer)
@@ -151,7 +530,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """Handle title-bar close while an export may still be running."""
         if self._export_running:
             if wx.MessageBox(
-                "Export is still running. Cancel export and close KiForge Studio?",
+                "Export is still running. Cancel export and close?",
                 "KiForge",
                 wx.YES_NO | wx.ICON_WARNING,
                 parent=self,
@@ -166,202 +545,468 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         event.Skip()
 
     def init_ui(self):
-        """Builds and lays out the wxPython user interface components, panels, and controls."""
+        self.SetBackgroundColour(_COLORS["app_bg"])
         main_sizer = wx.BoxSizer(wx.VERTICAL)
-        
-        # 1. Header Banner
-        banner_panel = wx.Panel(self)
-        banner_panel.SetBackgroundColour(wx.Colour(30, 41, 59))  # Dark slate blue (#1e293b)
-        banner_sizer = wx.BoxSizer(wx.VERTICAL)
-        
-        lbl_title = wx.StaticText(banner_panel, label="KiForge Studio")
-        lbl_title.SetForegroundColour(wx.Colour(255, 255, 255))
-        title_font = wx.Font(15, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
-        lbl_title.SetFont(title_font)
-        
-        lbl_subtitle = wx.StaticText(banner_panel, label="Automated manufacturing & documentation exports")
-        lbl_subtitle.SetForegroundColour(wx.Colour(203, 213, 225)) # Light slate (#cbd5e1)
-        subtitle_font = wx.Font(9, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
-        lbl_subtitle.SetFont(subtitle_font)
-        
-        banner_sizer.Add(lbl_title, 0, wx.ALL | wx.ALIGN_LEFT, 10)
-        banner_sizer.Add(lbl_subtitle, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.ALIGN_LEFT, 10)
-        banner_panel.SetSizer(banner_sizer)
-        main_sizer.Add(banner_panel, 0, wx.EXPAND)
+        main_sizer.Add(self._build_header_panel(), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, _PAD)
+        main_sizer.Add(self._separator(self), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, _PAD)
 
-        scroll = wx.ScrolledWindow(self, style=wx.VSCROLL)
-        scroll.SetScrollRate(0, 12)
-        content_sizer = wx.BoxSizer(wx.VERTICAL)
-        
-        # 2. Project Directory Selector
-        dir_box = wx.StaticBox(scroll, label="KiCad Project Directory")
-        dir_sizer = wx.StaticBoxSizer(dir_box, wx.HORIZONTAL)
-        self.txt_project_dir = wx.TextCtrl(dir_box, style=wx.TE_LEFT)
-        if self.project_dir:
-            self.txt_project_dir.SetValue(self.project_dir)
-        btn_browse = wx.Button(dir_box, label="Browse...")
-        btn_browse.Bind(wx.EVT_BUTTON, self.on_browse)
-        
-        dir_sizer.Add(self.txt_project_dir, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        dir_sizer.Add(btn_browse, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        content_sizer.Add(dir_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
-        
-        # 3. Checkboxes Columns
-        chk_container_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        
-        # Column 1: Manufacturing
-        mfg_box = wx.StaticBox(scroll, label="Manufacturing Outputs")
-        mfg_sizer = wx.StaticBoxSizer(mfg_box, wx.VERTICAL)
-        self.chk_gerbers = wx.CheckBox(mfg_box, label="Gerber Layers (.gbr)")
-        self.chk_drills = wx.CheckBox(mfg_box, label="Drill Files (.drl)")
-        self.chk_pos = wx.CheckBox(mfg_box, label="Component Placement (CPL)")
-        self.chk_bom = wx.CheckBox(mfg_box, label="Bill of Materials (BOM)")
-        self.chk_ibom = wx.CheckBox(mfg_box, label="Interactive HTML BOM (iBOM)")
-        self.chk_gerbers.Bind(wx.EVT_CHECKBOX, self.on_gerbers_toggled)
-        
-        mfg_sizer.Add(self.chk_gerbers, 0, wx.ALL, 6)
-        mfg_sizer.Add(self.chk_drills, 0, wx.ALL, 6)
-        mfg_sizer.Add(self.chk_pos, 0, wx.ALL, 6)
-        mfg_sizer.Add(self.chk_bom, 0, wx.ALL, 6)
-        mfg_sizer.Add(self.chk_ibom, 0, wx.ALL, 6)
-        
-        # Column 2: Documentation & Models
-        doc_box = wx.StaticBox(scroll, label="Documentation & Models")
-        doc_sizer = wx.StaticBoxSizer(doc_box, wx.VERTICAL)
-        self.chk_sch_pdf = wx.CheckBox(doc_box, label="Schematic PDF")
-        self.chk_step = wx.CheckBox(doc_box, label="STEP 3D Model (.step)")
-        self.chk_3d = wx.CheckBox(doc_box, label="3D View Renders (PNG)")
-        self.chk_svg = wx.CheckBox(doc_box, label="Copper Layer SVGs")
-        
-        doc_sizer.Add(self.chk_sch_pdf, 0, wx.ALL, 6)
-        doc_sizer.Add(self.chk_step, 0, wx.ALL, 6)
-        doc_sizer.Add(self.chk_3d, 0, wx.ALL, 6)
-        doc_sizer.Add(self.chk_svg, 0, wx.ALL, 6)
-        
-        chk_container_sizer.Add(mfg_sizer, 1, wx.EXPAND | wx.RIGHT, 5)
-        chk_container_sizer.Add(doc_sizer, 1, wx.EXPAND | wx.LEFT, 5)
-        content_sizer.Add(chk_container_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
-        
-        # 4. Output Folder
-        output_box = wx.StaticBox(scroll, label="Output Configuration")
-        output_sizer = wx.StaticBoxSizer(output_box, wx.HORIZONTAL)
-        lbl_out = wx.StaticText(output_box, label="Output Directory Name:")
-        self.txt_output_dir = wx.TextCtrl(output_box)
-        self.txt_output_dir.SetValue(self.settings.get('output_dir', 'kiforge'))
-        
-        output_sizer.Add(lbl_out, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        output_sizer.Add(self.txt_output_dir, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        content_sizer.Add(output_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
-
-        options_box = wx.StaticBox(scroll, label="Export Options")
-        options_sizer = wx.StaticBoxSizer(options_box, wx.VERTICAL)
-        self.chk_format_jlc = wx.CheckBox(options_box, label="Apply JLCPCB BOM/CPL formatting & rotation offsets")
-        self.chk_generate_cd = wx.CheckBox(options_box, label="Generate/update CD workflow files on export")
-        options_sizer.Add(self.chk_format_jlc, 0, wx.ALL, 6)
-        options_sizer.Add(self.chk_generate_cd, 0, wx.ALL, 6)
-        content_sizer.Add(options_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
-
-        ibom_box = wx.StaticBox(scroll, label="Interactive HTML BOM Defaults")
-        ibom_sizer = wx.StaticBoxSizer(ibom_box, wx.VERTICAL)
-        self.ibom_checks = {}
-        ibom_labels = {
-            "include_tracks": "Include copper tracks",
-            "include_netlist": "Include netlist",
-            "dark_mode": "Dark mode",
-            "checkboxes": "Show checkboxes column",
-            "show_fabrication": "Show fabrication layer",
-            "hide_pads": "Hide pads",
-            "highlight_pin1": "Highlight pin 1",
-        }
-        ibom_row = wx.BoxSizer(wx.HORIZONTAL)
-        ibom_left = wx.BoxSizer(wx.VERTICAL)
-        ibom_right = wx.BoxSizer(wx.VERTICAL)
-        for idx, (key, label) in enumerate(ibom_labels.items()):
-            chk = wx.CheckBox(ibom_box, label=label)
-            self.ibom_checks[key] = chk
-            (ibom_left if idx % 2 == 0 else ibom_right).Add(chk, 0, wx.ALL, 4)
-        ibom_row.Add(ibom_left, 1, wx.EXPAND)
-        ibom_row.Add(ibom_right, 1, wx.EXPAND)
-        ibom_sizer.Add(ibom_row, 0, wx.EXPAND)
-        content_sizer.Add(ibom_sizer, 0, wx.EXPAND | wx.BOTTOM, 10)
-        
-        # 5. CD Section
-        cd_box = wx.StaticBox(scroll, label="CD Release Integration")
-        cd_sizer = wx.StaticBoxSizer(cd_box, wx.VERTICAL)
-        
-        lbl_cd_desc = wx.StaticText(cd_box, label="Generate GitHub & Gitea Actions release CD workflows matching selections.")
-        lbl_cd_desc.SetForegroundColour(wx.Colour(100, 116, 139)) # Slate gray (#64748b)
-        btn_generate_cd = wx.Button(cd_box, label="Generate CD Files Only (.github/.gitea/.gitignore)")
-        btn_generate_cd.Bind(wx.EVT_BUTTON, self.on_generate_cd)
-        
-        cd_sizer.Add(lbl_cd_desc, 0, wx.ALL, 5)
-        cd_sizer.Add(btn_generate_cd, 0, wx.ALL | wx.EXPAND, 5)
-        self.lbl_cd_sync_status = wx.StaticText(cd_box, label="")
-        self.lbl_cd_sync_status.SetForegroundColour(wx.Colour(100, 116, 139))
-        cd_sizer.Add(self.lbl_cd_sync_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
-        content_sizer.Add(cd_sizer, 0, wx.EXPAND)
-
-        scroll.SetSizer(content_sizer)
-        scroll.Layout()
-        scroll.FitInside()
-        main_sizer.Add(scroll, 1, wx.EXPAND | wx.ALL, 10)
-
-        footer_panel = wx.Panel(self)
-        footer_sizer = wx.BoxSizer(wx.HORIZONTAL)
-
-        btn_save_project = wx.Button(footer_panel, label="Save Project Defaults")
-        btn_save_project.Bind(wx.EVT_BUTTON, self.on_save_project_defaults)
-        btn_save_global = wx.Button(footer_panel, label="Save Global Defaults")
-        btn_save_global.Bind(wx.EVT_BUTTON, self.on_save_global_defaults)
-        btn_reset = wx.Button(footer_panel, label="Reset Defaults")
-        btn_reset.Bind(wx.EVT_BUTTON, self.on_reset_defaults)
-
-        btn_export = wx.Button(footer_panel, label="Run Export Now")
-        btn_export.SetDefault()
-        btn_export.Bind(wx.EVT_BUTTON, self.on_run_export)
-        self.btn_export = btn_export
-
-        btn_close = wx.Button(footer_panel, wx.ID_CANCEL, label="Close")
-        btn_close.Bind(wx.EVT_BUTTON, self.on_close)
-
-        footer_sizer.Add(btn_save_project, 0, wx.RIGHT, 5)
-        footer_sizer.Add(btn_save_global, 0, wx.RIGHT, 5)
-        footer_sizer.Add(btn_reset, 0, wx.RIGHT, 15)
-        footer_sizer.AddStretchSpacer()
-        footer_sizer.Add(btn_export, 0, wx.RIGHT, 10)
-        footer_sizer.Add(btn_close, 0)
-        footer_panel.SetSizer(footer_sizer)
-        main_sizer.Add(footer_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.notebook = wx.Notebook(self, style=wx.BK_DEFAULT)
+        self.notebook.SetBackgroundColour(_COLORS["app_bg"])
+        try:
+            self.notebook.SetForegroundColour(_COLORS["text"])
+        except Exception:
+            pass
+        self._build_export_tab()
+        self._build_advanced_tab()
+        self._build_releases_tab()
+        self._apply_notebook_icons()
+        main_sizer.Add(self.notebook, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, _PAD)
+        main_sizer.Add(self._separator(self), 0, wx.EXPAND)
+        main_sizer.Add(self._build_footer_panel(), 0, wx.EXPAND)
 
         self.SetSizer(main_sizer)
-        self.SetMinSize((560, 420))
-        self._scroll_panel = scroll
+        self.SetMinSize((_DIALOG_MIN_WIDTH, _DIALOG_MIN_HEIGHT))
 
+        self.Bind(wx.EVT_SIZE, self._on_dialog_resize)
         self._cd_sync_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_cd_sync_timer, self._cd_sync_timer)
         self._bind_live_cd_sync_handlers()
+        self._prefetch_tab_icons_async()
+
+    def _prefetch_tab_icons_async(self):
+        """Warm the icon cache from CDN without blocking dialog construction."""
+        def worker():
+            for name in _TAB_ICON_NAMES:
+                if _read_cached_icon_svg(name):
+                    continue
+                _download_icon_svg(name)
+            wx.CallAfter(self._apply_notebook_icons)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_notebook_icons(self):
+        """Attach Material Symbols icons to notebook tabs (CDN + local SVG cache)."""
+        display_size = 20
+        for name in _TAB_ICON_NAMES:
+            _tab_icon_bitmap_cache.pop((name, display_size), None)
+        bitmaps = [_load_tab_icon_bitmap(name, display_size) for name in _TAB_ICON_NAMES]
+        if not all(bmp and bmp.IsOk() for bmp in bitmaps):
+            return
+        image_list = wx.ImageList(display_size, display_size)
+        for bmp in bitmaps:
+            image_list.Add(bmp)
+        self.notebook.AssignImageList(image_list)
+        for index in range(self.notebook.GetPageCount()):
+            self.notebook.SetPageImage(index, index)
+
+    def _bind_keyboard_shortcuts(self):
+        def on_char_hook(event):
+            if event.GetModifiers() == wx.MOD_CONTROL:
+                key = event.GetKeyCode()
+                tab_keys = {ord("1"): 0, ord("2"): 1, ord("3"): 2}
+                if key in tab_keys:
+                    self.notebook.SetSelection(tab_keys[key])
+                    return
+            elif event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+                focused = self.FindFocus()
+                if focused and isinstance(focused, wx.TextCtrl):
+                    event.Skip()
+                    return
+                if not self._export_running:
+                    self.on_run_export(event)
+                    return
+            event.Skip()
+        self.Bind(wx.EVT_CHAR_HOOK, on_char_hook)
+
+    def _separator(self, parent) -> wx.Panel:
+        line = wx.Panel(parent, size=(-1, 1))
+        line.SetBackgroundColour(_COLORS["border"])
+        line.SetMinSize((-1, 1))
+        return line
+
+    def _style_panel(self, panel: wx.Panel, *, surface: bool = True) -> None:
+        panel.SetBackgroundColour(_COLORS["surface"] if surface else _COLORS["app_bg"])
+
+    def _style_text(self, label: wx.StaticText, *, muted: bool = False) -> wx.StaticText:
+        label.SetForegroundColour(_COLORS["muted"] if muted else _COLORS["text"])
+        return label
+
+    def _style_input(self, ctrl: wx.TextCtrl) -> wx.TextCtrl:
+        ctrl.SetBackgroundColour(_COLORS["input_bg"])
+        ctrl.SetForegroundColour(_COLORS["input_fg"])
+        try:
+            ctrl.SetInsertionPointEnd()
+        except Exception:
+            pass
+        return ctrl
+
+    def _style_choice(self, ctrl: wx.CheckBox | wx.RadioButton) -> None:
+        ctrl.SetBackgroundColour(_COLORS["app_bg"])
+        ctrl.SetForegroundColour(_COLORS["text"])
+
+    def _section_label(self, parent, text: str) -> wx.StaticText:
+        lbl = wx.StaticText(parent, label=text)
+        lbl.SetForegroundColour(_COLORS["muted"])
+        font = lbl.GetFont()
+        font.SetWeight(wx.FONTWEIGHT_NORMAL)
+        lbl.SetFont(font)
+        return lbl
+
+    def _muted_label(self, parent, text: str, wrap: int | None = None) -> wx.StaticText:
+        lbl = wx.StaticText(parent, label=text)
+        self._style_text(lbl, muted=True)
+        if wrap:
+            lbl.Wrap(wrap)
+        return lbl
+
+    def _build_header_panel(self):
+        banner = wx.Panel(self)
+        self._style_panel(banner, surface=False)
+        sizer = wx.BoxSizer(wx.HORIZONTAL)
+        accent = wx.Panel(banner, size=(3, 24))
+        accent.SetBackgroundColour(_COLORS["accent"])
+        accent.SetMinSize((3, 24))
+        title = wx.StaticText(banner, label="KiForge")
+        title.SetForegroundColour(_COLORS["text"])
+        font = title.GetFont()
+        font.SetPointSize(13)
+        font.SetWeight(wx.FONTWEIGHT_BOLD)
+        title.SetFont(font)
+        sizer.Add(accent, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+        sizer.Add(title, 0, wx.ALIGN_CENTER_VERTICAL)
+        banner.SetSizer(sizer)
+        return banner
+
+    def _build_export_tab(self):
+        page = wx.Panel(self.notebook)
+        self._style_panel(page, surface=False)
+        scroll = wx.ScrolledWindow(page, style=wx.VSCROLL)
+        scroll.SetScrollRate(0, 10)
+        self._style_panel(scroll, surface=False)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        inset = wx.LEFT | wx.RIGHT
+
+        sizer.Add(self._section_label(scroll, "Project"), 0, inset | wx.TOP, _PAD_SM)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.txt_project_dir = wx.TextCtrl(scroll)
+        self._style_input(self.txt_project_dir)
+        if self.project_dir:
+            self.txt_project_dir.SetValue(self.project_dir)
+        self.txt_project_dir.Bind(wx.EVT_KILL_FOCUS, self.on_project_dir_changed)
+        btn_browse = _FlatButton(scroll, "Browse", min_width=72)
+        btn_browse.Bind(wx.EVT_BUTTON, self.on_browse)
+        row.Add(self.txt_project_dir, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, _PAD_SM)
+        row.Add(btn_browse, 0, wx.ALIGN_CENTER_VERTICAL)
+        sizer.Add(row, 0, wx.EXPAND | inset, _PAD_SM)
+        sizer.AddSpacer(_PAD_SM)
+
+        sizer.Add(self._section_label(scroll, "Output folder"), 0, inset, 0)
+        self.txt_output_dir = wx.TextCtrl(scroll)
+        self._style_input(self.txt_output_dir)
+        self.txt_output_dir.SetValue(self.settings.get("output_dir", "kiforge"))
+        sizer.Add(self.txt_output_dir, 0, wx.EXPAND | inset | wx.TOP, 6)
+        sizer.AddSpacer(_PAD)
+
+        sizer.Add(self._section_label(scroll, "Preset"), 0, inset, 0)
+        self._preset_radios = []
+        for idx, label in enumerate(EXPORT_PRESET_RADIO_LABELS):
+            style = wx.RB_GROUP if idx == 0 else 0
+            rb = wx.RadioButton(scroll, label=label, style=style)
+            self._style_choice(rb)
+            rb.Bind(wx.EVT_RADIOBUTTON, self.on_preset_changed)
+            self._preset_radios.append(rb)
+            sizer.Add(rb, 0, inset | wx.TOP, 4)
+
+        self.lbl_export_summary = wx.StaticText(scroll, label="")
+        self._style_text(self.lbl_export_summary, muted=True)
+        sizer.Add(self.lbl_export_summary, 0, inset | wx.TOP, _PAD_SM)
+
+        scroll.SetSizer(sizer)
+        scroll.FitInside()
+        page.SetSizer(wx.BoxSizer(wx.VERTICAL))
+        page.GetSizer().Add(scroll, 1, wx.EXPAND)
+        self.notebook.AddPage(page, "Export")
+
+    def _build_advanced_tab(self):
+        page = wx.Panel(self.notebook)
+        self._style_panel(page, surface=False)
+        scroll = wx.ScrolledWindow(page, style=wx.VSCROLL)
+        scroll.SetScrollRate(0, 10)
+        self._style_panel(scroll, surface=False)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        inset = wx.LEFT | wx.RIGHT
+
+        sizer.Add(self._section_label(scroll, "Outputs"), 0, inset | wx.TOP, _PAD_SM)
+        columns = wx.BoxSizer(wx.HORIZONTAL)
+
+        mfg_col = wx.BoxSizer(wx.VERTICAL)
+        mfg_col.Add(self._muted_label(scroll, "Manufacturing"), 0, wx.BOTTOM, 6)
+        self.chk_gerbers = wx.CheckBox(scroll, label="Gerbers")
+        self.chk_drills = wx.CheckBox(scroll, label="Drill files")
+        self.chk_pos = wx.CheckBox(scroll, label="Placement")
+        self.chk_bom = wx.CheckBox(scroll, label="BOM")
+        self.chk_ibom = wx.CheckBox(scroll, label="Interactive BOM")
+        self.chk_gerbers.Bind(wx.EVT_CHECKBOX, self.on_gerbers_toggled)
+        self.chk_ibom.Bind(wx.EVT_CHECKBOX, self.on_ibom_toggled)
+        for chk in (self.chk_drills, self.chk_pos, self.chk_bom):
+            chk.Bind(wx.EVT_CHECKBOX, self.on_export_checkbox_changed)
+        for chk in (self.chk_gerbers, self.chk_drills, self.chk_pos, self.chk_bom, self.chk_ibom):
+            self._style_choice(chk)
+            mfg_col.Add(chk, 0, wx.TOP, 4)
+
+        mfg_col.AddSpacer(8)
+        side_row = wx.BoxSizer(wx.HORIZONTAL)
+        side_row.Add(self._muted_label(scroll, "Placement side"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, _PAD_SM)
+        self.choice_pos_side = wx.Choice(scroll, choices=["Both", "Top", "Bottom"])
+        self.choice_pos_side.SetBackgroundColour(_COLORS["input_bg"])
+        self.choice_pos_side.SetForegroundColour(_COLORS["input_fg"])
+        side_row.Add(self.choice_pos_side, 1, wx.EXPAND)
+        mfg_col.Add(side_row, 0, wx.EXPAND | wx.TOP, 4)
+        self.chk_pos_smd_only = wx.CheckBox(scroll, label="SMD only")
+        self.chk_pos_exclude_dnp = wx.CheckBox(scroll, label="Exclude DNP")
+        for chk in (self.chk_pos_smd_only, self.chk_pos_exclude_dnp):
+            self._style_choice(chk)
+            mfg_col.Add(chk, 0, wx.TOP, 4)
+            chk.Bind(wx.EVT_CHECKBOX, self.on_export_setting_changed)
+        self.choice_pos_side.Bind(wx.EVT_CHOICE, self.on_export_setting_changed)
+
+        doc_col = wx.BoxSizer(wx.VERTICAL)
+        doc_col.Add(self._muted_label(scroll, "Documentation"), 0, wx.BOTTOM, 6)
+        self.chk_sch_pdf = wx.CheckBox(scroll, label="Schematic PDF")
+        self.chk_step = wx.CheckBox(scroll, label="STEP")
+        self.chk_3d = wx.CheckBox(scroll, label="3D renders")
+        self.chk_svg = wx.CheckBox(scroll, label="Copper SVG")
+        for chk in (self.chk_sch_pdf, self.chk_step, self.chk_3d, self.chk_svg):
+            self._style_choice(chk)
+            doc_col.Add(chk, 0, wx.TOP, 4)
+            chk.Bind(wx.EVT_CHECKBOX, self.on_export_checkbox_changed)
+
+        columns.Add(mfg_col, 1, wx.EXPAND | wx.RIGHT, 12)
+        columns.Add(doc_col, 1, wx.EXPAND)
+        sizer.Add(columns, 0, wx.EXPAND | inset | wx.TOP, 6)
+        sizer.AddSpacer(_PAD)
+
+        sizer.Add(self._section_label(scroll, "iBOM"), 0, inset, 0)
+        self.ibom_checks = {}
+        grid = wx.FlexGridSizer(cols=2, hgap=20, vgap=4)
+        for key, label in IBOM_OPTION_LABELS.items():
+            chk = wx.CheckBox(scroll, label=label)
+            self._style_choice(chk)
+            self.ibom_checks[key] = chk
+            grid.Add(chk, 0, wx.TOP, 4)
+        sizer.Add(grid, 0, inset | wx.TOP, 6)
+
+        scroll.SetSizer(sizer)
+        scroll.FitInside()
+        page.SetSizer(wx.BoxSizer(wx.VERTICAL))
+        page.GetSizer().Add(scroll, 1, wx.EXPAND)
+        self.notebook.AddPage(page, "Advanced")
+
+    def _build_releases_tab(self):
+        page = wx.Panel(self.notebook)
+        self._style_panel(page, surface=False)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        inset = wx.LEFT | wx.RIGHT | wx.TOP
+
+        sizer.Add(self._section_label(page, "Releases"), 0, inset, _PAD_SM)
+        btn_generate_cd = _FlatButton(page, "Set up workflows", primary=True, min_width=160)
+        btn_generate_cd.Bind(wx.EVT_BUTTON, self.on_generate_cd)
+        sizer.Add(btn_generate_cd, 0, inset | wx.TOP, 6)
+
+        self.chk_generate_cd = wx.CheckBox(page, label="Sync with export settings")
+        self._style_choice(self.chk_generate_cd)
+        sizer.Add(self.chk_generate_cd, 0, inset | wx.TOP, _PAD_SM)
+
+        self.lbl_cd_sync_status = wx.StaticText(page, label="")
+        self._style_text(self.lbl_cd_sync_status, muted=True)
+        sizer.Add(self.lbl_cd_sync_status, 0, inset | wx.TOP, 6)
+
+        page.SetSizer(sizer)
+        self.notebook.AddPage(page, "Releases")
+
+    def _build_footer_panel(self):
+        footer = wx.Panel(self)
+        footer.SetBackgroundColour(_COLORS["footer_bg"])
+        sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+        btn_save = _FlatButton(footer, "Save", min_width=64)
+        btn_save.Bind(wx.EVT_BUTTON, self.on_settings_menu)
+
+        self.btn_export = _FlatButton(footer, "Export", primary=True, min_width=72)
+        self.btn_export.Bind(wx.EVT_BUTTON, self.on_run_export)
+
+        btn_close = _FlatButton(footer, "Close", min_width=64)
+        btn_close.Bind(wx.EVT_BUTTON, self.on_close)
+
+        sizer.Add(btn_save, 0, wx.ALL, _PAD_SM)
+        sizer.AddStretchSpacer()
+        sizer.Add(self.btn_export, 0, wx.ALL, _PAD_SM)
+        sizer.Add(btn_close, 0, wx.ALL, _PAD_SM)
+        footer.SetSizer(sizer)
+        return footer
+
+    def _refresh_scroll_layout(self):
+        self.Layout()
+
+    def on_settings_menu(self, event):
+        menu = wx.Menu()
+        item_save_project = menu.Append(wx.ID_ANY, "Save for this project")
+        item_save_global = menu.Append(wx.ID_ANY, "Save as global default")
+        menu.AppendSeparator()
+        item_reset = menu.Append(wx.ID_ANY, "Reset")
+        self.Bind(wx.EVT_MENU, self.on_save_project_defaults, item_save_project)
+        self.Bind(wx.EVT_MENU, self.on_save_global_defaults, item_save_global)
+        self.Bind(wx.EVT_MENU, self.on_reset_defaults, item_reset)
+        btn = event.GetEventObject()
+        btn.PopupMenu(menu)
+        menu.Destroy()
+
+    def _selected_preset_index(self) -> int:
+        for idx, rb in enumerate(self._preset_radios):
+            if rb.GetValue():
+                return idx
+        return -1
+
+    def on_preset_changed(self, event):
+        """Apply a quick export preset."""
+        if event is not None and hasattr(event, "Skip"):
+            event.Skip()
+        index = self._selected_preset_index()
+        if index < 0:
+            return
+        preset_id = EXPORT_PRESET_CHOICES[index][0]
+        if preset_id == "custom":
+            self.notebook.SetSelection(1)
+            self._refresh_scroll_layout()
+            return
+        self._apply_export_preset(preset_id)
+
+    def on_export_checkbox_changed(self, event):
+        """Manual output toggles switch the preset to Custom."""
+        if event is not None and hasattr(event, "Skip"):
+            event.Skip()
+        if not self._applying_preset:
+            self._set_preset_choice("custom")
+        self._update_export_summary()
+        self.on_export_setting_changed(event)
+
+    def on_ibom_toggled(self, event):
+        if event is not None and hasattr(event, "Skip"):
+            event.Skip()
+        self._sync_ibom_ui_state()
+        self.on_export_checkbox_changed(event)
+
+    def _apply_export_preset(self, preset_id: str):
+        preset = EXPORT_PRESETS.get(preset_id)
+        if not preset:
+            return
+        checkbox_map = {
+            "export_gerbers": self.chk_gerbers,
+            "export_drills": self.chk_drills,
+            "export_pos": self.chk_pos,
+            "export_bom": self.chk_bom,
+            "export_ibom": self.chk_ibom,
+            "export_sch_pdf": self.chk_sch_pdf,
+            "export_step": self.chk_step,
+            "export_3d": self.chk_3d,
+            "export_svg": self.chk_svg,
+        }
+        self._applying_preset = True
+        try:
+            for key, value in preset.items():
+                if key == "format_jlc":
+                    self.settings["format_jlc"] = value
+                    self.settings.setdefault("exports", {})["format_jlc"] = value
+                elif key in checkbox_map:
+                    checkbox_map[key].SetValue(value)
+            self._set_preset_choice(preset_id)
+            self._sync_drill_checkbox_state()
+            self._sync_ibom_ui_state()
+            self._update_export_summary()
+            self._schedule_cd_sync()
+        finally:
+            self._applying_preset = False
+
+    def _set_preset_choice(self, preset_id: str):
+        labels = [pid for pid, _ in EXPORT_PRESET_CHOICES]
+        if preset_id in labels:
+            idx = labels.index(preset_id)
+            if 0 <= idx < len(self._preset_radios):
+                self._preset_radios[idx].SetValue(True)
+
+    def _detect_active_preset(self) -> str:
+        current = {key: getattr(self, self._export_checkbox_attr(key)).IsChecked() for key in _EXPORT_TOGGLE_KEYS}
+        current["format_jlc"] = self._export_setting("format_jlc")
+        for preset_id, values in EXPORT_PRESETS.items():
+            if all(current.get(key) == value for key, value in values.items()):
+                return preset_id
+        return "custom"
+
+    @staticmethod
+    def _export_checkbox_attr(export_key: str) -> str:
+        mapping = {
+            "export_gerbers": "chk_gerbers",
+            "export_drills": "chk_drills",
+            "export_pos": "chk_pos",
+            "export_bom": "chk_bom",
+            "export_ibom": "chk_ibom",
+            "export_sch_pdf": "chk_sch_pdf",
+            "export_step": "chk_step",
+            "export_3d": "chk_3d",
+            "export_svg": "chk_svg",
+        }
+        return mapping[export_key]
+
+    def _update_export_summary(self):
+        enabled = []
+        labels = {
+            "export_gerbers": "Gerbers",
+            "export_drills": "Drills",
+            "export_pos": "CPL",
+            "export_bom": "BOM",
+            "export_ibom": "iBOM",
+            "export_sch_pdf": "Schematic PDF",
+            "export_step": "STEP",
+            "export_3d": "3D renders",
+            "export_svg": "SVG",
+        }
+        for key in _EXPORT_TOGGLE_KEYS:
+            if getattr(self, self._export_checkbox_attr(key)).IsChecked():
+                enabled.append(labels[key])
+        if not enabled:
+            summary = "No outputs"
+        else:
+            summary = ", ".join(enabled)
+        if self._export_setting("format_jlc"):
+            summary += " · JLC"
+        self.lbl_export_summary.SetLabel(summary)
+
+    def _sync_ibom_ui_state(self):
+        enabled = self.chk_ibom.IsChecked()
+        for chk in self.ibom_checks.values():
+            chk.Enable(enabled)
+
+    def _on_dialog_resize(self, event):
+        if hasattr(self, "lbl_export_summary"):
+            width = max(_DIALOG_MIN_WIDTH, self.GetClientSize().width)
+            self.lbl_export_summary.Wrap(max(160, width - (_PAD * 2) - 8))
+        if event is not None:
+            event.Skip()
 
     def _fit_dialog_to_screen(self):
-        """Size the dialog to fit smaller displays while keeping the footer visible."""
         try:
             display_w, display_h = wx.DisplaySize()
         except Exception:
             display_w, display_h = 1024, 768
-        width = min(640, max(560, display_w - 80))
-        height = min(680, max(420, display_h - 120))
+        width = min(580, max(_DIALOG_MIN_WIDTH, display_w - 80))
+        height = min(520, max(_DIALOG_MIN_HEIGHT, display_h - 100))
         self.SetSize((width, height))
-        if hasattr(self, "_scroll_panel"):
-            self._scroll_panel.Layout()
-            self._scroll_panel.FitInside()
+        self._on_dialog_resize(None)
+        self.Layout()
 
     def _bind_live_cd_sync_handlers(self):
         """Regenerate CD YAML when export toggles change (debounced)."""
-        for ctrl in (
-            self.chk_gerbers, self.chk_drills, self.chk_pos, self.chk_bom, self.chk_ibom,
-            self.chk_sch_pdf, self.chk_step, self.chk_3d, self.chk_svg,
-            self.chk_format_jlc, self.chk_generate_cd,
-        ):
-            ctrl.Bind(wx.EVT_CHECKBOX, self.on_export_setting_changed)
+        self.chk_generate_cd.Bind(wx.EVT_CHECKBOX, self.on_export_setting_changed)
         self.txt_output_dir.Bind(wx.EVT_TEXT, self.on_export_setting_changed)
         for chk in self.ibom_checks.values():
             chk.Bind(wx.EVT_CHECKBOX, self.on_export_setting_changed)
@@ -369,6 +1014,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     def on_export_setting_changed(self, event):
         if event is not None and hasattr(event, "Skip"):
             event.Skip()
+        self.settings["export_params"] = self._collect_export_params()
         self._schedule_cd_sync()
 
     def _schedule_cd_sync(self):
@@ -379,6 +1025,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._sync_cd_workflows_silent()
 
     def _sync_cd_workflows_silent(self):
+        # Future: skip auto-regeneration once CD files exist (mid-project lifecycle).
+        if not self.chk_generate_cd.IsChecked():
+            return
         project_dir = self.txt_project_dir.GetValue().strip()
         output_dir_name = self.txt_output_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir) or not output_dir_name:
@@ -411,14 +1060,49 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_3d.SetValue(self._export_setting('export_3d'))
         self.chk_svg.SetValue(self._export_setting('export_svg'))
         self.txt_output_dir.SetValue(self.settings.get('output_dir', 'kiforge'))
-        self.chk_format_jlc.SetValue(self._export_setting('format_jlc'))
         self.chk_generate_cd.SetValue(
             self._export_setting('generate_cd', self.settings.get('generate_ci', True))
         )
         ibom_settings = self.settings.get('ibom', kiforge.DEFAULT_IBOM_SETTINGS)
         for key, chk in self.ibom_checks.items():
             chk.SetValue(ibom_settings.get(key, kiforge.DEFAULT_IBOM_SETTINGS.get(key, False)))
+        self._set_preset_choice(self._detect_active_preset())
         self._sync_drill_checkbox_state()
+        self._update_export_summary()
+        self._sync_ibom_ui_state()
+        self._apply_export_params_to_ui()
+
+    def _export_param(self, key, default=None):
+        """Read one placement/STEP value from nested export_params or flat settings."""
+        params = self.settings.get("export_params", {})
+        if isinstance(params, dict) and key in params:
+            return params[key]
+        if key in self.settings:
+            return self.settings[key]
+        return kiforge.DEFAULT_EXPORT_PARAMS.get(key, default)
+
+    def _collect_export_params(self) -> dict:
+        """Build export_params from Advanced tab controls for save/export/CD sync."""
+        side_map = ("both", "front", "back")
+        selection = self.choice_pos_side.GetSelection()
+        if selection < 0:
+            selection = 0
+        saved = self.settings.get("export_params")
+        if not isinstance(saved, dict):
+            saved = {}
+        params = kiforge.merge_export_params(saved, None)
+        params.update({
+            "pos_side": side_map[min(selection, 2)],
+            "pos_smd_only": self.chk_pos_smd_only.IsChecked(),
+            "pos_exclude_dnp": self.chk_pos_exclude_dnp.IsChecked(),
+        })
+        return params
+
+    def _apply_export_params_to_ui(self):
+        side_map = {"both": 0, "front": 1, "back": 2}
+        self.choice_pos_side.SetSelection(side_map.get(self._export_param("pos_side", "both"), 0))
+        self.chk_pos_smd_only.SetValue(bool(self._export_param("pos_smd_only", True)))
+        self.chk_pos_exclude_dnp.SetValue(bool(self._export_param("pos_exclude_dnp", True)))
 
     def _reload_settings(self, project_dir=None):
         """Reload merged settings into the dialog (global + project when dir is set)."""
@@ -437,13 +1121,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             'export_step': self.chk_step.IsChecked(),
             'export_3d': self.chk_3d.IsChecked(),
             'export_svg': self.chk_svg.IsChecked(),
-            'format_jlc': self.chk_format_jlc.IsChecked(),
+            'format_jlc': self._export_setting('format_jlc'),
             'generate_cd': self.chk_generate_cd.IsChecked(),
         }
         return {
             'output_dir': self.txt_output_dir.GetValue().strip(),
             **exports,
             'exports': exports,
+            'export_params': self._collect_export_params(),
             'ibom': {
                 key: chk.IsChecked() for key, chk in self.ibom_checks.items()
             },
@@ -459,7 +1144,24 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
 
     def on_gerbers_toggled(self, event):
         """Keep drill export aligned with Gerber export requirements."""
+        if event is not None and hasattr(event, "Skip"):
+            event.Skip()
         self._sync_drill_checkbox_state()
+        self.on_export_checkbox_changed(event)
+
+    def on_project_dir_changed(self, event):
+        """Reload project settings when the project folder field loses focus."""
+        if event is not None and hasattr(event, "Skip"):
+            event.Skip()
+        project_dir = self.txt_project_dir.GetValue().strip()
+        if (
+            project_dir
+            and os.path.isdir(project_dir)
+            and project_dir != self._settings_project_dir
+        ):
+            self.project_dir = project_dir
+            self._reload_settings(project_dir)
+            self._settings_project_dir = project_dir
 
     def on_browse(self, event):
         """Triggered by the 'Browse...' button to select a project root directory."""
@@ -478,31 +1180,26 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self.txt_project_dir.SetValue(chosen_dir)
             self.project_dir = chosen_dir
             self._reload_settings(chosen_dir)
+            self._settings_project_dir = chosen_dir
         dlg.Destroy()
-
-    def on_load_project_defaults(self, event):
-        """Reload settings from the project .kiforge.json into the dialog."""
-        project_dir = self.txt_project_dir.GetValue().strip()
-        if not project_dir or not os.path.isdir(project_dir):
-            wx.MessageBox("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
-            return
-        self._reload_settings(project_dir)
 
     def on_load_global_defaults(self, event):
         """Reload user-wide global settings into the dialog."""
         self._reload_settings(None)
+        self._settings_project_dir = self.txt_project_dir.GetValue().strip() or None
 
     def on_reset_defaults(self, event):
         """Reset dialog controls to built-in KiForge defaults."""
         self.settings = kiforge.DEFAULT_SETTINGS.copy()
         self.settings["exports"] = kiforge.DEFAULT_EXPORT_SETTINGS.copy()
         self.settings["ibom"] = kiforge.DEFAULT_IBOM_SETTINGS.copy()
+        self.settings["export_params"] = kiforge.DEFAULT_EXPORT_PARAMS.copy()
         self.update_ui_from_settings()
         wx.MessageBox("Dialog reset to built-in defaults.", "Reset", wx.OK | wx.ICON_INFORMATION)
 
     def _export_options(self):
         """Build export and CD option flags from the current dialog state."""
-        options = self._current_settings()
+        options = kiforge.apply_export_params_to_options(self._current_settings())
         if options['export_gerbers']:
             options['export_drills'] = True
         return options
@@ -581,11 +1278,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         }
 
         def progress_callback(step_index, total_steps, message):
+            if state.get("cancelled"):
+                return False
             if step_index is not None and total_steps is not None and total_steps > 0:
-                state['val'] = int((step_index / total_steps) * 100)
+                state["val"] = int((step_index / total_steps) * 100)
             if message:
-                state['msg'] = message
-            return not context.is_aborted()
+                state["msg"] = message
+            return not state.get("cancelled")
 
         context = kiforge.ExportContext(project_dir, output_dir_name, export_flags, progress_callback)
         if not context.resolve():
@@ -608,19 +1307,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_running = True
         self.btn_export.Disable()
 
-        # Parent to this dialog, not KiCad's top-level frame — safer on Windows.
-        progress_style = wx.PD_CAN_ABORT | wx.PD_SMOOTH
-        if sys.platform.startswith("linux"):
-            # GTK progress dialogs behave better without smooth animation.
-            progress_style = wx.PD_CAN_ABORT
-
-        self._export_progress = wx.ProgressDialog(
-            "KiForge",
-            "Initializing exporter...",
-            100,
-            parent=self,
-            style=progress_style,
-        )
+        self._export_progress = _ExportProgressDialog(self)
+        self._export_progress.Show()
 
         def export_worker():
             try:
@@ -639,8 +1327,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_join_deadline = time.time() + 600
         self._export_thread.start()
 
-        poll_ms = 100 if sys.platform == "win32" else 50
-        self._export_timer.Start(poll_ms)
+        self._export_timer.Start(75)
 
     def _stop_export_timer(self):
         if self._export_timer and self._export_timer.IsRunning():
@@ -653,39 +1340,40 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         _destroy_progress_dialog(progress)
 
     def _poll_export_progress(self, event):
-        """Timer handler: refresh wx.ProgressDialog without blocking KiCad's event loop."""
         state = self._export_state
         context = self._export_context
         progress = self._export_progress
         thread = self._export_thread
-        if not state or not context or not progress or not thread:
+        if not state or not context or not thread:
             self._destroy_export_progress()
             return
 
+        if progress and progress.was_cancelled() and not state["cancelled"]:
+            state["cancelled"] = True
+            context.cancel()
+            self._export_join_deadline = min(self._export_join_deadline, time.time() + 20)
+            self._destroy_export_progress()
+            progress = None
+
         _pump_ui_events()
 
-        if state['running']:
-            if state['val'] != self._export_poll_val or state['msg'] != self._export_poll_msg:
-                keep_going = _update_progress_dialog(progress, state['val'], state['msg'])
-                self._export_poll_val = state['val']
-                self._export_poll_msg = state['msg']
-                if not keep_going:
-                    state['cancelled'] = True
-                    logger.warning("Export cancelled by user via progress dialog.")
-                    context.cancel()
-                    self._export_join_deadline = min(self._export_join_deadline, time.time() + 30)
-                    _update_progress_dialog(progress, state['val'], "Cancelling export...")
+        if state["running"]:
+            if progress and (
+                state["val"] != self._export_poll_val or state["msg"] != self._export_poll_msg
+            ):
+                progress.update(state["val"], state["msg"])
+                self._export_poll_val = state["val"]
+                self._export_poll_msg = state["msg"]
             return
 
         if thread.is_alive():
-            if state['cancelled']:
+            if state["cancelled"]:
                 context.cancel()
             thread.join(timeout=0)
             if thread.is_alive():
                 if time.time() > self._export_join_deadline:
-                    logger.error("Export worker did not exit after cancellation request.")
-                    context.cancel()
-                    thread.join(timeout=0.1)
+                    logger.warning("Export worker still running after cancel timeout; releasing UI.")
+                    self._finish_export_progress()
                 return
 
         self._finish_export_progress()
@@ -772,7 +1460,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """Triggered when the close button is clicked."""
         if self._export_running:
             if wx.MessageBox(
-                "Export is still running. Cancel export and close KiForge Studio?",
+                "Export is still running. Cancel export and close?",
                 "KiForge",
                 wx.YES_NO | wx.ICON_WARNING,
                 parent=self,

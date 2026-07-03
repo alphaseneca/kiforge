@@ -63,12 +63,17 @@ You can also drop the `plugins/` folder manually:
 
 **Workflow:**
 1. Open your `.kicad_pcb` in KiCad 10.
-2. Go to **Tools › External Plugins › KiForge**.
-3. Confirm your project directory and toggle the exports you need.
-4. Click **Run Export Now** — a live progress dialog tracks each step.
-5. All files land in the configured output folder (default: `kiforge/` next to your `.kicad_pro`).
+2. Go to **Tools › External Plugins › KiForge Studio**.
+3. **Export** tab — project folder, output name, presets (Full / JLCPCB / Documentation / Custom).
+4. **Advanced** tab — individual output toggles, iBOM appearance, optional JLC copies (Fabrication Toolkit).
+5. **Releases** tab — generate or auto-sync tag-based CI workflow YAML.
+6. Click **Export** — a progress dialog tracks each step.
 
-Settings merge from built-in defaults → global (`~/.config/kiforge/settings.json` on Linux) → project `.kiforge.json`. Use **Save Project Defaults** or **Save Global Defaults** to persist your toggles.
+Studio uses a tabbed layout with Material Symbols icons (cached from Google CDN on first use). A first-run welcome banner explains the flow; dismiss it with **Got it** or reopen from **Settings › Show welcome guide**.
+
+**JLCPCB assembly:** KiForge auto-installs Fabrication Toolkit from GitHub when needed (like InteractiveHtmlBom). Raw KiCad `*_bom.csv` / `*_pos.csv` and JLC copies are produced on every BOM/placement export.
+
+Settings merge from built-in defaults → global (`~/.config/kiforge/settings.json` on Linux) → project `.kiforge.json`. Use **Settings** (footer) to load/save defaults or reset.
 
 **Support:** [Report an issue](https://github.com/alphaseneca/kiforge/issues) · [Usage guide](USAGE.md)
 
@@ -300,29 +305,26 @@ pip3 install --user InteractiveHtmlBom
 
 ## 🔩 JLCPCB-ready outputs
 
-### BOM (`*_bom_jlc.csv`)
-- JLCPCB column formatting is optional — disable with `format_jlc: false` in settings or `--no-format-jlc` on the CLI
-- DNP (Do Not Populate) components are automatically filtered out
-- LCSC part numbers are resolved from any of these custom fields: `LCSC`, `LCSC Part`, `LCSC Part #`, `JLCPCB Part`, `JLCPCB Part #`, `LCSC_Part`
-- Output columns: `Designator`, `Comment`, `Footprint`, `LCSC`, `Quantity`
+KiForge exports **both** unedited KiCad files and JLC-ready copies when BOM/placement are enabled.
 
-### CPL (`*_cpl_jlc.csv`)
-- Output columns: `Designator`, `Mid X`, `Mid Y`, `Layer`, `Rotation`
-- Component rotation offsets can be specified in a `.kiforge.json` file in your project root:
+| File | Description |
+| --- | --- |
+| `*_bom.csv` | Raw KiCad BOM (unchanged `kicad-cli` export) |
+| `*_pos.csv` | Raw KiCad placement CSV |
+| `*_bom_jlc.csv` | JLCPCB upload format (from Fabrication Toolkit when installed) |
+| `*_cpl_jlc.csv` | JLC centroid / pick-and-place (from Fabrication Toolkit when installed) |
 
-```json
-{
-  "rotation_offsets": {
-    "SOT-23":    180,
-    "QFN":       90,
-    "USB-C":     270
-  }
-}
-```
+### Recommended: JLCPCB Fabrication Toolkit
 
-Patterns are matched against both the footprint package name and component value (case-insensitive).
+KiForge **auto-installs** [JLCPCB Fabrication Toolkit](https://github.com/bennymeg/Fabrication-Toolkit) from GitHub on first export when it is missing — the same pattern as InteractiveHtmlBom. It then runs the plugin CLI and copies `production/bom.csv` and `production/positions.csv` into your output folder.
 
----
+Add **LCSC Part #** (or **JLCPCB Part #**) fields on schematic symbols, then **Update PCB from Schematic** before exporting.
+
+### Without Fabrication Toolkit
+
+If the auto-install fails (offline machine, blocked network), KiForge uses a built-in fallback formatter on the KiCad CSVs so exports still complete.
+
+Disable JLC copies only: `format_jlc: false` in settings or `--no-format-jlc` on the CLI.
 
 ## 📋 Log file
 

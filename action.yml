@@ -1,7 +1,13 @@
 # KiForge composite GitHub Action
 #
 # Runs the KiCad 10 exporter inside the official kicad/kicad Docker image.
-# See action/run.sh for the runner implementation and USAGE.md for workflow examples.
+# Inputs mirror kiforge.py configuration layers:
+#   - export_* toggles  → EXPORT_SETTING_KEYS (what to produce)
+#   - pos_*/step_*/render_* → EXPORT_PARAM_SPECS (kicad-cli parameters)
+#   - sync_title_block_rev → RUNTIME_OPTION_SPECS (per-run behavior)
+#
+# action/run.sh maps INPUT_* env vars to the same CLI flags as `python kiforge.py`.
+# See USAGE.md for workflow examples and the full input reference.
 name: 'KiForge'
 description: 'Export BOM, CPL, STEP, Gerbers, Drills, 3D renders, SVGs, and PDF from a KiCad 10 project using the official docker image'
 author: 'alphaseneca'
@@ -55,7 +61,23 @@ inputs:
     required: false
     default: 'true'
   format_jlc:
-    description: 'Apply JLCPCB BOM/CPL formatting and rotation offsets (true/false)'
+    description: 'Also produce JLC-ready BOM/CPL via Fabrication Toolkit (fallback formatter in CI) (true/false)'
+    required: false
+    default: 'true'
+  pos_side:
+    description: 'Placement export side: both, front (top), or back (bottom)'
+    required: false
+    default: 'both'
+  pos_smd_only:
+    description: 'Placement CSV includes SMD parts only (true/false)'
+    required: false
+    default: 'true'
+  pos_exclude_dnp:
+    description: 'Exclude DNP parts from placement CSV (true/false)'
+    required: false
+    default: 'true'
+  step_subst_models:
+    description: 'STEP export: substitute missing 3D models (true/false)'
     required: false
     default: 'true'
   sync_title_block_rev:
@@ -87,6 +109,10 @@ runs:
         INPUT_EXPORT_DRILLS: ${{ inputs.export_drills }}
         INPUT_EXPORT_IBOM: ${{ inputs.export_ibom }}
         INPUT_FORMAT_JLC: ${{ inputs.format_jlc }}
+        INPUT_POS_SIDE: ${{ inputs.pos_side }}
+        INPUT_POS_SMD_ONLY: ${{ inputs.pos_smd_only }}
+        INPUT_POS_EXCLUDE_DNP: ${{ inputs.pos_exclude_dnp }}
+        INPUT_STEP_SUBST_MODELS: ${{ inputs.step_subst_models }}
         INPUT_SYNC_TITLE_BLOCK_REV: ${{ inputs.sync_title_block_rev }}
         INPUT_VERSION: ${{ inputs.version }}
         GITHUB_REF_NAME: ${{ github.ref_name }}

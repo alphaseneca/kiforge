@@ -57,15 +57,22 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `output_dir` | Directory where output files are saved (relative to `project_path`) | `'kiforge'` |
 | `export_gerbers` | Export Gerber layer files (zipped) | `'true'` |
 | `export_drills` | Export drill files (included in Gerber ZIP) | `'true'` |
-| `export_bom` | Export JLCPCB-formatted Bill of Materials CSV | `'true'` |
-| `export_pos` | Export JLCPCB-formatted component placement CSV | `'true'` |
+| `export_bom` | Export Bill of Materials CSV (KiCad raw + optional JLC copy) | `'true'` |
+| `export_pos` | Export component placement CSV (KiCad raw + optional JLC copy) | `'true'` |
 | `export_sch_pdf` | Export schematic as a PDF | `'true'` |
 | `export_step` | Export STEP 3D model | `'true'` |
 | `export_3d` | Export front & back 3D PNG renders | `'true'` |
 | `export_svg` | Export front & back copper layer SVGs | `'true'` |
 | `export_ibom` | Export Interactive HTML BOM | `'true'` |
-| `format_jlc` | Apply JLCPCB BOM/CPL column formatting | `'true'` |
+| `format_jlc` | Also produce JLC-ready BOM/CPL via Fabrication Toolkit (fallback formatter in CI) | `'true'` |
+| `pos_side` | Placement CSV side: `both`, `front` (top), or `back` (bottom) | `'both'` |
+| `pos_smd_only` | Placement CSV: SMD parts only | `'true'` |
+| `pos_exclude_dnp` | Placement CSV: exclude DNP parts | `'true'` |
+| `step_subst_models` | STEP export: substitute missing 3D models | `'true'` |
+| `sync_title_block_rev` | Sync schematic title-block `(rev …)` to the export version | `'true'` |
 | `version` | Override version suffix for output filenames | _(auto from Git tag)_ |
+
+> **Export parameters:** The `pos_*` and `step_*` inputs map to configurable `kicad-cli` flags (`export_params` in `.kiforge.json`). BOM columns, iBOM grouping, and 3D render quality are fixed inside KiForge (`BOM_EXPORT_DEFAULTS`, `RENDER_3D_DEFAULTS`). Raw `*_bom.csv` uses the standard field layout; JLC copies still come from Fabrication Toolkit or the fallback formatter.
 
 > **Version tagging:** All output filenames are versioned automatically on every run — locally and in CD. On tag push, KiForge reads `GITHUB_REF_NAME` (e.g. `myboard_v1.0.0_gerbers.zip`, `myboard_v1.0.0_sch.pdf`). Locally, the version comes from `--version-tag`, the latest git tag (when enabled), or defaults to `v0.1.0`. During export only, schematic PDFs sync the title-block `(rev …)` to that version via a temporary staged copy (`--sync-title-block-rev`, on by default in CI and Studio Run Export).
 
@@ -80,8 +87,10 @@ KiForge writes all files into `output_dir/` on the GitHub Actions runner — not
 | File | Description | Controlled by |
 |---|---|---|
 | `<name>_gerbers.zip` | Gerber + Drill files archive | `export_gerbers` / `export_drills` |
-| `<name>_bom_jlc.csv` | JLCPCB Bill of Materials | `export_bom` |
-| `<name>_cpl_jlc.csv` | JLCPCB Component Placement List | `export_pos` |
+| `<name>_bom.csv` | KiCad Bill of Materials (raw) | `export_bom` |
+| `<name>_bom_jlc.csv` | JLCPCB Bill of Materials | `export_bom` + `format_jlc` |
+| `<name>_pos.csv` | KiCad placement CSV (raw) | `export_pos` |
+| `<name>_cpl_jlc.csv` | JLCPCB Component Placement List | `export_pos` + `format_jlc` |
 | `<name>_sch.pdf` | Schematic PDF | `export_sch_pdf` |
 | `<name>.step` | STEP 3D model | `export_step` |
 | `<name>_3d_front.png` | 3D front render | `export_3d` |
@@ -92,7 +101,31 @@ KiForge writes all files into `output_dir/` on the GitHub Actions runner — not
 
 ---
 
-## Selective Export Examples
+## JLCPCB Fabrication Toolkit
+
+KiForge **auto-installs** Fabrication Toolkit from the latest GitHub release when `format_jlc` is enabled and the plugin is not already present — same flow as InteractiveHtmlBom (`pip install` on first use).
+
+When available, KiForge runs its CLI and copies `bom.csv` / `positions.csv` from the project `production/` folder into `*_bom_jlc.csv` and `*_cpl_jlc.csv`.
+
+KiCad `*_bom.csv` and `*_pos.csv` are always unedited `kicad-cli` exports.
+
+If auto-install fails, a built-in fallback formatter still produces JLC-shaped CSVs.
+
+---
+
+## KiForge Studio (GUI plugin)
+
+The PCM plugin opens **KiForge Studio** — a tabbed dialog:
+
+| Tab | Purpose |
+| --- | --- |
+| **Export** | Project folder, output name, presets, live summary |
+| **Advanced** | Individual outputs and iBOM options |
+| **Releases** | CD workflow generation and auto-sync |
+
+Tab icons load from Google Material Symbols CDN once and cache under `%APPDATA%/kiforge/icon_cache/` (or platform equivalent).
+
+---
 
 ### JLCPCB Fabrication Only
 
@@ -216,6 +249,33 @@ GitHub Actions will:
 3. Run KiForge to generate all manufacturing files
 4. Create a GitHub Release with auto-generated release notes
 5. Upload all generated files as downloadable release assets
+
+---
+
+## CLI (`python kiforge.py`)
+
+The CLI exposes the same three configuration layers as the GitHub Action:
+
+| Layer | CLI flags | Persisted in `.kiforge.json` |
+| --- | --- | --- |
+| Export toggles | `--export-bom` / `--no-export-bom`, … | `exports` |
+| Export parameters | `--pos-side`, `--top`, `--bottom`, … | `export_params` |
+| Runtime | `--sync-title-block-rev` / `--no-sync-title-block-rev` | _(not saved)_ |
+
+Examples:
+
+```bash
+# JLC-oriented placement (top only, SMD, no DNP) and unoptimized STEP
+python kiforge.py --top --pos-smd-only --pos-exclude-dnp
+
+# Bottom-side placement only
+python kiforge.py --bottom
+
+# Generate CD workflow YAML from current CLI selections
+python kiforge.py --generate-cd --no-export-3d --pos-side back
+```
+
+When export-parameter flags are omitted, KiForge merges defaults with project/global settings from `.kiforge.json` (Studio **Save** writes those files).
 
 ---
 
