@@ -58,7 +58,7 @@ sequenceDiagram
 
     User->>Context: Instantiate(project_path, options)
     User->>Context: resolve()
-    Note over Context: 1. Resolves kicad-cli / python paths<br/>2. Locates .kicad_pcb & .kicad_sch<br/>3. Appends version to pcb_name<br/>4. Merges settings & rotation offsets
+    Note over Context: 1. Resolves kicad-cli / python paths<br/>2. Locates .kicad_pcb & .kicad_sch<br/>3. Merges settings & rotation offsets<br/>4. Appends version to pcb_name
     Context-->>User: Success (bool)
     
     User->>Runner: Instantiate(context)
@@ -70,14 +70,14 @@ sequenceDiagram
         Task-->>Runner: True/False
         alt Task is applicable
             Runner->>Task: run(context)
-            Note over Task: Spawns subprocess (kicad-cli)
+            Note over Task: Spawns subprocess (kicad-cli or iBOM)
             Task-->>Runner: True (Success)
         end
     end
     
     Note over Runner: Post-Processing Steps
-    Runner->>Formatter: format_bom() & format_cpl()
-    Note over Formatter: Standardizes output columns for JLCPCB
+    Runner->>Task: BomOutputTask / PosOutputTask
+    Note over Task: Rename raw CSVs; optional JLCPCBFormatter
     
     Runner-->>User: Pipeline Complete (bool)
 ```
@@ -85,20 +85,29 @@ sequenceDiagram
 ### Phase 1: Context Resolution
 The `ExportContext.resolve()` method performs all environment discovery:
 1. **Executable Resolution**: Finds `kicad-cli` and `kicad-python` (with `pcbnew` bound) standard paths across Windows, macOS, and Linux using `PathResolver`.
-2. **File Discovery**: Recursively searches the `project_path` to find `.kicad_pcb`, `.kicad_pro`, and `.kicad_sch` files.
-3. **Version Suffix**: Resolves version from CLI/options, `GITHUB_REF_NAME`, title-block `(rev ...)`, or `v0.1.0`, then appends it to `pcb_name`. All export tasks use this prefixed name (Gerber ZIP, BOM, CPL, STEP, schematic PDF, etc.) in both local and CD runs.
+2. **Subprocess Environment**: Builds `PYTHONPATH` and `PATH` via `_build_subprocess_env()`. iBOM-specific env flags are **not** applied here — only in `ensure_ibom_subprocess_env()` when launching InteractiveHtmlBom.
+3. **File Discovery**: Recursively searches the `project_path` to find `.kicad_pcb`, `.kicad_pro`, and `.kicad_sch` files.
 4. **Settings Merging**: Loads global settings (`~/.config/kiforge/settings.json` on Linux), project-local `.kiforge.json`, and merges them with run-time command flags (command line or GUI).
-5. **Environment Setup**: Configures environment variables (`PYTHONPATH` and `PATH`) to ensure third-party site-packages and KiCad binaries are accessible.
+5. **Version Suffix**: Resolved by `resolve_export_version()` — explicit option → `GITHUB_REF_NAME` → `VERSION` env → git tag → `v0.1.0`. Appended to `pcb_name` for all versioned outputs.
+6. **Rotation Offsets**: Loaded through `load_merged_settings()` from `.kiforge.json`; runtime options override project values.
+
+Schematic PDF export optionally writes `(rev …)` into a staged schematic copy so the source file is not modified (`sync_title_block_rev` runtime flag).
 
 ### Phase 2: Pipeline Initialization
 `ExportRunner` builds an ordered task pipeline consisting of two parts:
 1. **CLI Core Exporters**: Runs `kicad-cli` commands to generate raw Gerbers, drills, positions, BOMs, schematic PDFs, STEP models, 3D renders, SVGs, and Interactive HTML BOMs.
-2. **Post-Processors**: Packages raw Gerber and drill outputs into a clean `.zip` archive, filters out DNP components from the BOM, resolves LCSC part numbers, and aligns component placement orientations using custom offsets.
+2. **Post-Processors**:
+   - `GerberPackTask` — zip `temp_gerbers/` into `{name}_gerbers.zip`
+   - `BomOutputTask` — rename `raw_bom.csv` → `{name}_bom.csv`; optionally `{name}_bom_jlc.csv`
+   - `PosOutputTask` — rename `raw_pos.csv` → `{name}_pos.csv`; optionally `{name}_cpl_jlc.csv`
+
+Raw BOM and placement files are kept; JLC variants are additional outputs when `format_jlc` is enabled.
 
 ### Phase 3: Task Execution & Subprocess Tracking
 Each task executes its logic inside `run()`, typically invoking `_run_subprocess()`.
 * **Process Tracking**: The spawned `subprocess.Popen` object is atomically assigned to `context.active_process` under a thread lock (`context._lock`).
 * **Output Redirection**: Subprocess `stdout` and `stderr` are read and written to the structured logger (`kiforge.log`) at the `DEBUG` level for traceability.
+* **Resilience**: A failed step adds a warning and the pipeline continues unless every applicable step fails or the user cancels.
 
 ---
 
@@ -109,6 +118,8 @@ Running heavy CLI export processes directly on a GUI thread freezes the window m
 * **Background Worker Thread**: Invokes `kiforge.run_export(context)` and runs the pipeline.
 * **Progress GUI Thread**: Polls worker state and updates `wx.ProgressDialog` only when progress text or value changes (avoids Linux/Windows flicker from tight `wx.SafeYield()` loops).
 * **Thread-Safe Cancellation**: If the user clicks "Cancel" on the progress dialog, the GUI thread calls `context.cancel()`. The worker thread checks `context.is_aborted()` at each task boundary, locks `context._lock`, and terminates/kills the active `subprocess.Popen` instance immediately.
+
+Studio also debounces CD workflow regeneration when export checkboxes change (`_schedule_cd_sync` / `_sync_cd_workflows_silent`).
 
 ---
 
@@ -128,6 +139,7 @@ KiCad's internal scripting environment has unique constraints:
       from .kiforge_studio import ExporterPlugin
       ExporterPlugin().register()
   ```
+* **iBOM toolbar coexistence**: `INTERACTIVE_HTML_BOM_CLI_MODE` and `INTERACTIVE_HTML_BOM_NO_DISPLAY` must never be set at `kiforge.py` import time — only in `ensure_ibom_subprocess_env()` for the iBOM export subprocess. Setting them globally breaks the standalone InteractiveHtmlBom plugin toolbar in KiCad.
 
 ---
 
@@ -141,12 +153,11 @@ KiCad's internal scripting environment has unique constraints:
 ### CPL Rotation Offsets (`JLCPCBFormatter.format_cpl`)
 * Converts raw position layouts into `Designator`, `Mid X`, `Mid Y`, `Layer`, and `Rotation`.
 * Downstream manufacturers like JLCPCB use standard component feeders that require specific rotational alignment relative to KiCad's CAD layout orientation.
-* KiForge merges footprint package patterns and component designators with a dictionary of target rotational offset values (loaded dynamically from `.kiforge.json`) to adjust the output rotation cleanly before shipping:
+* KiForge applies footprint package patterns and component designators against `rotation_offsets` from merged settings (`.kiforge.json` or runtime options):
   ```python
-  # Applies the offset matching component packages
   rotation = (rotation + offset) % 360.0
   ```
-* **Optional formatting**: Set `format_jlc: false` in settings or pass `--no-format-jlc` on the CLI to skip JLCPCB BOM/CPL post-processing.
+* **Optional formatting**: Set `format_jlc: false` in settings or pass `--no-format-jlc` on the CLI to skip JLCPCB BOM/CPL post-processing while still keeping raw `{name}_bom.csv` and `{name}_pos.csv`.
 
 ---
 
@@ -159,6 +170,21 @@ KiForge settings merge in this order: built-in defaults → global file → proj
 | Global | `~/.config/kiforge/settings.json` (Linux), `%APPDATA%/kiforge/settings.json` (Windows) |
 | Project | `<project>/.kiforge.json` |
 
-CD workflow generation and `.gitignore` updates use `templates/kiforge.gitignore` beside the installed `kiforge.py`. Users can edit that template in-place after installation; KiForge merges missing patterns into each project's `.gitignore` on export (when `generate_cd` is enabled) or via **Generate CD Files Only**.
+Saved JSON structure:
+
+```json
+{
+  "output_dir": "kiforge",
+  "exports": { "export_gerbers": true, "format_jlc": true, "generate_cd": true, ... },
+  "ibom": { "include_tracks": false, "dark_mode": false, ... },
+  "rotation_offsets": { "0603": 90 }
+}
+```
+
+Legacy flat export keys and `generate_ci` are still read for backward compatibility.
+
+CD workflow generation and `.gitignore` updates read editable files from `templates/` (shipped beside the installed `kiforge.py` in the plugin zip). Edit `templates/kiforge.gitignore`, `templates/github-release.yml`, and `templates/gitea-release.yml` in the repo — never duplicate them under `plugins/templates/` in git.
 
 When Gerbers are enabled, drill export runs automatically so the Gerber ZIP always includes drill files. JLC formatting (`format_jlc`) and CD generation (`generate_cd`) default to on and can be disabled per run or in saved settings.
+
+Schematic title-block `(rev …)` sync is an export-runtime option (CLI / Studio Run Export / GitHub Action), not a saved setting. Studio auto-saves project config after a successful export.

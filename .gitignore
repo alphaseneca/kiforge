@@ -4,10 +4,14 @@
 *.kicad_sch-bak
 __pycache__/
 .history/
-kiforge/
+kiforge_out/
 dist/
+packages.json
+repository.json
+resources.zip
 tmp/
 .idea/
 .vscode/
 plugins/kiforge.py
+plugins/templates/
 .DS_Store

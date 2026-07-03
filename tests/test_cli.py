@@ -1,11 +1,33 @@
+"""
+Unit tests for kiforge.py — CLI parsing, settings merge, versioning, export tasks,
+JLC formatting, CD/gitignore generation, and git-tag resolution.
+
+Does not require KiCad to be installed; subprocess export tests skip or mock when
+kicad-cli is unavailable.
+"""
 import unittest
 import sys
 import os
+import subprocess
+import shutil
+import tempfile
 
 # Add root directory to sys.path to import kiforge
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import kiforge
+
+def _rmtree_force(path: str) -> None:
+    """Remove a directory tree, including read-only git objects on Windows."""
+    import stat
+
+    def _onerror(func, p, _exc_info):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+
+    if os.path.isdir(path):
+        shutil.rmtree(path, onerror=_onerror)
+
 
 class TestKiForgeCLI(unittest.TestCase):
     def test_default_arguments(self):
@@ -138,6 +160,31 @@ class TestKiForgeCLI(unittest.TestCase):
         context.cancel()
         self.assertTrue(context.is_aborted())
 
+    def test_subprocess_responds_to_cancel(self):
+        """Cancelling an in-flight subprocess must not block until the command finishes."""
+        import threading
+        import time
+
+        context = kiforge.ExportContext(".", "kiforge_out", {})
+        context.project_dir = "."
+        context.startupinfo = kiforge._subprocess_startupinfo()
+        task = kiforge.GerberExportTask()
+
+        def cancel_after_delay():
+            time.sleep(0.25)
+            context.cancel()
+
+        threading.Thread(target=cancel_after_delay, daemon=True).start()
+        started = time.time()
+        result = task._run_subprocess(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            context,
+        )
+        elapsed = time.time() - started
+        self.assertFalse(result)
+        self.assertTrue(context.is_aborted())
+        self.assertLess(elapsed, 8, "subprocess cancellation took too long")
+
     def test_rotation_offsets_merge(self):
         """Verify ExportContext merges and exposes rotation offsets correctly."""
         options = {
@@ -189,6 +236,7 @@ class TestKiForgeCLI(unittest.TestCase):
                 content = f.read()
                 self.assertIn("output_dir: 'kiforge_test_ci'", content)
                 self.assertIn("export_3d: 'false'", content)
+                self.assertIn(kiforge.KIFORGE_ACTION_REF, content)
 
             # Check Gitea workflow file
             gitea_workflow_path = os.path.join(temp_dir, ".gitea", "workflows", "release.yml")
@@ -197,23 +245,29 @@ class TestKiForgeCLI(unittest.TestCase):
                 gitea_content = f.read()
                 self.assertIn("output_dir: 'kiforge_test_ci'", gitea_content)
                 self.assertIn("export_3d: 'false'", gitea_content)
+                self.assertIn(
+                    f"https://github.com/{kiforge.KIFORGE_ACTION_REF}",
+                    gitea_content,
+                )
                 self.assertIn("softprops/action-gh-release@v2", gitea_content)
                 
             # Check gitignore
             with open(gitignore_path, 'r', encoding='utf-8') as f:
                 git_content = f.read()
                 self.assertIn("kiforge_test_ci/", git_content)
+                self.assertIn("production/", git_content)
                 self.assertIn(".history/", git_content)
         finally:
             shutil.rmtree(temp_dir)
 
     def test_gitignore_template_patterns(self):
-        """Verify gitignore template includes KiCad 10 patterns."""
+        """Verify gitignore template includes KiCad patterns."""
         patterns = kiforge.load_gitignore_patterns("kiforge_out")
         self.assertIn("kiforge_out/", patterns)
-        self.assertIn(".history/", patterns)
         self.assertIn("*.kicad_prl", patterns)
         self.assertIn("bom/", patterns)
+        self.assertIn("production/", patterns)
+        self.assertIn(".history/", patterns)
 
     def test_global_settings_save_and_merge(self):
         """Verify global settings persist and merge with project settings."""
@@ -229,6 +283,12 @@ class TestKiForgeCLI(unittest.TestCase):
 
         try:
             kiforge.save_settings({"format_jlc": False, "output_dir": "global_out"}, scope="global")
+            with open(global_path, "r", encoding="utf-8") as f:
+                import json
+                saved = json.load(f)
+            self.assertIn("exports", saved)
+            self.assertFalse(saved["exports"]["format_jlc"])
+            self.assertNotIn("export_gerbers", saved)
             merged = kiforge.load_merged_settings(temp_dir)
             self.assertFalse(merged["format_jlc"])
             self.assertEqual(merged["output_dir"], "global_out")
@@ -236,10 +296,10 @@ class TestKiForgeCLI(unittest.TestCase):
             project_settings = os.path.join(temp_dir, ".kiforge.json")
             with open(project_settings, "w", encoding="utf-8") as f:
                 import json
-                json.dump({"output_dir": "project_out"}, f)
+                json.dump({"output_dir": "project_out", "exports": {"format_jlc": True}}, f)
             merged = kiforge.load_merged_settings(temp_dir)
             self.assertEqual(merged["output_dir"], "project_out")
-            self.assertFalse(merged["format_jlc"])
+            self.assertTrue(merged["format_jlc"])
         finally:
             shutil.rmtree(temp_dir)
             if backup is not None:
@@ -249,6 +309,91 @@ class TestKiForgeCLI(unittest.TestCase):
             elif os.path.isfile(global_path):
                 os.remove(global_path)
 
+    def test_title_block_rev_helpers(self):
+        """Verify title-block rev insertion/update without modifying the source file."""
+        import tempfile
+        import shutil
+
+        content = '(kicad_sch\n\t(paper "A4")\n\t(generator "eeschema")\n)\n'
+        updated = kiforge.update_kicad_file_title_block_rev(content, "v2.0.0")
+        self.assertIn('(rev "v2.0.0")', updated)
+        self.assertIn('(paper "A4")', updated)
+
+        existing = '(title_block (rev "old") (date "2024-01-01"))\n'
+        updated = kiforge.update_kicad_file_title_block_rev(existing, "v3.1.4")
+        self.assertIn('(rev "v3.1.4")', updated)
+        self.assertIn('(date "2024-01-01")', updated)
+        self.assertNotIn("old", updated)
+
+        temp_root = tempfile.mkdtemp()
+        sch_path = os.path.join(temp_root, "board.kicad_sch")
+        try:
+            with open(sch_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            temp_dir, staged = kiforge.create_title_block_staged_copy(sch_path, "v1.2.3")
+            try:
+                with open(staged, "r", encoding="utf-8") as f:
+                    staged_content = f.read()
+                with open(sch_path, "r", encoding="utf-8") as f:
+                    original_content = f.read()
+                self.assertIn('(rev "v1.2.3")', staged_content)
+                self.assertEqual(original_content, content)
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        finally:
+            shutil.rmtree(temp_root)
+
+    def test_export_runtime_options_not_persisted(self):
+        """Title-block sync is export-runtime only, not saved in settings JSON."""
+        import tempfile
+        import shutil
+        import json
+
+        temp_dir = tempfile.mkdtemp()
+        global_path = kiforge.get_global_settings_path()
+        backup = None
+        if os.path.isfile(global_path):
+            with open(global_path, "r", encoding="utf-8") as f:
+                backup = f.read()
+
+        try:
+            runtime = kiforge.apply_export_runtime_options({})
+            self.assertTrue(runtime["sync_title_block_rev"])
+
+            kiforge.save_settings({"format_jlc": False}, scope="global")
+            with open(global_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertNotIn("sync_title_block_rev", saved)
+            self.assertNotIn("sync_title_block_rev", saved.get("exports", {}))
+
+            with open(os.path.join(temp_dir, ".kiforge.json"), "w", encoding="utf-8") as f:
+                json.dump({"exports": {"sync_title_block_rev": False}}, f)
+            merged = kiforge.load_merged_settings(temp_dir)
+            self.assertNotIn("sync_title_block_rev", merged)
+        finally:
+            shutil.rmtree(temp_dir)
+            if backup is not None:
+                os.makedirs(os.path.dirname(global_path), exist_ok=True)
+                with open(global_path, "w", encoding="utf-8") as f:
+                    f.write(backup)
+            elif os.path.isfile(global_path):
+                os.remove(global_path)
+
+    def test_legacy_flat_export_settings(self):
+        """Verify legacy flat export keys in saved JSON still load correctly."""
+        import tempfile
+        import shutil
+        import json
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(temp_dir, ".kiforge.json"), "w", encoding="utf-8") as f:
+                json.dump({"export_bom": False}, f)
+            merged = kiforge.load_merged_settings(temp_dir)
+            self.assertFalse(merged["export_bom"])
+        finally:
+            shutil.rmtree(temp_dir)
+
     def test_drill_runs_when_only_gerbers_enabled(self):
         """Verify drill export runs when gerbers are enabled even if drills flag is false."""
         task = kiforge.DrillExportTask()
@@ -257,14 +402,320 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertTrue(task.is_applicable(context))
 
     def test_jlc_format_tasks_respect_format_jlc_flag(self):
-        """Verify JLC formatting tasks are skipped when format_jlc is false."""
-        bom_task = kiforge.JlcBomFormatTask()
-        cpl_task = kiforge.JlcCplFormatTask()
-        context = kiforge.ExportContext(".", "kiforge_out", {"format_jlc": False, "export_bom": True, "export_pos": True})
-        context.pcb_file = "dummy.kicad_pcb"
-        context.sch_file = "dummy.kicad_sch"
-        self.assertFalse(bom_task.is_applicable(context))
-        self.assertFalse(cpl_task.is_applicable(context))
+        """Verify BOM/POS finalize tasks always run; JLC files only when format_jlc is true."""
+        import tempfile
+        import csv
+
+        temp_dir = tempfile.mkdtemp()
+        out_dir = os.path.join(temp_dir, "out")
+        os.makedirs(out_dir)
+        try:
+            raw_bom = os.path.join(out_dir, "raw_bom.csv")
+            with open(raw_bom, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["Reference", "Value", "Footprint", "DNP"])
+                writer.writeheader()
+                writer.writerow({"Reference": "R1", "Value": "10k", "Footprint": "R_0603", "DNP": ""})
+
+            raw_pos = os.path.join(out_dir, "raw_pos.csv")
+            with open(raw_pos, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["Ref", "Val", "Package", "PosX", "PosY", "Rot", "Side"]
+                )
+                writer.writeheader()
+                writer.writerow({
+                    "Ref": "R1", "Val": "10k", "Package": "R_0603",
+                    "PosX": "1", "PosY": "2", "Rot": "0", "Side": "top",
+                })
+
+            bom_task = kiforge.BomOutputTask()
+            pos_task = kiforge.PosOutputTask()
+            context = kiforge.ExportContext(".", "out", {"format_jlc": False, "export_bom": True, "export_pos": True})
+            context.pcb_file = "dummy.kicad_pcb"
+            context.sch_file = "dummy.kicad_sch"
+            context.pcb_name = "board_v1.0"
+            context.project_dir = temp_dir
+            context.output_dir = out_dir
+            context.logger = kiforge.logger
+
+            self.assertTrue(bom_task.is_applicable(context))
+            self.assertTrue(pos_task.is_applicable(context))
+            self.assertTrue(bom_task.run(context))
+            self.assertTrue(pos_task.run(context))
+
+            versioned_bom = os.path.join(out_dir, "board_v1.0_bom.csv")
+            versioned_pos = os.path.join(out_dir, "board_v1.0_pos.csv")
+            self.assertTrue(os.path.isfile(versioned_bom))
+            self.assertTrue(os.path.isfile(versioned_pos))
+            self.assertFalse(os.path.isfile(raw_bom))
+            self.assertFalse(os.path.isfile(raw_pos))
+            self.assertFalse(os.path.isfile(os.path.join(out_dir, "board_v1.0_bom_jlc.csv")))
+            self.assertFalse(os.path.isfile(os.path.join(out_dir, "board_v1.0_cpl_jlc.csv")))
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_bom_output_task_produces_jlc_and_kicad_csv(self):
+        """Verify versioned KiCad BOM/POS are kept alongside JLCPCB CSVs."""
+        import tempfile
+        import csv
+
+        temp_dir = tempfile.mkdtemp()
+        out_dir = os.path.join(temp_dir, "out")
+        os.makedirs(out_dir)
+        try:
+            raw_bom = os.path.join(out_dir, "raw_bom.csv")
+            with open(raw_bom, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["Reference", "Value", "Footprint", "DNP"])
+                writer.writeheader()
+                writer.writerow({"Reference": "R1", "Value": "10k", "Footprint": "R_0603", "DNP": ""})
+
+            context = kiforge.ExportContext(".", "out", {"format_jlc": True, "export_bom": True})
+            context.sch_file = "dummy.kicad_sch"
+            context.pcb_name = "sample_v1.0"
+            context.output_dir = out_dir
+            context.logger = kiforge.logger
+
+            self.assertTrue(kiforge.BomOutputTask().run(context))
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "sample_v1.0_bom.csv")))
+            self.assertTrue(os.path.isfile(os.path.join(out_dir, "sample_v1.0_bom_jlc.csv")))
+            self.assertFalse(os.path.isfile(raw_bom))
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_resolve_git_latest_tag(self):
+        """Verify latest git tag is resolved from a repository directory."""
+        import tempfile
+        import shutil
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            git = shutil.which("git")
+            if not git:
+                self.skipTest("git not available")
+            subprocess.run([git, "init"], cwd=temp_dir, check=True, capture_output=True)
+            subprocess.run([git, "config", "user.email", "kiforge@test.local"], cwd=temp_dir, check=True)
+            subprocess.run([git, "config", "user.name", "KiForge Test"], cwd=temp_dir, check=True)
+            marker = os.path.join(temp_dir, "marker.txt")
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write("test\n")
+            subprocess.run([git, "add", "marker.txt"], cwd=temp_dir, check=True, capture_output=True)
+            subprocess.run([git, "commit", "-m", "init"], cwd=temp_dir, check=True, capture_output=True)
+            subprocess.run([git, "tag", "v2.5.0"], cwd=temp_dir, check=True, capture_output=True)
+            self.assertEqual(kiforge.resolve_git_latest_tag(temp_dir), "v2.5.0")
+        finally:
+            _rmtree_force(temp_dir)
+
+    def test_version_from_git_tag(self):
+        """Verify local export uses the latest git tag when no explicit version is set."""
+        import tempfile
+        import shutil
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            git = shutil.which("git")
+            if not git:
+                self.skipTest("git not available")
+            pcb_path = os.path.join(temp_dir, "myboard.kicad_pcb")
+            with open(pcb_path, "w", encoding="utf-8") as f:
+                f.write("(kicad_pcb (version 20240108)\n")
+            subprocess.run([git, "init"], cwd=temp_dir, check=True, capture_output=True)
+            subprocess.run([git, "config", "user.email", "kiforge@test.local"], cwd=temp_dir, check=True)
+            subprocess.run([git, "config", "user.name", "KiForge Test"], cwd=temp_dir, check=True)
+            subprocess.run([git, "add", "myboard.kicad_pcb"], cwd=temp_dir, check=True, capture_output=True)
+            subprocess.run([git, "commit", "-m", "board"], cwd=temp_dir, check=True, capture_output=True)
+            subprocess.run([git, "tag", "v3.1.4"], cwd=temp_dir, check=True, capture_output=True)
+
+            context = kiforge.ExportContext(temp_dir, "out", {})
+            original_setup_logger = kiforge.setup_logger
+            kiforge.setup_logger = lambda dir: None
+            try:
+                self.assertTrue(context.resolve())
+            finally:
+                kiforge.setup_logger = original_setup_logger
+            self.assertEqual(context.pcb_name, "myboard_v3.1.4")
+        finally:
+            _rmtree_force(temp_dir)
+
+    def test_normalize_version_suffix(self):
+        """Verify version strings are normalized for filenames."""
+        self.assertEqual(kiforge.normalize_version_suffix("1.2.3"), "v1.2.3")
+        self.assertEqual(kiforge.normalize_version_suffix("v1.2.3"), "v1.2.3")
+        self.assertEqual(kiforge.normalize_version_suffix("refs/tags/v9.0"), "v9.0")
+        self.assertEqual(kiforge.normalize_version_suffix(""), "v0.1.0")
+
+    def test_apply_version_suffix(self):
+        """Verify version suffix is applied once and never omitted."""
+        self.assertEqual(kiforge.apply_version_suffix("board", "1.0.0"), "board_v1.0.0")
+        self.assertEqual(kiforge.apply_version_suffix("board_v1.0.0", "2.0.0"), "board_v1.0.0")
+
+    def test_sanitize_filename_component(self):
+        """Untrusted version/name input must not enable path traversal or unsafe files."""
+        self.assertEqual(kiforge.sanitize_filename_component("v1.2.3"), "v1.2.3")
+        # Directory separators and traversal collapse to the final safe component.
+        self.assertEqual(kiforge.sanitize_filename_component("../../etc/passwd"), "passwd")
+        self.assertEqual(kiforge.sanitize_filename_component("a\\b\\c"), "c")
+        # Shell/HTML metacharacters are replaced, not preserved.
+        self.assertNotIn("/", kiforge.sanitize_filename_component("a/b"))
+        self.assertNotIn(";", kiforge.sanitize_filename_component("v1;rm -rf"))
+        self.assertNotIn("<", kiforge.sanitize_filename_component("<script>"))
+        # Empty/degenerate input falls back safely.
+        self.assertEqual(kiforge.sanitize_filename_component("", fallback="x"), "x")
+        self.assertEqual(kiforge.sanitize_filename_component("...", fallback="x"), "x")
+
+    def test_normalize_version_suffix_rejects_traversal(self):
+        """A malicious git tag cannot inject path separators into output filenames."""
+        result = kiforge.normalize_version_suffix("v1.0/../../evil")
+        self.assertNotIn("/", result)
+        self.assertNotIn("..", result)
+        # A tag with shell metacharacters is reduced to a safe filename token.
+        self.assertNotIn(";", kiforge.normalize_version_suffix("1.0;whoami"))
+
+    def test_build_ibom_cli_args(self):
+        """Verify iBOM CLI flags are built from saved settings."""
+        args = kiforge.build_ibom_cli_args(
+            {"dark_mode": True, "include_tracks": False, "include_netlist": True},
+            "/tmp/out",
+        )
+        self.assertIn("--no-browser", args)
+        self.assertIn("--dark-mode", args)
+        self.assertIn("--include-nets", args)
+        self.assertNotIn("--include-netlist", args)
+        self.assertNotIn("--include-tracks", args)
+        self.assertEqual(args[-2:], ["--dest-dir", "/tmp/out"])
+
+    def test_build_ibom_cli_args_always_suppresses_browser(self):
+        """Legacy no_browser=false in saved settings must not open a browser during export."""
+        args = kiforge.build_ibom_cli_args({"no_browser": False}, "/tmp/out")
+        self.assertEqual(args.count("--no-browser"), 1)
+
+    def test_cleanup_partial_ibom_output(self):
+        """Cancelled iBOM runs should remove default and versioned HTML outputs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            default_path = os.path.join(tmp, "ibom.html")
+            versioned_path = os.path.join(tmp, "board_v1_ibom.html")
+            open(default_path, "w", encoding="utf-8").close()
+            open(versioned_path, "w", encoding="utf-8").close()
+            kiforge.cleanup_partial_ibom_output(tmp, "board_v1")
+            self.assertFalse(os.path.exists(default_path))
+            self.assertFalse(os.path.exists(versioned_path))
+
+    def test_build_ibom_subprocess_command(self):
+        """iBOM must run as a module so it does not register a pcbnew ActionPlugin."""
+        cmd = kiforge.build_ibom_subprocess_command("/usr/bin/python3")
+        self.assertEqual(
+            cmd,
+            ["/usr/bin/python3", "-m", "InteractiveHtmlBom.generate_interactive_bom"],
+        )
+        env = kiforge.ensure_ibom_subprocess_env({})
+        self.assertEqual(env["INTERACTIVE_HTML_BOM_NO_DISPLAY"], "1")
+        self.assertEqual(env["INTERACTIVE_HTML_BOM_CLI_MODE"], "1")
+
+    def test_ibom_env_not_set_on_kiforge_import(self):
+        """Importing kiforge must not set iBOM CLI env vars (breaks InteractiveHtmlBom toolbar)."""
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        env = os.environ.copy()
+        env.pop("INTERACTIVE_HTML_BOM_CLI_MODE", None)
+        env.pop("INTERACTIVE_HTML_BOM_NO_DISPLAY", None)
+        code = (
+            f"import sys; sys.path.insert(0, {repo_root!r}); "
+            "import kiforge; import os; "
+            "raise SystemExit(1 if os.environ.get('INTERACTIVE_HTML_BOM_CLI_MODE') "
+            "or os.environ.get('INTERACTIVE_HTML_BOM_NO_DISPLAY') else 0)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_format_ibom_failure_message_outline(self):
+        """Missing Edge.Cuts outline should produce a clear warning."""
+        msg = kiforge.format_ibom_failure_message(
+            stderr="2026-06-30 ERROR Please draw pcb outline on the edges layer before generating BOM.\n"
+                   "2026-06-30 ERROR Parsing failed.\n"
+        )
+        self.assertIn("Edge.Cuts", msg)
+        self.assertIn("skipped", msg.lower())
+        self.assertNotIn("python.exe", msg)
+
+    def test_format_task_failure_message(self):
+        """Generic export failures should stay short and omit raw commands."""
+        msg = kiforge.format_task_failure_message(
+            "Exporting Gerber Layers",
+            stderr="ERROR: Failed to export gerbers\n",
+        )
+        self.assertIn("Gerber", msg)
+        self.assertNotIn("kicad-cli", msg.lower())
+
+    def test_export_runner_continues_after_task_failure(self):
+        """One failed step must not abort the whole export pipeline."""
+        context = kiforge.ExportContext(".", "kiforge_out", {
+            "export_gerbers": True,
+            "export_drills": False,
+            "export_pos": False,
+            "export_bom": False,
+            "export_ibom": False,
+            "export_3d": False,
+            "export_svg": False,
+            "export_step": False,
+            "export_sch_pdf": False,
+        })
+        context.pcb_file = "board.kicad_pcb"
+        context.pcb_name = "board"
+        context.project_dir = "."
+        context.output_dir = "kiforge_out"
+        context.temp_gerber_dir = os.path.join("kiforge_out", "temp_gerbers")
+        context.kicad_cli = "kicad-cli"
+        context.kicad_python = "python"
+        os.makedirs(context.output_dir, exist_ok=True)
+
+        runner = kiforge.ExportRunner(context)
+        original_run = runner.tasks[0].run
+
+        def fail_gerbers(ctx):
+            ctx.add_warning("Exporting Gerber Layers failed: simulated")
+            return False
+
+        runner.tasks[0].run = fail_gerbers
+        try:
+            result = runner.execute()
+        finally:
+            runner.tasks[0].run = original_run
+
+        self.assertTrue(result)
+        self.assertIn("Exporting Gerber Layers failed", context.warnings[0])
+
+    def test_merged_settings_include_ibom(self):
+        """Verify iBOM defaults merge from global/project JSON."""
+        import tempfile
+
+        temp_dir = tempfile.mkdtemp()
+        global_path = kiforge.get_global_settings_path()
+        backup = None
+        if os.path.isfile(global_path):
+            with open(global_path, "r", encoding="utf-8") as f:
+                backup = f.read()
+        try:
+            kiforge.save_settings({"ibom": {"dark_mode": True}}, scope="global")
+            merged = kiforge.load_merged_settings(temp_dir)
+            self.assertTrue(merged["ibom"]["dark_mode"])
+            project_path = kiforge.get_project_settings_path(temp_dir)
+            with open(project_path, "w", encoding="utf-8") as f:
+                import json
+                json.dump({"ibom": {"dark_mode": False, "checkboxes": True}}, f)
+            merged = kiforge.load_merged_settings(temp_dir)
+            self.assertFalse(merged["ibom"]["dark_mode"])
+            self.assertTrue(merged["ibom"]["checkboxes"])
+        finally:
+            shutil.rmtree(temp_dir)
+            if backup is not None:
+                os.makedirs(os.path.dirname(global_path), exist_ok=True)
+                with open(global_path, "w", encoding="utf-8") as f:
+                    f.write(backup)
+            elif os.path.isfile(global_path):
+                os.remove(global_path)
 
     def test_version_tag_resolution(self):
         """Verify version resolution and normalization from environment, options, and file extraction."""
@@ -294,7 +745,7 @@ class TestKiForgeCLI(unittest.TestCase):
                 kiforge.setup_logger = original_setup_logger
             self.assertEqual(context.pcb_name, "myboard_v9.9.9")
             
-            # Case 2: Extract revision from schematic file
+            # Case 2: No explicit version or git tag → default v0.1.0 (title block ignored)
             options = {}
             context = kiforge.ExportContext(temp_dir, "out", options)
             original_setup_logger = kiforge.setup_logger
@@ -303,8 +754,7 @@ class TestKiForgeCLI(unittest.TestCase):
                 self.assertTrue(context.resolve())
             finally:
                 kiforge.setup_logger = original_setup_logger
-            # Should read "1.2.3-sch" and normalize to "v1.2.3-sch"
-            self.assertEqual(context.pcb_name, "myboard_v1.2.3-sch")
+            self.assertEqual(context.pcb_name, "myboard_v0.1.0")
 
             # Case 3: Default to v0.1.0 when no rev, env, or option is available
             plain_dir = tempfile.mkdtemp()
@@ -330,10 +780,9 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertIs(kiforge.generate_ci_files, kiforge.generate_cd_files)
 
     def test_step3d_export_task_vrml_warning(self):
-        """Verify that Step3dExportTask intercepts VRML model export errors, logs a warning, and returns True."""
+        """Partial STEP output should count as success with a warning."""
         task = kiforge.Step3dExportTask()
-        
-        # Create a mock ExportContext
+
         options = {"export_step": True}
         context = kiforge.ExportContext(".", "kiforge_out", options)
         context.pcb_file = "dummy.kicad_pcb"
@@ -341,21 +790,28 @@ class TestKiForgeCLI(unittest.TestCase):
         context.project_dir = "."
         context.output_dir = "kiforge_out"
         context.temp_gerber_dir = "kiforge_out/temp_gerbers"
-        
-        import logging
-        context.logger = logging.getLogger("kiforge_test_vrml")
-        
-        # Mock _run_subprocess to raise a RuntimeError with the VRML error message
-        def mock_run_subprocess(cmd, ctx):
-            raise RuntimeError("Command failed: pcb export step ...\n\nError:\nCannot use VRML models when exporting to non-mesh formats.")
-            
-        task._run_subprocess = mock_run_subprocess
-        
-        # This should log a warning and return True instead of raising an error/returning False
-        with self.assertLogs("kiforge_test_vrml", level="WARNING") as cm:
-            result = task.run(context)
-            self.assertTrue(result)
-            self.assertTrue(any("Cannot use VRML models" in log for log in cm.output))
+        os.makedirs(context.output_dir, exist_ok=True)
+        output_step = os.path.join(context.output_dir, "dummy.step")
+
+        with open(output_step, "wb") as step_file:
+            step_file.write(b"partial-step")
+
+        task._run_subprocess = lambda cmd, ctx: (
+            ctx.add_warning("Exporting STEP 3D Model failed: Cannot use VRML models"),
+            False,
+        )[1]
+
+        self.assertTrue(task.run(context))
+        self.assertTrue(any("STEP" in warning for warning in context.warnings))
+
+    def test_studio_ui_helpers_are_safe_without_progress(self):
+        """Cross-platform progress helpers must tolerate a missing dialog."""
+        try:
+            from plugins import kiforge_studio
+        except ImportError:
+            self.skipTest("plugins package not available")
+        self.assertTrue(kiforge_studio._update_progress_dialog(None, 50, "Running..."))
+        kiforge_studio._destroy_progress_dialog(None)
 
 
 if __name__ == '__main__':

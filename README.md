@@ -26,7 +26,9 @@ All outputs are versioned automatically in every run (GUI, CLI, and CD) — ever
 |---|---|---|
 | Gerber + Drill archive | `<name>_gerbers.zip` | `export_gerbers` (drills included automatically when Gerbers are enabled) |
 | JLCPCB Bill of Materials | `<name>_bom_jlc.csv` | `export_bom` |
+| KiCad Bill of Materials (raw) | `<name>_bom.csv` | `export_bom` |
 | JLCPCB Component Placement | `<name>_cpl_jlc.csv` | `export_pos` |
+| KiCad Component Placement (raw) | `<name>_pos.csv` | `export_pos` |
 | Schematic PDF | `<name>_sch.pdf` | `export_sch_pdf` |
 | STEP 3D Model | `<name>.step` | `export_step` |
 | 3D Front & Back Renders | `<name>_3d_front/back.png` | `export_3d` |
@@ -41,7 +43,17 @@ All outputs are versioned automatically in every run (GUI, CLI, and CD) — ever
 
 The quickest way. KiForge appears under **Tools › External Plugins** inside the KiCad PCB Editor. No terminal needed.
 
-**Install via KiCad Plugin Manager** — search for `KiForge` — or drop the `plugins/` folder manually:
+**Install via KiCad Plugin Manager** — add this custom repository URL (do not use raw files from the git tree; they are not kept in sync with releases):
+
+```
+https://github.com/alphaseneca/kiforge/releases/latest/download/repository.json
+```
+
+If you previously added a local or main-branch PCM URL and see a hash mismatch, remove the old repository in PCM and add the URL above, then refresh.
+
+Or install the release zip directly: **Plugin and Content Manager → Install from file…** → download `com.github.alphaseneca.kiforge-vX.Y.Z.zip` from [Releases](https://github.com/alphaseneca/kiforge/releases).
+
+You can also drop the `plugins/` folder manually:
 
 | Platform | Plugin path |
 |---|---|
@@ -57,6 +69,8 @@ The quickest way. KiForge appears under **Tools › External Plugins** inside th
 5. All files land in the configured output folder (default: `kiforge/` next to your `.kicad_pro`).
 
 Settings merge from built-in defaults → global (`~/.config/kiforge/settings.json` on Linux) → project `.kiforge.json`. Use **Save Project Defaults** or **Save Global Defaults** to persist your toggles.
+
+**Support:** [Report an issue](https://github.com/alphaseneca/kiforge/issues) · [Usage guide](USAGE.md)
 
 > **Bonus:** CD workflow files (`.github/workflows/release.yml`, `.gitea/workflows/release.yml`, and `.gitignore` patterns from `templates/kiforge.gitignore`) are generated automatically after each successful export when **Generate/update CD workflow files on export** is checked. You can also use **Generate CD Files Only** without exporting.
 
@@ -91,7 +105,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run KiForge
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: '.'
 
@@ -144,7 +158,7 @@ Exports only what JLCPCB needs to manufacture and assemble: Gerbers, Drills, BOM
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: '.'
           export_3d: 'false'
@@ -162,7 +176,7 @@ Schematic PDF, 3D renders, and SVGs — no fabrication data.
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: '.'
           export_gerbers: 'false'
@@ -179,7 +193,7 @@ Schematic PDF, 3D renders, and SVGs — no fabrication data.
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: 'hardware/my-board'
           output_dir: 'hardware/my-board/kiforge'
@@ -237,9 +251,10 @@ KiForge appends the version to **all** output filenames automatically. The versi
 1. `--version-tag` CLI flag
 2. `GITHUB_REF_NAME` environment variable (set automatically by GitHub Actions on tag push)
 3. `VERSION` environment variable
-4. `(rev ...)` field from your `.kicad_sch` title block
-5. `(rev ...)` field from your `.kicad_pcb` title block
-6. Default `v0.1.0` if none of the above are set
+4. Latest **git tag** in the project directory (when `use_git_tag_version` is enabled — default on)
+5. Default **`v0.1.0`** if no tag or explicit version is available
+
+Every output filename always includes a version suffix (never unversioned `myboard.step`).
 
 Version suffixes apply to **all** outputs locally and in CD — including schematic PDF (`*_sch.pdf`), because `ExportContext.resolve()` appends the version to `pcb_name` before any task runs.
 
@@ -332,12 +347,18 @@ The log includes resolved paths, every subprocess command with its full argument
 kiforge/
 ├── kiforge.py              # Core exporter — single source of truth
 ├── action.yml              # GitHub Action composite definition
+├── action/run.sh           # Composite action Docker runner
 ├── Dockerfile              # kicad/kicad:10.0-based image for CI
 ├── docker-compose.yml      # Local Docker test environment
 ├── package_plugin.py       # Builds the KiCad PCM plugin zip
-├── metadata.json           # KiCad Plugin Manager manifest
+├── metadata.json           # KiCad PCM v2 plugin manifest
+├── schemas/
+│   ├── pcm.v2.schema.json  # Official KiCad PCM schema v2 (vendored)
+│   └── README.md           # Schema source URL and usage notes
 ├── templates/
-│   └── kiforge.gitignore   # Editable gitignore template merged into downstream projects
+│   ├── kiforge.gitignore      # Gitignore patterns merged into downstream projects
+│   ├── github-release.yml     # GitHub Actions CD workflow template
+│   └── gitea-release.yml      # Gitea Actions CD workflow template
 ├── plugins/
 │   ├── __init__.py         # KiCad plugin registration hook
 │   ├── kiforge_studio.py   # wx GUI (settings dialog + progress)
@@ -352,6 +373,8 @@ kiforge/
 ```
 
 ### Running tests
+
+See [Development.md](Development.md) for the full testing guide.
 
 ```bash
 python -m unittest tests/test_cli.py tests/test_studio.py -v

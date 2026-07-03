@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: KiForge documentation
+    url: https://github.com/alphaseneca/kiforge/blob/main/USAGE.md
+    about: Usage guide for CLI, GUI, and GitHub Actions
+  - name: KiCad addon publishing docs
+    url: https://dev-docs.kicad.org/en/addons/
+    about: KiCad PCM packaging and official repository requirements

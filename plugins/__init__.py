@@ -1,9 +1,12 @@
 """
 KiForge plugin package for KiCad 10.
-Registers the ExporterPlugin ActionPlugin when loaded inside the KiCad scripting environment.
 
-KiCad loads this package via __init__.py when it scans the scripting/plugins directory.
-'pcbnew' being present in sys.modules is the reliable signal that we are running inside KiCad.
+Registers :class:`ExporterPlugin` (KiForge Studio) when loaded inside the KiCad
+scripting environment. KiCad discovers this package via ``plugins/__init__.py``
+when scanning the scripting/plugins directory.
+
+The ``pcbnew`` module being present in ``sys.modules`` is the reliable signal
+that Python is running inside KiCad — not during CLI, unit tests, or packaging.
 """
 import sys
 

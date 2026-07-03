@@ -1,0 +1,52 @@
+name: Bug Report
+description: Report a KiForge export or KiCad plugin issue
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a KiForge issue. Include KiCad version, OS, and steps to reproduce.
+  - type: input
+    id: kicad-version
+    attributes:
+      label: KiCad version
+      placeholder: "10.0.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. Open sample project...\n2. Run export with..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste excerpts from kiforge.log or KiCad scripting console if available.
+      render: shell

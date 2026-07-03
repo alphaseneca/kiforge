@@ -1,5 +1,6 @@
 {
-    "$schema": "https://gitlab.com/kicad/code/kicad/-/raw/master/kicad/pcm/schemas/pcm.v1.schema.json#/definitions/Repository",
+    "$schema": "https://gitlab.com/kicad/code/kicad/-/raw/master/kicad/pcm/schemas/pcm.v2.schema.json#/definitions/Repository",
+    "schema_version": 2,
     "maintainer": {
         "name": "Ukesh Aryal",
         "contact": {
@@ -9,14 +10,14 @@
     "name": "KiForge Custom PCM Repository",
     "packages": {
         "url": "https://github.com/alphaseneca/kiforge/releases/latest/download/packages.json",
-        "sha256": "2c6f5185525c0fa35c9f784bbae771c610ec525d2aa6491208a73c878a359520",
-        "update_timestamp": 1780510919,
-        "update_time_utc": "2026-06-03 18:21:59"
+        "sha256": "83fb32c9b689317e237845fa91c876a4e9d65df9b99ef1425b44bec767955aba",
+        "update_timestamp": 1782817585,
+        "update_time_utc": "2026-06-30 11:06:25"
     },
     "resources": {
         "url": "https://github.com/alphaseneca/kiforge/releases/latest/download/resources.zip",
         "sha256": "42d0b143c034796a6d947b380c5e592556ce46bca928660392646cc4d4161efe",
-        "update_timestamp": 1780510919,
-        "update_time_utc": "2026-06-03 18:21:59"
+        "update_timestamp": 1782817585,
+        "update_time_utc": "2026-06-30 11:06:25"
     }
 }

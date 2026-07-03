@@ -1,3 +1,8 @@
+"""
+GUI tests for KiForge Studio (wx dialog and CD sync).
+
+Opt in with ``KIFORGE_RUN_GUI_TESTS=1`` — requires a display and wxPython.
+"""
 import unittest
 import sys
 import os
@@ -73,8 +78,8 @@ class TestKiForgeStudio(unittest.TestCase):
         with open(settings_file, 'w', encoding='utf-8') as f:
             json.dump(settings, f)
             
-        # Verify settings load correctly
-        loaded_settings = dialog.load_settings(self.test_dir)
+        # Verify settings load correctly via core merge logic
+        loaded_settings = kiforge.load_merged_settings(self.test_dir)
         self.assertEqual(loaded_settings['output_dir'], 'custom_out')
         self.assertFalse(loaded_settings['export_gerbers'])
         self.assertTrue(loaded_settings['export_drills'])
@@ -119,6 +124,7 @@ class TestKiForgeStudio(unittest.TestCase):
         with open(gitignore_path, 'r', encoding='utf-8') as f:
             git_content = f.read()
             self.assertIn("kiforge_ci_test/", git_content)
+            self.assertIn("production/", git_content)
             self.assertIn(".history/", git_content)
 
         dialog.Destroy()
@@ -137,6 +143,12 @@ class TestKiForgeStudio(unittest.TestCase):
         loaded = kiforge.load_merged_settings(self.test_dir)
         self.assertEqual(loaded["output_dir"], "saved_out")
         self.assertFalse(loaded["format_jlc"])
+        project_path = kiforge.get_project_settings_path(self.test_dir)
+        with open(project_path, "r", encoding="utf-8") as f:
+            import json
+            saved = json.load(f)
+        self.assertIn("exports", saved)
+        self.assertFalse(saved["exports"]["format_jlc"])
         dialog.Destroy()
 
     def test_save_global_defaults(self):
@@ -165,6 +177,72 @@ class TestKiForgeStudio(unittest.TestCase):
                     f.write(backup)
             elif os.path.isfile(global_path):
                 os.remove(global_path)
+
+    def test_load_global_defaults_button(self):
+        """Verify Load Global Config applies global settings to the dialog."""
+        global_path = kiforge.get_global_settings_path()
+        backup = None
+        if os.path.isfile(global_path):
+            with open(global_path, "r", encoding="utf-8") as f:
+                backup = f.read()
+
+        try:
+            kiforge.save_settings(
+                {**kiforge.DEFAULT_SETTINGS, "export_3d": False},
+                scope="global",
+            )
+            dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+            dialog.chk_3d.SetValue(True)
+
+            class MockEvent:
+                pass
+
+            dialog.on_load_global_defaults(MockEvent())
+            self.assertFalse(dialog.chk_3d.IsChecked())
+            dialog.Destroy()
+        finally:
+            if backup is not None:
+                os.makedirs(os.path.dirname(global_path), exist_ok=True)
+                with open(global_path, "w", encoding="utf-8") as f:
+                    f.write(backup)
+            elif os.path.isfile(global_path):
+                os.remove(global_path)
+
+    def test_reset_defaults_button(self):
+        """Verify Reset restores built-in defaults in the dialog."""
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        dialog.chk_3d.SetValue(False)
+
+        class MockEvent:
+            pass
+
+        dialog.on_reset_defaults(MockEvent())
+        self.assertTrue(dialog.chk_3d.IsChecked())
+        dialog.Destroy()
+
+    def test_live_cd_sync_on_toggle(self):
+        """Verify changing an export checkbox triggers debounced CD workflow sync."""
+        from unittest.mock import patch
+
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        dialog.txt_project_dir.SetValue(self.test_dir)
+        dialog.txt_output_dir.SetValue("kiforge_sync_test")
+        dialog.chk_3d.SetValue(True)
+
+        class MockEvent:
+            pass
+
+        with patch.object(kiforge_studio.kiforge, "generate_cd_files", return_value=("ok", True)) as mock_cd:
+            dialog.on_export_setting_changed(MockEvent())
+            dialog.on_cd_sync_timer(MockEvent())
+            mock_cd.assert_called_once()
+            self.assertTrue(mock_cd.call_args[0][2]["export_3d"])
+            dialog.chk_3d.SetValue(False)
+            dialog.on_export_setting_changed(MockEvent())
+            dialog.on_cd_sync_timer(MockEvent())
+            self.assertEqual(mock_cd.call_count, 2)
+            self.assertFalse(mock_cd.call_args[0][2]["export_3d"])
+        dialog.Destroy()
 
     def test_gerber_toggle_forces_drills(self):
         """Verify enabling gerbers disables and checks the drill checkbox."""

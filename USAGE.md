@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run KiForge
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: '.'
 
@@ -43,7 +43,7 @@ jobs:
           files: kiforge/*
 ```
 
-> Replace `alphaseneca/kiforge@v0.1.0` with the latest tag from the [KiForge releases page](https://github.com/alphaseneca/kiforge/releases).
+> KiForge workflows default to `alphaseneca/kiforge@main`. Pin to a release tag (e.g. `@v1.0.0`) from the [releases page](https://github.com/alphaseneca/kiforge/releases) once you want a fixed stable action version.
 
 ---
 
@@ -67,7 +67,7 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `format_jlc` | Apply JLCPCB BOM/CPL column formatting | `'true'` |
 | `version` | Override version suffix for output filenames | _(auto from Git tag)_ |
 
-> **Version tagging:** All output filenames are versioned automatically on every run — locally and in CD. On tag push, KiForge reads `GITHUB_REF_NAME` (e.g. `myboard_v1.0.0_gerbers.zip`, `myboard_v1.0.0_sch.pdf`). Locally, the version comes from `--version-tag`, title-block `(rev ...)`, or defaults to `v0.1.0`.
+> **Version tagging:** All output filenames are versioned automatically on every run — locally and in CD. On tag push, KiForge reads `GITHUB_REF_NAME` (e.g. `myboard_v1.0.0_gerbers.zip`, `myboard_v1.0.0_sch.pdf`). Locally, the version comes from `--version-tag`, the latest git tag (when enabled), or defaults to `v0.1.0`. During export only, schematic PDFs sync the title-block `(rev …)` to that version via a temporary staged copy (`--sync-title-block-rev`, on by default in CI and Studio Run Export).
 
 ---
 
@@ -100,7 +100,7 @@ Exports only what JLCPCB needs to manufacture and assemble your board: Gerbers, 
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: '.'
           export_3d: 'false'
@@ -118,7 +118,7 @@ Exports the schematic PDF, 3D renders, and SVGs — no fabrication data.
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: '.'
           export_gerbers: 'false'
@@ -137,7 +137,7 @@ Useful for sharing a reviewable board layout alongside fabrication files.
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: '.'
           export_3d: 'false'
@@ -156,7 +156,7 @@ If your KiCad project is not in the repository root:
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: 'hardware/my-board'
           output_dir: 'hardware/my-board/kiforge'
@@ -187,7 +187,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run KiForge Exporter
-        uses: alphaseneca/kiforge@v0.1.0
+        uses: alphaseneca/kiforge@main
         with:
           project_path: '.'
           output_dir: 'kiforge'

@@ -1,19 +1,63 @@
-# KiCad temporary and lock files
-*.lck
-*.tmp
-fp-info-cache
-_autosave-*
+# ---> KiCad
+# Official site: https://www.kicad.org/
+# File format reference: https://kicad.org/help/file-formats/
 
-# KiCad backup files
+#----------------------------------------
+# Temporary and backup files
+#----------------------------------------
+*.000
 *.bak
-*-backups/
+*.bck
 *.kicad_pcb-bak
 *.kicad_sch-bak
+*.sch-bak
+*-backups
+*-save.pro
+*-save.kicad_pcb
+*~
+~*.lck
+_autosave-*
+*.tmp
+\#auto_saved_files#
+
+#----------------------------------------
+# Local/Project-specific KiCad files
+#----------------------------------------
 *.kicad_prl
-*.pdf
+fp-info-cache
+fp-lib-table
+sym-lib-table
+fabrication-toolkit-options.json
+
+#----------------------------------------
+# Simulation and output files
+#----------------------------------------
+*.xml
+*.csv
+*.pos
 *.svg
-#BOM directory
+*.step
+*.pdf
+*.swp
+*.png
+*.jpeg
+*.kicad_mod # KiCad module files
+*.kicad_sym # KiCad symbol files
+*.dxf
+*.DXF
+
+#----------------------------------------
+# Exported files
+#----------------------------------------
+*.net      # Netlist
+*.dsn      # Autorouter session
+*.ses      # Autorouter session
+
+#----------------------------------------
+# Output directories
+#----------------------------------------
 bom/
+production/
 
 # KiCad 10 Local History / Auto-backups
 .history/

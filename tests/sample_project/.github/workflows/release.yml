@@ -1,0 +1,44 @@
+# Manufacturing release workflow for KiCad projects (GitHub Actions).
+# Sample fixture — mirrors templates/github-release.yml with KiForge defaults.
+name: Manufacturing Release (GitHub)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run KiForge
+        uses: alphaseneca/kiforge@main
+        with:
+          project_path: '.'
+          output_dir: 'kiforge_verify'
+          export_3d: 'true'
+          export_svg: 'true'
+          export_bom: 'true'
+          export_sch_pdf: 'true'
+          export_pos: 'true'
+          export_step: 'true'
+          export_gerbers: 'true'
+          export_drills: 'true'
+          export_ibom: 'true'
+          format_jlc: 'true'
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: kiforge_verify/*

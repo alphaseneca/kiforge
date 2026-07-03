@@ -1,3 +1,7 @@
+# KiForge composite GitHub Action
+#
+# Runs the KiCad 10 exporter inside the official kicad/kicad Docker image.
+# See action/run.sh for the runner implementation and USAGE.md for workflow examples.
 name: 'KiForge'
 description: 'Export BOM, CPL, STEP, Gerbers, Drills, 3D renders, SVGs, and PDF from a KiCad 10 project using the official docker image'
 author: 'alphaseneca'
@@ -54,6 +58,10 @@ inputs:
     description: 'Apply JLCPCB BOM/CPL formatting and rotation offsets (true/false)'
     required: false
     default: 'true'
+  sync_title_block_rev:
+    description: 'Sync schematic title-block (rev) to export version via staged copy (true/false)'
+    required: false
+    default: 'true'
   version:
     description: 'Optional version tag override for output filenames (defaults to GITHUB_REF_NAME or v0.1.0)'
     required: false
@@ -62,88 +70,25 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Run KiForge Exporter
+    - name: Run KiForge exporter
       shell: bash
-      run: |
-        ARGS=()
-        ARGS+=("--project-path" "${{ inputs.project_path }}")
-        ARGS+=("--output-dir" "${{ inputs.output_dir }}")
-        
-        if [ "${{ inputs.export_3d }}" = "false" ]; then ARGS+=("--no-export-3d"); fi
-        if [ "${{ inputs.export_svg }}" = "false" ]; then ARGS+=("--no-export-svg"); fi
-        if [ "${{ inputs.export_bom }}" = "false" ]; then ARGS+=("--no-export-bom"); fi
-        if [ "${{ inputs.export_sch_pdf }}" = "false" ]; then ARGS+=("--no-export-sch-pdf"); fi
-        if [ "${{ inputs.export_pos }}" = "false" ]; then ARGS+=("--no-export-pos"); fi
-        if [ "${{ inputs.export_step }}" = "false" ]; then ARGS+=("--no-export-step"); fi
-        if [ "${{ inputs.export_gerbers }}" = "false" ]; then ARGS+=("--no-export-gerbers"); fi
-        if [ "${{ inputs.export_drills }}" = "false" ]; then ARGS+=("--no-export-drills"); fi
-        if [ "${{ inputs.export_ibom }}" = "false" ]; then ARGS+=("--no-export-ibom"); fi
-        if [ "${{ inputs.format_jlc }}" = "false" ]; then ARGS+=("--no-format-jlc"); fi
-        if [ -n "${{ inputs.version }}" ]; then ARGS+=("--version-tag" "${{ inputs.version }}"); fi
-        
-        echo "Building KiForge Docker image..."
-        docker build -t kiforge:latest "${{ github.action_path }}"
-
-        echo "Running KiForge Exporter..."
-        
-        get_container_id() {
-          # 1. Try hostname
-          if [ -n "$(hostname)" ] && docker inspect "$(hostname)" &>/dev/null; then
-            echo "$(hostname)"
-            return 0
-          fi
-          
-          # 2. Try cgroup
-          if [ -f /proc/self/cgroup ]; then
-            local cid
-            cid=$(grep -o -E '[0-9a-f]{64}' /proc/self/cgroup 2>/dev/null | head -n 1)
-            if [ -n "$cid" ] && docker inspect "$cid" &>/dev/null; then
-              echo "$cid"
-              return 0
-            fi
-          fi
-          
-          # 3. Try mountinfo
-          if [ -f /proc/self/mountinfo ]; then
-            local cid
-            cid=$(grep -o -E '[0-9a-f]{64}' /proc/self/mountinfo 2>/dev/null | head -n 1)
-            if [ -n "$cid" ] && docker inspect "$cid" &>/dev/null; then
-              echo "$cid"
-              return 0
-            fi
-          fi
-          
-          return 1
-        }
-
-        CONTAINER_ID=$(get_container_id || true)
-
-        if [ -n "$CONTAINER_ID" ]; then
-          echo "Detected running inside a Docker container ($CONTAINER_ID). Using --volumes-from..."
-          docker run --rm \
-            --user root \
-            -e GITHUB_REF_NAME \
-            -e GITHUB_REF_TYPE \
-            -e VERSION \
-            --volumes-from "$CONTAINER_ID" \
-            -w "${{ github.workspace }}" \
-            kiforge:latest \
-            /bin/bash /action/kiforge.sh "${ARGS[@]}"
-        else
-          echo "Running on host or container ID not found. Using standard volume mount..."
-          docker run --rm \
-            --user root \
-            -e GITHUB_REF_NAME \
-            -e GITHUB_REF_TYPE \
-            -e VERSION \
-            -v "${{ github.workspace }}:/workspace" \
-            -w /workspace \
-            kiforge:latest \
-            /bin/bash /action/kiforge.sh "${ARGS[@]}"
-        fi
-          
-        # Restore host user ownership on the output folder
-        # This prevents permission issues in subsequent workflow steps
-        if [ -d "${{ inputs.project_path }}/${{ inputs.output_dir }}" ]; then
-          sudo chown -R $(id -u):$(id -g) "${{ inputs.project_path }}/${{ inputs.output_dir }}"
-        fi
+      env:
+        KIFORGE_ACTION_PATH: ${{ github.action_path }}
+        KIFORGE_WORKSPACE: ${{ github.workspace }}
+        INPUT_PROJECT_PATH: ${{ inputs.project_path }}
+        INPUT_OUTPUT_DIR: ${{ inputs.output_dir }}
+        INPUT_EXPORT_3D: ${{ inputs.export_3d }}
+        INPUT_EXPORT_SVG: ${{ inputs.export_svg }}
+        INPUT_EXPORT_BOM: ${{ inputs.export_bom }}
+        INPUT_EXPORT_SCH_PDF: ${{ inputs.export_sch_pdf }}
+        INPUT_EXPORT_POS: ${{ inputs.export_pos }}
+        INPUT_EXPORT_STEP: ${{ inputs.export_step }}
+        INPUT_EXPORT_GERBERS: ${{ inputs.export_gerbers }}
+        INPUT_EXPORT_DRILLS: ${{ inputs.export_drills }}
+        INPUT_EXPORT_IBOM: ${{ inputs.export_ibom }}
+        INPUT_FORMAT_JLC: ${{ inputs.format_jlc }}
+        INPUT_SYNC_TITLE_BLOCK_REV: ${{ inputs.sync_title_block_rev }}
+        INPUT_VERSION: ${{ inputs.version }}
+        GITHUB_REF_NAME: ${{ github.ref_name }}
+        GITHUB_REF_TYPE: ${{ github.ref_type }}
+      run: bash "${{ github.action_path }}/action/run.sh"

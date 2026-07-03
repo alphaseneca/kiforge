@@ -12,4 +12,5 @@ RUN apt-get update && \
 RUN mkdir -p /action
 COPY kiforge.py /action/kiforge.py
 COPY kiforge.sh /action/kiforge.sh
+COPY templates/ /action/templates/
 RUN chmod +x /action/kiforge.sh

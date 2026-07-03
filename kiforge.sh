@@ -1,5 +1,6 @@
 #!/bin/bash
-set -e
+# Wrapper for kiforge.py inside Docker and local compose setups.
+set -euo pipefail
 
 # Determine the script path (handling action vs local docker compose)
 if [ -f "/action/kiforge.py" ]; then

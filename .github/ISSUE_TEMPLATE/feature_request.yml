@@ -1,0 +1,27 @@
+name: Feature Request
+description: Suggest an improvement or new export option
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the manufacturing or documentation workflow you want KiForge to support.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      placeholder: "I need to export X because..."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
