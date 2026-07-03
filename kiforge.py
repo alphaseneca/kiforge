@@ -760,6 +760,106 @@ def get_global_settings_path() -> str:
     return os.path.join(xdg, "kiforge", "settings.json")
 
 
+# ---------------------------------------------------------------------------
+# Studio tab icons (wx-free — cache, CDN fetch, SVG tint for dark UI)
+# ---------------------------------------------------------------------------
+
+TAB_ICON_CDN = {
+    "export": "file_download",
+    "advanced": "tune",
+    "releases": "label",
+}
+TAB_ICON_CDN_URL = (
+    "https://fonts.gstatic.com/s/i/short-term/release/"
+    "materialsymbolsoutlined/{icon}/default/24px.svg"
+)
+TAB_ICON_TINT_COLOUR = "#e4e4e7"
+
+
+def tab_icon_cache_dir() -> str:
+    path = os.path.join(os.path.dirname(get_global_settings_path()), "icon_cache")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _tab_icon_cache_path(tab_name: str) -> str:
+    return os.path.join(tab_icon_cache_dir(), f"{tab_name}.svg")
+
+
+def read_cached_tab_icon_svg(tab_name: str) -> bytes | None:
+    path = _tab_icon_cache_path(tab_name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+        return data if data.strip().startswith(b"<svg") else None
+    except OSError as exc:
+        logger.warning("Failed to read cached tab icon %s: %s", tab_name, exc)
+        return None
+
+
+def write_cached_tab_icon_svg(tab_name: str, data: bytes) -> None:
+    if not data.strip().startswith(b"<svg"):
+        return
+    try:
+        with open(_tab_icon_cache_path(tab_name), "wb") as handle:
+            handle.write(data)
+    except OSError as exc:
+        logger.warning("Failed to cache tab icon %s: %s", tab_name, exc)
+
+
+def download_tab_icon_svg(tab_name: str) -> bytes | None:
+    icon_id = TAB_ICON_CDN.get(tab_name)
+    if not icon_id:
+        return None
+    url = TAB_ICON_CDN_URL.format(icon=icon_id)
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "KiForge-Studio/1.0"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = response.read()
+        if data.strip().startswith(b"<svg"):
+            write_cached_tab_icon_svg(tab_name, data)
+            return data
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        logger.warning("Tab icon CDN fetch failed for %s: %s", tab_name, exc)
+    return None
+
+
+def fetch_tab_icon_svg(tab_name: str) -> bytes | None:
+    """Return tab icon SVG from disk cache, refreshing from CDN when missing."""
+    cached = read_cached_tab_icon_svg(tab_name)
+    if cached:
+        return cached
+    return download_tab_icon_svg(tab_name)
+
+
+def prepare_tab_icon_svg(svg_data: bytes) -> bytes:
+    """
+    Tint Material Symbol SVGs for dark notebook tabs.
+
+    CDN SVGs omit ``fill``; wx rasterizes them as black on dark backgrounds.
+    """
+    try:
+        text = svg_data.decode("utf-8")
+    except UnicodeDecodeError:
+        return svg_data
+    colour = TAB_ICON_TINT_COLOUR
+    text = text.replace("currentColor", colour)
+    if re.search(r"<path[^>]*\sfill=", text, re.I):
+        text = re.sub(
+            r'(<path[^>]*\s)fill="[^"]*"',
+            rf'\1fill="{colour}"',
+            text,
+            flags=re.I,
+        )
+    else:
+        text = re.sub(r"<path\s+", f'<path fill="{colour}" ', text, flags=re.I)
+    if 'fill="' not in text.split(">", 1)[0]:
+        text = re.sub(r"<svg\s+", f'<svg fill="{colour}" ', text, count=1)
+    return text.encode("utf-8")
+
+
 def _coerce_setting_value(default, value):
     if isinstance(default, bool) and isinstance(value, str):
         return value.lower() == "true"

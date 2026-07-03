@@ -1084,65 +1084,63 @@ class TestKiForgeCLI(unittest.TestCase):
     def test_tab_icon_svg_cache_round_trip(self):
         """Tab icons are cached as SVG beside global KiForge settings."""
         from unittest.mock import patch
-        from plugins import kiforge_studio
 
         sample_svg = (
             b'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">'
             b'<path d="M0 0h24v24H0z"/></svg>'
         )
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(kiforge_studio, "_icon_cache_dir", return_value=tmp):
-                kiforge_studio._write_cached_icon_svg("export", sample_svg)
-                loaded = kiforge_studio._read_cached_icon_svg("export")
+            with patch.object(kiforge, "tab_icon_cache_dir", return_value=tmp):
+                kiforge.write_cached_tab_icon_svg("export", sample_svg)
+                loaded = kiforge.read_cached_tab_icon_svg("export")
                 self.assertEqual(loaded, sample_svg)
 
     def test_prepare_tab_icon_svg_adds_light_fill(self):
         """CDN SVGs without fill are tinted for dark tab backgrounds."""
-        from plugins import kiforge_studio
-
         raw = (
             b'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">'
             b'<path d="M0 0h24v24H0z"/></svg>'
         )
-        prepared = kiforge_studio._prepare_tab_icon_svg(raw)
+        prepared = kiforge.prepare_tab_icon_svg(raw)
         self.assertIn(b'fill="#e4e4e7"', prepared)
         with_path_fill = (
             b'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">'
             b'<path fill="#000000" d="M0 0h24v24H0z"/></svg>'
         )
-        self.assertIn(b'fill="#e4e4e7"', kiforge_studio._prepare_tab_icon_svg(with_path_fill))
-        self.assertNotIn(b'fill="#000000"', kiforge_studio._prepare_tab_icon_svg(with_path_fill))
+        self.assertIn(b'fill="#e4e4e7"', kiforge.prepare_tab_icon_svg(with_path_fill))
+        self.assertNotIn(b'fill="#000000"', kiforge.prepare_tab_icon_svg(with_path_fill))
 
     def test_tab_icon_cdn_download_cached(self):
         """CDN icon fetch writes SVG into the local cache."""
         from unittest.mock import MagicMock, patch
-        from plugins import kiforge_studio
 
         sample_svg = (
             b'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">'
             b'<path d="M0 0h24v24H0z"/></svg>'
         )
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(kiforge_studio, "_icon_cache_dir", return_value=tmp):
+            with patch.object(kiforge, "tab_icon_cache_dir", return_value=tmp):
                 mock_resp = MagicMock()
                 mock_resp.read.return_value = sample_svg
                 mock_resp.__enter__.return_value = mock_resp
                 mock_resp.__exit__.return_value = False
                 with patch.object(
-                    kiforge_studio.urllib.request,
+                    kiforge.urllib.request,
                     "urlopen",
                     return_value=mock_resp,
                 ):
-                    data = kiforge_studio._download_icon_svg("export")
+                    data = kiforge.download_tab_icon_svg("export")
                 self.assertEqual(data, sample_svg)
-                self.assertEqual(kiforge_studio._read_cached_icon_svg("export"), sample_svg)
+                self.assertEqual(kiforge.read_cached_tab_icon_svg("export"), sample_svg)
 
     def test_destroy_progress_dialog_tolerates_none(self):
         """Progress dialog teardown must not raise when no dialog exists."""
         try:
             from plugins import kiforge_studio
-        except ImportError:
-            self.skipTest("plugins package not available")
+        except ModuleNotFoundError as exc:
+            if exc.name == "wx":
+                self.skipTest("wxPython not installed")
+            raise
         kiforge_studio._destroy_progress_dialog(None)
 
 

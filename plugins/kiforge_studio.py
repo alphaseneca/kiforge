@@ -29,12 +29,9 @@ Registration
 # pyrefly: ignore [missing-import]
 import sys
 import os
-import re
 import threading
 import time
 import logging
-import urllib.error
-import urllib.request
 
 # pyrefly: ignore [missing-import]
 import wx
@@ -85,7 +82,6 @@ _COLORS = {
 }
 
 _BUTTON_RADIUS = 6
-_TAB_ICON_COLOUR = "#e4e4e7"  # light zinc — Material Symbols default to black without fill
 
 
 class _FlatButton(wx.Panel):
@@ -326,103 +322,8 @@ _EXPORT_TOGGLE_KEYS = (
 )
 
 _TAB_ICON_NAMES = ("export", "advanced", "releases")
-# Google Material Symbols Outlined (fonts.gstatic.com) — downloaded once, cached locally.
-_TAB_ICON_CDN = {
-    "export": "file_download",
-    "advanced": "tune",
-    "releases": "label",
-}
-_CDN_SVG_URL = (
-    "https://fonts.gstatic.com/s/i/short-term/release/"
-    "materialsymbolsoutlined/{icon}/default/24px.svg"
-)
 _TAB_ICON_RASTER_SIZE = 48
 _tab_icon_bitmap_cache: dict[tuple[str, int], wx.Bitmap] = {}
-
-
-def _icon_cache_dir() -> str:
-    path = os.path.join(os.path.dirname(kiforge.get_global_settings_path()), "icon_cache")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def _icon_cache_path(tab_name: str) -> str:
-    return os.path.join(_icon_cache_dir(), f"{tab_name}.svg")
-
-
-def _read_cached_icon_svg(tab_name: str) -> bytes | None:
-    path = _icon_cache_path(tab_name)
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, "rb") as handle:
-            data = handle.read()
-        return data if data.strip().startswith(b"<svg") else None
-    except Exception as exc:
-        logger.warning("Failed to read cached tab icon %s: %s", tab_name, exc)
-        return None
-
-
-def _write_cached_icon_svg(tab_name: str, data: bytes) -> None:
-    if not data.strip().startswith(b"<svg"):
-        return
-    try:
-        with open(_icon_cache_path(tab_name), "wb") as handle:
-            handle.write(data)
-    except Exception as exc:
-        logger.warning("Failed to cache tab icon %s: %s", tab_name, exc)
-
-
-def _download_icon_svg(tab_name: str) -> bytes | None:
-    icon_id = _TAB_ICON_CDN.get(tab_name)
-    if not icon_id:
-        return None
-    url = _CDN_SVG_URL.format(icon=icon_id)
-    try:
-        request = urllib.request.Request(url, headers={"User-Agent": "KiForge-Studio/1.0"})
-        with urllib.request.urlopen(request, timeout=10) as response:
-            data = response.read()
-        if data.strip().startswith(b"<svg"):
-            _write_cached_icon_svg(tab_name, data)
-            return data
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        logger.warning("Tab icon CDN fetch failed for %s: %s", tab_name, exc)
-    return None
-
-
-def _fetch_icon_svg(tab_name: str) -> bytes | None:
-    """Return tab icon SVG from disk cache, refreshing from CDN when missing."""
-    cached = _read_cached_icon_svg(tab_name)
-    if cached:
-        return cached
-    return _download_icon_svg(tab_name)
-
-
-def _prepare_tab_icon_svg(svg_data: bytes) -> bytes:
-    """
-    Tint Material Symbol SVGs for dark notebook tabs.
-
-    CDN SVGs omit ``fill``; wx rasterizes them as black, which is invisible on
-    dark backgrounds. Force a light fill before :class:`wx.BitmapBundle.FromSVG`.
-    """
-    try:
-        text = svg_data.decode("utf-8")
-    except UnicodeDecodeError:
-        return svg_data
-    colour = _TAB_ICON_COLOUR
-    text = text.replace("currentColor", colour)
-    if re.search(r"<path[^>]*\sfill=", text, re.I):
-        text = re.sub(
-            r'(<path[^>]*\s)fill="[^"]*"',
-            rf'\1fill="{colour}"',
-            text,
-            flags=re.I,
-        )
-    else:
-        text = re.sub(r"<path\s+", f'<path fill="{colour}" ', text, flags=re.I)
-    if 'fill="' not in text.split(">", 1)[0]:
-        text = re.sub(r"<svg\s+", f'<svg fill="{colour}" ', text, count=1)
-    return text.encode("utf-8")
 
 
 def _load_tab_icon_bitmap(name: str, size: int = 20) -> wx.Bitmap | None:
@@ -432,12 +333,12 @@ def _load_tab_icon_bitmap(name: str, size: int = 20) -> wx.Bitmap | None:
         cached_bmp = _tab_icon_bitmap_cache[cache_key]
         return cached_bmp if cached_bmp.IsOk() else None
 
-    svg_data = _fetch_icon_svg(name)
+    svg_data = kiforge.fetch_tab_icon_svg(name)
     if not svg_data:
         _tab_icon_bitmap_cache[cache_key] = wx.Bitmap()
         return None
     try:
-        tinted = _prepare_tab_icon_svg(svg_data)
+        tinted = kiforge.prepare_tab_icon_svg(svg_data)
         bundle = wx.BitmapBundle.FromSVG(tinted, (_TAB_ICON_RASTER_SIZE, _TAB_ICON_RASTER_SIZE))
         bitmap = bundle.GetBitmap(wx.Size(size, size))
         _tab_icon_bitmap_cache[cache_key] = bitmap
@@ -577,9 +478,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """Warm the icon cache from CDN without blocking dialog construction."""
         def worker():
             for name in _TAB_ICON_NAMES:
-                if _read_cached_icon_svg(name):
+                if kiforge.read_cached_tab_icon_svg(name):
                     continue
-                _download_icon_svg(name)
+                kiforge.download_tab_icon_svg(name)
             wx.CallAfter(self._apply_notebook_icons)
 
         threading.Thread(target=worker, daemon=True).start()
