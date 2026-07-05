@@ -40,5 +40,6 @@ jobs:
         uses: https://github.com/softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          generate_release_notes: true
           files: kiforge_verify/*
+          overwrite: true
+          overwrite_files: true
