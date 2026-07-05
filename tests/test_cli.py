@@ -29,6 +29,22 @@ def _rmtree_force(path: str) -> None:
         shutil.rmtree(path, onerror=_onerror)
 
 
+def _without_github_actions_tag_env():
+    """
+    Ignore GITHUB_REF_NAME on tag-triggered workflows.
+
+    Release CI sets GITHUB_REF_TYPE=tag and GITHUB_REF_NAME=vX.Y.Z; local/git-tag
+    resolution tests must not inherit that tag.
+    """
+    from unittest.mock import patch
+
+    return patch.dict(
+        os.environ,
+        {"GITHUB_REF_TYPE": "branch", "GITHUB_REF_NAME": ""},
+        clear=False,
+    )
+
+
 class TestKiForgeCLI(unittest.TestCase):
     def test_default_arguments(self):
         """Verify default values are correctly parsed when no arguments are provided."""
@@ -871,7 +887,8 @@ class TestKiForgeCLI(unittest.TestCase):
             original_setup_logger = kiforge.setup_logger
             kiforge.setup_logger = lambda dir: None
             try:
-                self.assertTrue(context.resolve())
+                with _without_github_actions_tag_env():
+                    self.assertTrue(context.resolve())
             finally:
                 kiforge.setup_logger = original_setup_logger
             self.assertEqual(context.pcb_name, "myboard_v3.1.4")
@@ -1096,7 +1113,8 @@ class TestKiForgeCLI(unittest.TestCase):
             original_setup_logger = kiforge.setup_logger
             kiforge.setup_logger = lambda dir: None
             try:
-                self.assertTrue(context.resolve())
+                with _without_github_actions_tag_env():
+                    self.assertTrue(context.resolve())
             finally:
                 kiforge.setup_logger = original_setup_logger
             self.assertEqual(context.pcb_name, "myboard_v0.1.0")
@@ -1110,7 +1128,8 @@ class TestKiForgeCLI(unittest.TestCase):
                 context = kiforge.ExportContext(plain_dir, "out", {})
                 kiforge.setup_logger = lambda dir: None
                 try:
-                    self.assertTrue(context.resolve())
+                    with _without_github_actions_tag_env():
+                        self.assertTrue(context.resolve())
                 finally:
                     kiforge.setup_logger = original_setup_logger
                 self.assertEqual(context.pcb_name, "plain_v0.1.0")
