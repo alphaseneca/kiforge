@@ -303,3 +303,39 @@ python kiforge.py --generate-cd --project-path . --output-dir kiforge
 When Gerbers are enabled, drill export runs automatically so the Gerber ZIP always includes drill files. JLC formatting (`format_jlc`) and CD generation (`generate_cd`) default to on and can be disabled per run or in saved settings.
 
 Schematic title-block `(rev …)` sync is an export-runtime option (CLI / Studio Run Export / GitHub Action), not a saved setting. Studio auto-saves project config after a successful export.
+
+---
+
+## 8. PCM publishing (KiCad Plugin Manager)
+
+KiForge ships as a **PCM v2 plugin** (`com.github.alphaseneca.kiforge`). Publishing is split from the export pipeline on purpose: manufacturing exports are per-project; the plugin zip is a separate release artifact.
+
+### Two metadata layers
+
+| Layer | Location | Contents |
+| --- | --- | --- |
+| **Static manifest** | `metadata.json` in git | Identity: name, description, author, tags, resources. **`versions` must be `[]`.** |
+| **Repository manifest** | `dist/metadata.json` on each GitHub Release tag | Full version history with `download_url`, `download_sha256`, `download_size`, `install_size` |
+
+Git never stores hashes or version history. Tag push → `.github/workflows/release.yml` runs `package_plugin.py --version`, which chains the prior release’s `metadata.json` from GitHub, appends the new row, and uploads `dist/*`.
+
+### Three install surfaces
+
+| Surface | Consumer gets |
+| --- | --- |
+| **Plugin zip** | `plugins/kiforge.py` with `KIFORGE_ACTION_REF = alphaseneca/kiforge@vX.Y.Z` |
+| **Zip-embedded metadata** | Single `versions[]` row, no `download_*` (PCM install-from-file rule) |
+| **Custom PCM repo** | `repository.json` + `packages.json` + `resources.zip` on the release tag |
+
+When users generate CD workflows, `{{KIFORGE_ACTION_REF}}` in `templates/github-release.yml` and `templates/gitea-release.yml` resolves to the tag baked into their installed plugin — not `@main`.
+
+### Key functions and files
+
+| Piece | Role |
+| --- | --- |
+| `package_plugin.py` | Zip layout, hash chain, `dist/` artifacts, action-ref pinning |
+| `verify_release_pcm_artifacts()` | CI check: zip SHA/size matches `dist/packages.json` |
+| `PCM_SUBMISSION.md` | Release and official-catalog MR steps |
+| `schemas/README.md` | PCM v2 schema ownership table |
+
+Repo-root `kiforge.py` keeps `KIFORGE_ACTION_REF = @main` for contributors running `--generate-cd` from a git clone only; PCM users never receive that default.

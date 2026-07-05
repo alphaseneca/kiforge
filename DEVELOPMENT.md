@@ -81,9 +81,10 @@ python kiforge.py --generate-cd --project-path tests/sample_project --output-dir
 
 Templates live in `templates/github-release.yml` and `templates/gitea-release.yml`.
 KiForge substitutes `{{OUTPUT_DIR}}`, export toggles, `{{KIFORGE_ACTION_REF}}`, and
-`{{GITHUB_REF_NAME}}` when generating project workflows. `KIFORGE_ACTION_REF` defaults
-to `alphaseneca/kiforge@main`; switch it to a release tag (e.g. `@v1.0.0`) in
-`kiforge.py` once you publish a stable composite-action release.
+`{{GITHUB_REF_NAME}}` when generating project workflows. End users who install from a
+**PCM release zip** get `alphaseneca/kiforge@vX.Y.Z` baked in (see `PCM_SUBMISSION.md`).
+The `@main` default in repo-root `kiforge.py` is for **contributors** running
+`--generate-cd` from a git clone only — not a PCM install path.
 
 ## GitHub Actions (this repository)
 
@@ -99,53 +100,24 @@ Composite action layout:
 - `Dockerfile` — `kicad/kicad:10.0` + KiForge scripts + InteractiveHtmlBom
 - `kiforge.sh` — entrypoint inside the container
 
-When you publish a stable composite-action release, change `KIFORGE_ACTION_REF` in
-`kiforge.py` from `@main` to the release tag (e.g. `alphaseneca/kiforge@v1.0.0`).
+Release plugin zips pin `KIFORGE_ACTION_REF` at package time (see `PCM_SUBMISSION.md`).
 
 ## Plugin packaging
 
-KiForge uses **KiCad PCM schema v2** (KiCad 10+). The official schema is vendored at
-`schemas/pcm.v2.schema.json` (upstream:
-[pcm.v2.schema.json](https://gitlab.com/kicad/code/kicad/-/raw/master/kicad/pcm/schemas/pcm.v2.schema.json)).
+PCM publishing (releases, GitLab submission, user install URLs): **[PCM_SUBMISSION.md](PCM_SUBMISSION.md)**.
+
+Schema reference: `schemas/README.md` and vendored `schemas/pcm.v2.schema.json`.
 
 ```bash
-# Local zip for Install from file in KiCad PCM
+# Local zip (contributors / Install from file smoke test)
 python package_plugin.py
 
-# KiCad → Plugin and Content Manager → Install from file… → dist/com.github.alphaseneca.kiforge.zip
+# Release build (same as tag CI — artifacts go to GitHub Release, not committed to git)
+python package_plugin.py --version vX.Y.Z
 
-# Release build (GitHub PCM URLs + updates metadata.json)
-python package_plugin.py --version v0.2.0
-# Upload dist/*.zip plus generated packages.json, repository.json, resources.zip
-# End users must use releases/latest/download/repository.json — not main-branch PCM files.
-
-# Optional: custom PCM host (only when you have a real static URL for dist/)
+# Optional custom PCM host
 python package_plugin.py --repo-base-url https://example.com/kiforge/
 ```
-
-The packager validates `metadata.json` for official PCM readiness (maintainer, resource links, stable release versions only — dev `0.0.0` is inserted at build time, not committed).
-
-## Official KiCad PCM repository submission
-
-KiForge targets the [KiCad official addons repository](https://dev-docs.kicad.org/en/addons/#_submission_to_the_official_repository). Requirements covered in this repo:
-
-| Requirement | Location |
-|---|---|
-| PCM v2 manifest | `metadata.json` |
-| Zip layout + archive metadata (no `download_*` in zip) | `package_plugin.py` |
-| Issue reporting | [GitHub Issues](https://github.com/alphaseneca/kiforge/issues) + `.github/ISSUE_TEMPLATE/` |
-| MIT license (GPL-compatible) | `LICENSE` |
-| Public release artifacts | `.github/workflows/release.yml` |
-
-### Submit a new release to KiCad
-
-1. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`
-2. Confirm the release workflow uploaded the zip and updated `metadata.json` hashes.
-3. Fork [kicad/addons/metadata](https://gitlab.com/kicad/addons/metadata) on GitLab.
-4. Copy `metadata.json` to `packages/com.github.alphaseneca.kiforge/metadata.json`.
-5. Open a merge request. Do **not** MR [kicad/addons/repository](https://gitlab.com/kicad/addons/repository) — it is updated automatically.
-
-Optional: attach `resources/icon.png` in the metadata MR directory if KiCad requests it.
 
 JLCPCB CSV formatting does not call fab APIs — no commercial-service email to KiCad is required.
 

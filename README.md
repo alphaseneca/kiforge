@@ -106,7 +106,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run KiForge
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: '.'
 
@@ -117,7 +117,7 @@ jobs:
           files: kiforge/*
 ```
 
-> Tip: Use the **Generate CD Files Only** button in the KiCad plugin to create this file automatically.
+> Tip: Use **KiForge Studio → Releases** (or **Generate CD Files Only**) to write this file with `uses: alphaseneca/kiforge@vX.Y.Z` matching your installed PCM plugin version.
 
 #### Triggering a release
 
@@ -160,7 +160,7 @@ Exports only what JLCPCB needs to manufacture and assemble: Gerbers, Drills, BOM
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: '.'
           export_3d: 'false'
@@ -178,7 +178,7 @@ Schematic PDF, 3D renders, and SVGs — no fabrication data.
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: '.'
           export_gerbers: 'false'
@@ -195,7 +195,7 @@ Schematic PDF, 3D renders, and SVGs — no fabrication data.
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: 'hardware/my-board'
           output_dir: 'hardware/my-board/kiforge'
@@ -378,11 +378,11 @@ python -m unittest tests/test_cli.py tests/test_studio.py -v
 # Unversioned (for local install / development)
 python package_plugin.py
 
-# Versioned release build (updates metadata.json automatically)
-python package_plugin.py --version v0.2.0
+# Versioned release build (see PCM_SUBMISSION.md — artifacts attach to the GitHub Release tag)
+python package_plugin.py --version vX.Y.Z
 ```
 
-Output: `dist/com.github.alphaseneca.kiforge-v0.2.0.zip`
+Output: `dist/com.github.alphaseneca.kiforge-vX.Y.Z.zip`
 
 ### Adding a new export task
 

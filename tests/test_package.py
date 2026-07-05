@@ -130,24 +130,45 @@ class TestPackagePlugin(unittest.TestCase):
             manifest_path.write_text(original, encoding="utf-8")
 
     def test_package_manifest_official_submission_fields(self):
-        """Committed metadata.json includes maintainer and PCM resource links."""
+        """Committed metadata.json includes author and PCM resource links."""
         manifest = package_plugin._load_package_manifest()
-        self.assertIn("maintainer", manifest)
+        self.assertIn("author", manifest)
         self.assertLessEqual(
             len(manifest["description"]),
             package_plugin.PCM_MAX_DESCRIPTION_LENGTH,
         )
         for key in package_plugin._REQUIRED_RESOURCE_KEYS:
             self.assertIn(key, manifest["resources"])
-        self.assertIn("documentation", manifest["description_full"].lower())
 
-    def test_committed_manifest_has_no_dev_version(self):
-        """Official metadata lists stable releases only; 0.0.0 is build-time only."""
+    def test_committed_manifest_versions_empty(self):
+        """Version rows live in release CI output only; git keeps versions: []."""
         manifest = package_plugin._load_package_manifest()
-        versions = [v["version"] for v in manifest["versions"]]
-        self.assertNotIn(package_plugin.LOCAL_DEV_VERSION, versions)
-        for row in manifest["versions"]:
-            self.assertEqual(row["status"], "stable")
+        self.assertEqual(manifest["versions"], [])
+
+    def test_pcm_icon_files_exist(self):
+        """PCM zip and resources.zip require committed plugin and listing icons."""
+        for rel in ("plugins/icon.png", "resources/icon.png"):
+            path = Path(rel)
+            self.assertTrue(path.is_file(), f"Missing {rel}")
+            self.assertGreater(path.stat().st_size, 0, f"Empty {rel}")
+
+    def test_versioned_zip_pins_action_ref(self):
+        """Release zips pin KIFORGE_ACTION_REF to the release tag, not @main."""
+        zip_path = package_plugin.package_plugin(version="v9.9.9")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            source = zf.read("plugins/kiforge.py").decode("utf-8")
+        self.assertIn('KIFORGE_ACTION_REF = "alphaseneca/kiforge@v9.9.9"', source)
+        self.assertNotIn("@main", source)
+
+    def test_release_repository_json_uses_tag_urls(self):
+        """Tag release repository.json points at that tag's packages.json, not @main."""
+        package_plugin.package_plugin(version="v9.9.8")
+        with open(Path("dist") / "repository.json", encoding="utf-8") as f:
+            repo = json.load(f)
+        self.assertIn(
+            "https://github.com/alphaseneca/kiforge/releases/download/v9.9.8/packages.json",
+            repo["packages"]["url"],
+        )
 
     def test_installed_layout_resolves_templates(self):
         """Simulate PCM install layout and verify template lookup works."""

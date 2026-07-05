@@ -4,17 +4,25 @@ KiCad Plugin Packaging Script for KiForge
 =========================================
 
 Builds the PCM (Plugin and Content Manager) zip in ``dist/``. Uses **PCM schema v2**
-(KiCad 10+). Release builds also emit ``packages.json``, ``repository.json``, and
-``resources.zip`` for GitHub or an explicit custom host.
+(KiCad 10+).
 
-``metadata.json`` is the committed package manifest (static v2 fields). The
-packager validates it and only overwrites build-derived ``download_*`` fields
-for release or custom-host builds — see ``schemas/README.md``.
+**First principles — two metadata layers:**
+
+1. **Git** — ``metadata.json`` holds static package identity only (``versions: []``).
+   Never commit ``download_*`` fields or version history.
+2. **Release CI** — on tag push, fetches the prior GitHub Release ``metadata.json``,
+   appends the new version row (measured zip hash/size), writes ``dist/metadata.json``,
+   ``dist/packages.json``, ``dist/repository.json``, and ``dist/resources.zip``.
+   The release workflow uploads ``dist/*`` only.
+
+Release plugin zips also pin ``KIFORGE_ACTION_REF`` to ``alphaseneca/kiforge@vX.Y.Z``.
+
+Operational steps: ``PCM_SUBMISSION.md``. Schema detail: ``schemas/README.md``.
 
 Usage::
 
     python package_plugin.py                     # local zip (Install from file in PCM)
-    python package_plugin.py --version v0.2.0    # release build + GitHub PCM URLs
+    python package_plugin.py --version vX.Y.Z    # release build → dist/ artifacts
     python package_plugin.py --repo-base-url https://example.com/kiforge/
     python package_plugin.py clean               # wipe dist/
 
@@ -24,12 +32,15 @@ the zip (not committed under ``plugins/templates/`` in git).
 """
 
 import os
+import re
 import sys
 import json
 import hashlib
 import zipfile
 import shutil
 import copy
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -62,7 +73,6 @@ _REQUIRED_PACKAGE_FIELDS = (
     "description",
     "description_full",
     "author",
-    "maintainer",
     "license",
     "resources",
     "tags",
@@ -70,9 +80,6 @@ _REQUIRED_PACKAGE_FIELDS = (
 )
 
 _REQUIRED_RESOURCE_KEYS = ("homepage", "documentation", "issues")
-
-# PCM v2 PackageVersion — required on each committed version row (download_* filled at build).
-_REQUIRED_VERSION_FIELDS = ("version", "status", "kicad_version", "platforms")
 
 # Keys that belong in repository metadata only — never in the zip-embedded metadata.json
 # (KiCad official PCM submission requirement).
@@ -188,8 +195,8 @@ def verify_release_pcm_artifacts(version_tag: str, base_dir: Path | str = ".") -
     base = Path(base_dir)
     version = version_tag.lstrip("v")
     zip_path = base / "dist" / f"com.github.alphaseneca.kiforge-{version_tag}.zip"
-    packages_path = base / "packages.json"
-    repo_path = base / "repository.json"
+    packages_path = base / "dist" / "packages.json"
+    repo_path = base / "dist" / "repository.json"
 
     if not zip_path.is_file():
         raise SystemExit(f"Release zip not found: {zip_path}")
@@ -263,20 +270,96 @@ def _download_url(version: str | None, zip_name: str, repo_base_url: str, use_gi
     return f"{_normalize_repo_base(repo_base_url)}{zip_name}"
 
 
-def _repository_asset_urls(repo_base_url: str, use_github: bool) -> tuple[str, str]:
+def _repository_asset_urls(
+    repo_base_url: str,
+    use_github: bool,
+    release_tag: str | None = None,
+) -> tuple[str, str]:
     if use_github:
-        base = f"https://github.com/{GITHUB_REPO}/releases/latest/download"
+        if release_tag:
+            base = f"https://github.com/{GITHUB_REPO}/releases/download/{release_tag}"
+        else:
+            base = f"https://github.com/{GITHUB_REPO}/releases/latest/download"
         return f"{base}/packages.json", f"{base}/resources.zip"
     base = _normalize_repo_base(repo_base_url).rstrip("/")
     return f"{base}/packages.json", f"{base}/resources.zip"
+
+
+def _pin_action_ref_in_plugin(release_tag: str) -> None:
+    """Pin KIFORGE_ACTION_REF in the packaged plugin to this release tag (not @main)."""
+    plugin_path = Path("plugins/kiforge.py")
+    action_ref = f"alphaseneca/kiforge@{release_tag}"
+    text = plugin_path.read_text(encoding="utf-8")
+    updated, count = re.subn(
+        r'KIFORGE_ACTION_REF = "[^"]+"',
+        f'KIFORGE_ACTION_REF = "{action_ref}"',
+        text,
+        count=1,
+    )
+    if count != 1:
+        raise SystemExit(
+            "PCM build failed: could not pin KIFORGE_ACTION_REF in plugins/kiforge.py"
+        )
+    plugin_path.write_text(updated, encoding="utf-8")
+    print(f"  Pinned KIFORGE_ACTION_REF -> {action_ref}")
+
+
+def _fetch_latest_release_metadata() -> dict | None:
+    """
+    Load repository metadata from the latest GitHub Release asset.
+
+    Chains version history across tags without committing metadata.json to main.
+    """
+    url = f"https://github.com/{GITHUB_REPO}/releases/latest/download/metadata.json"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        _validate_package_manifest(data)
+        print(f"  Loaded version history from latest GitHub Release metadata.json")
+        return data
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, SystemExit) as exc:
+        print(f"  Note: no prior release metadata ({exc}); using committed metadata.json")
+        return None
+
+
+def _load_package_manifest_for_release(version: str | None) -> dict:
+    """
+    Base manifest for a versioned release build.
+
+    Prefers the latest release metadata.json (version chain), then overlays static
+    fields from the committed metadata.json in the tagged commit.
+    """
+    if not version:
+        return _load_package_manifest()
+
+    fetched = _fetch_latest_release_metadata()
+    if not fetched:
+        return _load_package_manifest()
+
+    if PACKAGE_MANIFEST_PATH.is_file():
+        with open(PACKAGE_MANIFEST_PATH, "r", encoding="utf-8") as f:
+            committed = json.load(f)
+        for key in (
+            "description", "description_full", "tags", "author",
+            "resources", "category", "license", "name",
+        ):
+            if committed.get(key) is not None:
+                fetched[key] = committed[key]
+
+    _validate_package_manifest(fetched)
+    return fetched
 
 
 def _load_package_manifest() -> dict:
     """
     Load and validate the committed PCM v2 package manifest (metadata.json).
 
-    Static package fields (name, tags, author, …) must be authored in the file.
-    The packager only overwrites build-derived download_* fields per version.
+    Static package fields only — ``versions`` must be ``[]`` in git. Release CI
+    chains prior rows from GitHub Release assets and writes full metadata to dist/.
     """
     if not PACKAGE_MANIFEST_PATH.is_file():
         raise SystemExit(f"{PACKAGE_MANIFEST_PATH} not found — cannot build PCM repository files.")
@@ -316,21 +399,11 @@ def _validate_package_manifest(manifest: dict) -> None:
         )
 
     for index, version_row in enumerate(manifest.get("versions", [])):
-        row_missing = [key for key in _REQUIRED_VERSION_FIELDS if key not in version_row]
-        if row_missing:
-            raise SystemExit(
-                f"{PACKAGE_MANIFEST_PATH} versions[{index}] missing: {', '.join(row_missing)}"
-            )
-        if version_row.get("version") == LOCAL_DEV_VERSION:
-            raise SystemExit(
-                f"{PACKAGE_MANIFEST_PATH} must not list dev version {LOCAL_DEV_VERSION!r}; "
-                "local builds insert it at pack time only."
-            )
-        if version_row.get("status") != "stable":
-            raise SystemExit(
-                f"{PACKAGE_MANIFEST_PATH} versions[{index}] must use status \"stable\" "
-                f"for official-ready releases (got {version_row.get('status')!r})."
-            )
+        raise SystemExit(
+            f"{PACKAGE_MANIFEST_PATH} must keep \"versions\": []. "
+            f"Found versions[{index}] in git — release CI appends version rows to "
+            "dist/metadata.json only."
+        )
 
 
 def _build_version_entry(
@@ -413,6 +486,7 @@ def _generate_pcm_repository_files(
     output_dir: Path,
     repo_base_url: str,
     use_github: bool,
+    release_tag: str | None = None,
 ) -> tuple[Path, Path, Path]:
     """
     Write packages.json, repository.json, and resources.zip for KiCad PCM custom repos.
@@ -438,13 +512,16 @@ def _generate_pcm_repository_files(
 
     with zipfile.ZipFile(resources_zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         icon_path = Path("resources/icon.png")
-        if icon_path.exists():
-            zipf.write(icon_path, f"{meta['identifier']}/icon.png")
-        else:
-            print("  Warning: resources/icon.png not found!")
+        if not icon_path.is_file():
+            raise SystemExit(
+                "PCM build failed: resources/icon.png is required (64x64 PCM listing icon)."
+            )
+        zipf.write(icon_path, f"{meta['identifier']}/icon.png")
 
     resources_sha256 = _sha256(resources_zip_path)
-    packages_url, resources_url = _repository_asset_urls(repo_base_url, use_github)
+    packages_url, resources_url = _repository_asset_urls(
+        repo_base_url, use_github, release_tag=release_tag,
+    )
 
     contact = meta.get("maintainer") or meta.get("author", {})
     maintainer_name = contact.get("name", "KiForge Maintainer")
@@ -544,6 +621,8 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
 
     print("Copying root kiforge.py to plugins/kiforge.py...")
     shutil.copy2("kiforge.py", "plugins/kiforge.py")
+    if version:
+        _pin_action_ref_in_plugin(version)
 
     template_dir = Path("templates")
     if not template_dir.is_dir():
@@ -577,6 +656,11 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
                 if os.path.exists(local_path):
                     zipf.write(local_path, arc_path)
                     print(f"  Added: {Path(local_path).as_posix()} -> {arc_path}")
+                elif local_path.endswith("icon.png"):
+                    raise SystemExit(
+                        f"PCM build failed: missing required icon {local_path!r} "
+                        "(plugins/icon.png toolbar icon; resources/icon.png PCM listing icon)."
+                    )
                 else:
                     print(f"  Warning: File not found: {local_path}")
 
@@ -586,7 +670,7 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
     install_size = _extract_install_size(zip_path)
     sha256 = _sha256(zip_path)
 
-    base_meta = _load_package_manifest()
+    base_meta = _load_package_manifest_for_release(version)
     pcm_meta = _manifest_with_build(
         base_meta, version, zip_name, sha256, download_size, install_size,
         resolved_repo_base, use_github, include_download_fields=emit_pcm_repository,
@@ -639,7 +723,7 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
     repo_path = None
     if emit_pcm_repository:
         packages_path, repo_path, resources_path = _generate_pcm_repository_files(
-            pcm_meta, output_dir, resolved_repo_base, use_github,
+            pcm_meta, output_dir, resolved_repo_base, use_github, release_tag=version,
         )
         print(f"\npackages.json SHA-256:   {_sha256(packages_path)}")
         print(f"resources.zip SHA-256:   {_sha256(resources_path)}")
@@ -658,17 +742,19 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
     )
 
     if version:
-        metadata_path = PACKAGE_MANIFEST_PATH
-        with open(metadata_path, "w", encoding="utf-8") as f:
+        # Full repository metadata for this tag — dist/ only (never overwrite committed metadata.json).
+        release_meta_path = output_dir / "metadata.json"
+        with open(release_meta_path, "w", encoding="utf-8") as f:
             json.dump(pcm_meta, f, indent=4)
             f.write("\n")
-        print(f"\nmetadata.json updated for release version {version.lstrip('v')}.")
-
-        root_packages, root_repo, root_resources = _generate_pcm_repository_files(
-            pcm_meta, Path("."), resolved_repo_base, use_github=True,
+        print(
+            f"\nRepository metadata written to {release_meta_path} "
+            f"(upload as a GitHub Release asset; not committed to git)."
         )
-        print(f"Release PCM copies also written to repo root ({root_packages.name}, "
-              f"{root_repo.name}, {root_resources.name}) for GitHub upload.")
+        print(
+            f"  Tag-pinned PCM URL: "
+            f"https://github.com/{GITHUB_REPO}/releases/download/{version}/repository.json"
+        )
 
     return zip_path
 

@@ -179,7 +179,8 @@ logger = logging.getLogger("KiForge.Core")
 
 KIFORGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# Default composite-action reference for generated CD workflows (branch until stable tag).
+# Default composite-action ref for CD workflows generated from a dev/git checkout.
+# Release plugin zips pin this to alphaseneca/kiforge@<tag> at package time (see package_plugin.py).
 KIFORGE_ACTION_REF = "alphaseneca/kiforge@main"
 
 # ---------------------------------------------------------------------------

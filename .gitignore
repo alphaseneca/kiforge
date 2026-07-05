@@ -6,6 +6,7 @@ __pycache__/
 .history/
 kiforge_out/
 dist/
+# PCM release build outputs (package_plugin.py --version); never commit
 packages.json
 repository.json
 resources.zip

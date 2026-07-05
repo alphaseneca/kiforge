@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run KiForge
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: '.'
 
@@ -43,7 +43,7 @@ jobs:
           files: kiforge/*
 ```
 
-> KiForge workflows default to `alphaseneca/kiforge@main`. Pin to a release tag (e.g. `@v1.0.0`) from the [releases page](https://github.com/alphaseneca/kiforge/releases) once you want a fixed stable action version.
+> If you install KiForge from PCM, **Generate CD Files** in Studio writes `uses: alphaseneca/kiforge@vX.Y.Z` for the plugin version you installed. When editing YAML by hand, pin the same [release tag](https://github.com/alphaseneca/kiforge/releases) as your KiForge plugin — do not use `@main`.
 
 ---
 
@@ -138,7 +138,7 @@ Exports only what JLCPCB needs to manufacture and assemble your board: Gerbers, 
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: '.'
           export_3d: 'false'
@@ -156,7 +156,7 @@ Exports the schematic PDF, 3D renders, and SVGs — no fabrication data.
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: '.'
           export_gerbers: 'false'
@@ -175,7 +175,7 @@ Useful for sharing a reviewable board layout alongside fabrication files.
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: '.'
           export_3d: 'false'
@@ -194,7 +194,7 @@ If your KiCad project is not in the repository root:
 
 ```yaml
       - name: Run KiForge
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: 'hardware/my-board'
           output_dir: 'hardware/my-board/kiforge'
@@ -225,7 +225,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run KiForge Exporter
-        uses: alphaseneca/kiforge@main
+        uses: alphaseneca/kiforge@vX.Y.Z
         with:
           project_path: '.'
           output_dir: 'kiforge'
