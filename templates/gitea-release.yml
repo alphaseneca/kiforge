@@ -39,6 +39,7 @@ jobs:
           pos_smd_only: '{{POS_SMD_ONLY}}'
           pos_exclude_dnp: '{{POS_EXCLUDE_DNP}}'
           step_subst_models: '{{STEP_SUBST_MODELS}}'
+          bom_include_mfr_mpn: '{{BOM_INCLUDE_MFR_MPN}}'
           sync_title_block_rev: '{{SYNC_TITLE_BLOCK_REV}}'
 
       - name: Create release and upload assets

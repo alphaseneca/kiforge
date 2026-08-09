@@ -1,0 +1,628 @@
+# =============================================================================
+# Neoden PnP post-process
+# =============================================================================
+#
+# WHAT THIS DOES (on tag push v* or manual workflow_dispatch)
+#   KiForge "Manufacturing Release" runs first and uploads *_pos.csv to the Gitea
+#   release. This workflow then:
+#     1. Polls the release until *_pos.csv exists
+#     2. Downloads release assets
+#     3. Converts KiCad POS → Neoden CSV (same rules as restructedPosFileNeoden.py)
+#     4. Renders a front-copper reference PNG with origin crosshairs for machine align
+#     5. Uploads both files back onto the same release tag
+#
+# INSTALL
+#   Copy templates/gitea-pnp-neoden.yml →  <your-kicad-project>/.gitea/workflows/pnp-neoden.yml
+#
+# OUTPUTS (under pnp_out/, attached to release)
+#   {stem}_pos_neoden.csv    — Neoden pick-and-place file
+#   {stem}_pnp_ref_origin.png — front view + drill/place crosshair + grid marker
+#   {stem} = KiCad POS filename without _pos.csv (e.g. NiziDynamicPOSGeneral_v2.0.14)
+#
+# NEODEN CSV FORMAT
+#   KiCad column     → Neoden column
+#   Ref              → Designator
+#   Package          → Footprint
+#   PosX             → Mid X
+#   PosY             → Mid Y
+#   Side top/bottom  → Layer T/B
+#   Rot              → Rotation
+#   Val              → Comment
+#   Column order: Designator, Footprint, Mid X, Mid Y, Layer, Rotation, Comment
+#
+# ORIGIN PNG PIPELINE
+#   1. kicad-cli pcb export svg — F.Cu + F.SilkS + Edge.Cuts only
+#   2. Expand viewBox with padding (5% of board size, min 4 mm per side)
+#   3. If set in .kicad_pcb: overlay drill/place crosshair (aux_axis_origin) and/or grid marker (grid_origin). Missing origins → board PNG only.
+#   4. rsvg-convert → PNG (dark background #1e2a3a, 6× zoom)
+# =============================================================================
+
+name: Neoden PnP Post-Process
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to process (e.g. v1.2.3)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PNP_OUTPUT_DIR: pnp_out
+  RELEASE_WAIT_SEC: "30"
+  RELEASE_WAIT_MAX: "40"
+
+jobs:
+  neoden:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: https://github.com/actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          [ -n "$TAG" ] || { echo "No tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      - name: Wait for KiForge release assets
+        id: wait
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          API: ${{ vars.GITEA_API_URL || format('{0}/api/v1', github.server_url) }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.request
+
+          api = os.environ["API"].rstrip("/")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["TAG"]
+          token = os.environ["TOKEN"]
+          wait = int(os.environ.get("RELEASE_WAIT_SEC", "30"))
+          mx = int(os.environ.get("RELEASE_WAIT_MAX", "40"))
+
+          def release_url():
+              return f"{api}/repos/{repo}/releases/tags/{tag}"
+
+          def auth_json():
+              return {"Authorization": f"token {token}"}
+
+          for attempt in range(1, mx + 1):
+              try:
+                  req = urllib.request.Request(release_url(), headers=auth_json())
+                  with urllib.request.urlopen(req) as r:
+                      data = json.load(r)
+                  assets = data.get("assets") or data.get("attachments") or []
+                  pos = [a for a in assets if a["name"].endswith("_pos.csv")]
+                  if pos:
+                      print(f"Found release assets after attempt {attempt}: {pos[0]['name']}")
+                      with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                          out.write("ready=true\n")
+                      sys.exit(0)
+                  print(f"Attempt {attempt}/{mx}: release exists but no *_pos.csv yet ({len(assets)} assets)")
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      print(f"Attempt {attempt}/{mx}: release not created yet")
+                  else:
+                      raise
+              if attempt < mx:
+                  time.sleep(wait)
+
+          raise SystemExit("Timed out waiting for KiForge to publish *_pos.csv on the release")
+          PY
+
+      - name: Download necessary release assets
+        if: steps.wait.outputs.ready == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          API: ${{ vars.GITEA_API_URL || format('{0}/api/v1', github.server_url) }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p release_in
+          python3 - <<'PY'
+          import json, os, urllib.error, urllib.parse, urllib.request
+
+          api = os.environ["API"].rstrip("/")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["TAG"]
+          token = os.environ["TOKEN"]
+          out_dir = "release_in"
+
+          def auth_json():
+              return {"Authorization": f"token {token}"}
+
+          def auth_binary():
+              return {
+                  "Authorization": f"token {token}",
+                  "Accept": "application/octet-stream",
+              }
+
+          def with_token_query(url: str) -> list[str]:
+              if not url:
+                  return []
+              out = []
+              parsed = urllib.parse.urlparse(url)
+              for key in ("token", "access_token"):
+                  qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+                  qs[key] = [token]
+                  out.append(
+                      urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(qs, doseq=True)))
+                  )
+              return out
+
+          def download_bytes(url: str, binary: bool) -> bytes:
+              headers = auth_binary() if binary else auth_json()
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  return r.read()
+
+          def download_asset(release: dict, asset: dict) -> None:
+              name = asset["name"]
+              aid = asset["id"]
+              release_id = release["id"]
+              dest = os.path.join(out_dir, name)
+
+              candidates: list[tuple[str, bool]] = []
+              api_url = asset.get("url")
+              if api_url:
+                  candidates.append((api_url, True))
+              candidates.extend([
+                  (f"{api}/repos/{repo}/releases/{release_id}/assets/{aid}", True),
+                  (f"{api}/repos/{repo}/releases/attachments/{aid}", True),
+                  (f"{api}/repos/{repo}/releases/assets/{aid}", True),
+              ])
+              browser = asset.get("browser_download_url") or asset.get("download_url")
+              for u in with_token_query(browser):
+                  candidates.append((u, False))
+
+              last_err = None
+              for url, binary in candidates:
+                  try:
+                      data = download_bytes(url, binary)
+                      with open(dest, "wb") as f:
+                          f.write(data)
+                      print(f"Downloaded {name}")
+                      return
+                  except urllib.error.HTTPError as e:
+                      print(f"  HTTP {e.code} for {url.split('?')[0]}")
+                      last_err = e
+              raise last_err or RuntimeError(f"Could not download {name}")
+
+          url = f"{api}/repos/{repo}/releases/tags/{tag}"
+          req = urllib.request.Request(url, headers=auth_json())
+          with urllib.request.urlopen(req) as r:
+              release = json.load(r)
+
+          assets = release.get("assets") or release.get("attachments") or []
+          pos_assets = [a for a in assets if a["name"].endswith("_pos.csv")]
+          if not pos_assets:
+              raise SystemExit(f"No *_pos.csv in release (found: {[a['name'] for a in assets]})")
+
+          for asset in pos_assets:
+              download_asset(release, asset)
+          PY
+
+      - name: Locate necessary files
+        if: steps.wait.outputs.ready == 'true'
+        id: paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          POS="$(find release_in -name '*_pos.csv' | head -n1)"
+          PCB="$(find . -maxdepth 6 -name '*.kicad_pcb' ! -path './.git/*' | head -n1)"
+          [ -n "$POS" ] || { echo "No *_pos.csv in release_in"; exit 1; }
+          [ -n "$PCB" ] || { echo "No .kicad_pcb in checkout"; exit 1; }
+          STEM="$(basename "$POS" _pos.csv)"
+          echo "pos=$POS" >> "$GITHUB_OUTPUT"
+          echo "pcb=$PCB" >> "$GITHUB_OUTPUT"
+          echo "stem=$STEM" >> "$GITHUB_OUTPUT"
+          echo "POS=$POS  PCB=$PCB  STEM=$STEM"
+
+      - name: Convert KiCad position file to Neoden CSV file format
+        if: steps.wait.outputs.ready == 'true'
+        shell: bash
+        env:
+          POS_FILE: ${{ steps.paths.outputs.pos }}
+          FILE_STEM: ${{ steps.paths.outputs.stem }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$PNP_OUTPUT_DIR"
+
+          python3 - <<'PY'
+          import csv, os, re
+          from pathlib import Path
+
+          # Neoden expected column order 
+          OUT_COLS = ("Designator", "Footprint", "Mid X", "Mid Y", "Layer", "Rotation", "Comment")
+
+          def layer_t_b(side: str) -> str:
+              """KiCad Side 'top'/'bottom' → Neoden 'T'/'B' (case-insensitive)."""
+              s = (side or "").strip()
+              if re.search(r"(?i)bottom", s):
+                  return "B"
+              if re.search(r"(?i)top", s):
+                  return "T"
+              return "T"
+
+          stem = os.environ["FILE_STEM"]
+          pos = Path(os.environ["POS_FILE"])
+          out = Path(os.environ["PNP_OUTPUT_DIR"]) / f"{stem}_pos_neoden.csv"
+
+          with open(pos, newline="", encoding="utf-8-sig") as f:
+              raw_lines = [ln.strip() for ln in f if ln.strip()]
+
+          clean_lines = []
+          header_found = False
+          for line in raw_lines:
+              if line.startswith("#"):
+                  if not header_found and re.search(r"(?i)\b(ref|designator)\b", line):
+                      clean_lines.append(re.sub(r"^#+\s*", "", line))
+                      header_found = True
+                  continue
+              clean_lines.append(line)
+
+          delimiter = ","
+          if clean_lines:
+              header_line = clean_lines[0]
+              if ";" in header_line:
+                  delimiter = ";"
+              elif "\t" in header_line:
+                  delimiter = "\t"
+
+          rows = list(csv.DictReader(clean_lines, delimiter=delimiter))
+
+          out_rows = []
+          for r in rows:
+              row_keys = {k.strip().lower(): (v or "").strip() for k, v in r.items() if k}
+              ref = row_keys.get("ref") or row_keys.get("designator") or ""
+              if not ref:
+                  continue
+              footprint = row_keys.get("package") or row_keys.get("footprint") or ""
+              mid_x = row_keys.get("posx") or row_keys.get("mid x") or row_keys.get("x") or ""
+              mid_y = row_keys.get("posy") or row_keys.get("mid y") or row_keys.get("y") or ""
+              layer = layer_t_b(row_keys.get("side") or row_keys.get("layer") or "top")
+              rotation = row_keys.get("rot") or row_keys.get("rotation") or "0"
+              comment = row_keys.get("val") or row_keys.get("value") or row_keys.get("comment") or ""
+
+              out_rows.append({
+                  "Designator": ref,
+                  "Footprint": footprint,
+                  "Mid X": mid_x,
+                  "Mid Y": mid_y,
+                  "Layer": layer,
+                  "Rotation": rotation,
+                  "Comment": comment,
+              })
+
+          with open(out, "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=list(OUT_COLS))
+              w.writeheader()
+              w.writerows(out_rows)
+          print(f"Wrote {out} ({len(out_rows)} rows)")
+          PY
+
+      - name: Generate PnP origin alignment image
+        if: steps.wait.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v docker >/dev/null || { echo "ERROR: docker not found on runner"; exit 1; }
+
+          PCB="${{ steps.paths.outputs.pcb }}"
+          STEM="${{ steps.paths.outputs.stem }}"
+          OUT="$PNP_OUTPUT_DIR"
+          WS="${GITHUB_WORKSPACE:-$PWD}"
+          mkdir -p "$WS/$OUT"
+
+          CID="$(docker create kicad/kicad:10.0 tail -f /dev/null)"
+          cleanup() { docker rm -f "$CID" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker cp "$WS/." "$CID:/ws"
+          docker start "$CID" >/dev/null
+
+          docker exec -i -u root -w /ws "$CID" bash -s <<DOCKER_SCRIPT
+          set -euo pipefail
+          PCB='$PCB'
+          OUT='$OUT'
+          STEM='$STEM'
+          TMP=/tmp/kiforge_pnp
+          rm -rf "\$TMP"
+          mkdir -p "\$TMP" "\$OUT"
+          chmod -R a+rwX "\$OUT"
+
+          svg_raw="\$TMP/board.svg"
+          svg_marked="\$TMP/board_marked.svg"
+          final_png="\$OUT/\${STEM}_pnp_ref_origin.png"
+
+          kicad-cli pcb export svg \
+            --output "\$svg_raw" \
+            --layers "F.Cu,F.SilkS" \
+            --common-layers "Edge.Cuts" \
+            --fit-page-to-board \
+            --exclude-drawing-sheet \
+            --mode-single \
+            --drill-shape-opt 2 \
+            "\$PCB"
+
+          [ -f "\$svg_raw" ] || { echo 'ERROR: pcb export svg not produced'; exit 1; }
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends librsvg2-bin >/dev/null
+
+          python3 - "\$PCB" "\$svg_raw" "\$svg_marked" <<'PY'
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          COORD_RE = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
+          pcb_path, svg_in, svg_out = sys.argv[1:4]
+          pcb_text = Path(pcb_path).read_text(encoding='utf-8', errors='replace')
+
+          def parse_mm(v):
+              return float(v)
+
+          def parse_origin_mm(text, token):
+              m = re.search(rf'\({token}\s+({COORD_RE})\s+({COORD_RE})\)', text)
+              return None if not m else (parse_mm(m.group(1)), parse_mm(m.group(2)))
+
+          aux_mm = parse_origin_mm(pcb_text, 'aux_axis_origin')
+          grid_mm = parse_origin_mm(pcb_text, 'grid_origin')
+          has_aux = aux_mm is not None
+          has_grid = grid_mm is not None
+          if not has_aux and not has_grid:
+              print(
+                  'NOTE: no aux_axis_origin or grid_origin in .kicad_pcb — '
+                  'exporting board PNG without origin markers',
+                  flush=True,
+              )
+
+          area = re.search(
+              rf'\(general\b.*?\(area\s+({COORD_RE})\s+({COORD_RE})\s+'
+              rf'({COORD_RE})\s+({COORD_RE})\)',
+              pcb_text,
+              re.DOTALL,
+          )
+          if area:
+              x1, y1, x2, y2 = map(parse_mm, area.groups())
+              pcb_bbox = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+          else:
+              xs, ys = [], []
+              for block in re.finditer(
+                  r'\(gr_(?:rect|line|arc|circle|curve)\s+(.*?)\(layer\s+"Edge\.Cuts"\)',
+                  pcb_text,
+                  re.DOTALL,
+              ):
+                  for m in re.finditer(
+                      rf'\((?:start|end|center|mid|xy)\s+({COORD_RE})\s+({COORD_RE})\)',
+                      block.group(1),
+                  ):
+                      xs.append(parse_mm(m.group(1)))
+                      ys.append(parse_mm(m.group(2)))
+              if not xs:
+                  raise SystemExit('ERROR: could not determine board bounding box from PCB file')
+              pcb_bbox = (min(xs), min(ys), max(xs), max(ys))
+
+          xmin, ymin, xmax, ymax = pcb_bbox
+          board_w = max(xmax - xmin, 0.001)
+          board_h = max(ymax - ymin, 0.001)
+
+          tree = ET.parse(svg_in)
+          root = tree.getroot()
+          vb = (root.get('viewBox') or '0 0 0 0').split()
+          if len(vb) != 4:
+              raise SystemExit('ERROR: SVG viewBox missing')
+          vx, vy, vw, vh = map(float, vb)
+
+          # Padding: 5% of board size, minimum 4 mm each side (dark margin in PNG).
+          pad_mm = max(max(board_w, board_h) * 0.05, 4.0)
+          pad_x = pad_mm * (vw / board_w)
+          pad_y = pad_mm * (vh / board_h)
+          p_vx = vx - pad_x
+          p_vy = vy - pad_y
+          p_vw = vw + 2 * pad_x
+          p_vh = vh + 2 * pad_y
+
+          root.set('viewBox', f'{p_vx:.4f} {p_vy:.4f} {p_vw:.4f} {p_vh:.4f}')
+          w_attr = (root.get('width') or '').replace('mm', '').strip()
+          h_attr = (root.get('height') or '').replace('mm', '').strip()
+          try:
+              w_mm = float(w_attr)
+              h_mm = float(h_attr)
+              if w_mm > 0 and h_mm > 0:
+                  root.set('width', f'{w_mm * p_vw / vw:.4f}mm')
+                  root.set('height', f'{h_mm * p_vh / vh:.4f}mm')
+          except ValueError:
+              pass
+
+          # KiCad --fit-page-to-board: plot offset = board bbox origin (mm).
+          # KiCad SVG (m_yaxisReversed): svg = board_mm - plot_offset — no extra Y flip.
+          # Editor screen Y-down: visual bottom-left ≈ (xmin, ymax) in board mm.
+          sx = vw / board_w
+          sy = vh / board_h
+
+          def mm_to_svg(x_mm, y_mm):
+              return vx + (x_mm - xmin) * sx, vy + (y_mm - ymin) * sy
+
+          def mm_to_svg(x_mm, y_mm):
+              return vx + (x_mm - xmin) * sx, vy + (y_mm - ymin) * sy
+
+          if has_aux or has_grid:
+              ns_uri = 'http://www.w3.org/2000/svg'
+              ET.register_namespace('', ns_uri)
+              overlay = ET.Element(f'{{{ns_uri}}}g', {'id': 'pnp-origin-overlay'})
+
+              stroke = max(p_vw, p_vh) * 0.00055
+              halo = stroke * 1.6
+              arm = max(p_vw, p_vh) * 0.012
+
+              def add_line(x1, y1, x2, y2, color, width):
+                  ET.SubElement(
+                      overlay,
+                      f'{{{ns_uri}}}line',
+                      {
+                          'x1': f'{x1:.4f}',
+                          'y1': f'{y1:.4f}',
+                          'x2': f'{x2:.4f}',
+                          'y2': f'{y2:.4f}',
+                          'stroke': color,
+                          'stroke-width': f'{width:.4f}',
+                          'stroke-linecap': 'round',
+                      },
+                  )
+
+              def draw_crosshair(cx, cy, color, ring):
+                  add_line(p_vx, cy, p_vx + p_vw, cy, '#000000', halo)
+                  add_line(cx, p_vy, cx, p_vy + p_vh, '#000000', halo)
+                  add_line(p_vx, cy, p_vx + p_vw, cy, '#ffffff', stroke)
+                  add_line(cx, p_vy, cx, p_vy + p_vh, '#ffffff', stroke)
+                  ET.SubElement(
+                      overlay,
+                      f'{{{ns_uri}}}circle',
+                      {
+                          'cx': f'{cx:.4f}',
+                          'cy': f'{cy:.4f}',
+                          'r': f'{ring:.4f}',
+                          'fill': 'none',
+                          'stroke': '#000000',
+                          'stroke-width': f'{stroke * 1.4:.4f}',
+                      },
+                  )
+                  ET.SubElement(
+                      overlay,
+                      f'{{{ns_uri}}}circle',
+                      {
+                          'cx': f'{cx:.4f}',
+                          'cy': f'{cy:.4f}',
+                          'r': f'{ring:.4f}',
+                          'fill': 'none',
+                          'stroke': color,
+                          'stroke-width': f'{stroke:.4f}',
+                      },
+                  )
+                  add_line(cx - arm, cy, cx + arm, cy, color, stroke)
+                  add_line(cx, cy - arm, cx, cy + arm, color, stroke)
+                  ET.SubElement(
+                      overlay,
+                      f'{{{ns_uri}}}circle',
+                      {
+                          'cx': f'{cx:.4f}',
+                          'cy': f'{cy:.4f}',
+                          'r': f'{stroke * 0.8:.4f}',
+                          'fill': color,
+                          'stroke': 'none',
+                      },
+                  )
+
+              if has_aux:
+                  ax, ay = mm_to_svg(aux_mm[0], aux_mm[1])
+                  draw_crosshair(ax, ay, '#ff1493', arm * 0.45)
+
+              if has_grid:
+                  gx, gy = mm_to_svg(grid_mm[0], grid_mm[1])
+                  gap = max(p_vw, p_vh) * 0.007
+                  cell = gap * 0.38
+                  half = cell / 2
+                  for ix in (-1, 0, 1):
+                      for iy in (-1, 0, 1):
+                          cx = gx + ix * gap
+                          cy = gy + iy * gap
+                          if ix == 0 and iy == 0:
+                              ET.SubElement(
+                                  overlay,
+                                  f'{{{ns_uri}}}circle',
+                                  {
+                                      'cx': f'{cx:.4f}',
+                                      'cy': f'{cy:.4f}',
+                                      'r': f'{half:.4f}',
+                                      'fill': '#00ffff',
+                                      'stroke': 'none',
+                                  },
+                              )
+                          else:
+                              ET.SubElement(
+                                  overlay,
+                                  f'{{{ns_uri}}}rect',
+                                  {
+                                      'x': f'{cx - half:.4f}',
+                                      'y': f'{cy - half:.4f}',
+                                      'width': f'{cell:.4f}',
+                                      'height': f'{cell:.4f}',
+                                      'fill': 'none',
+                                      'stroke': '#00ffff',
+                                      'stroke-width': f'{stroke * 0.7:.4f}',
+                                  },
+                              )
+
+              root.append(overlay)
+
+          tree.write(svg_out, encoding='utf-8', xml_declaration=True)
+
+          print(
+              f'viewBox=({p_vx:.3f},{p_vy:.3f},{p_vw:.3f},{p_vh:.3f}) pad_mm={pad_mm:.2f} '
+              f'board_bbox=({xmin:.3f},{ymin:.3f})-({xmax:.3f},{ymax:.3f})'
+          )
+          if has_grid:
+              gx, gy = mm_to_svg(grid_mm[0], grid_mm[1])
+              print(
+                  f'Grid origin: board=({grid_mm[0]:.3f}, {grid_mm[1]:.3f}) mm -> '
+                  f'svg=({gx:.2f}, {gy:.2f})'
+              )
+          else:
+              print('Grid origin: not set in .kicad_pcb — marker skipped')
+          if has_aux:
+              ax, ay = mm_to_svg(aux_mm[0], aux_mm[1])
+              print(
+                  f'Drill/place origin: board=({aux_mm[0]:.3f}, {aux_mm[1]:.3f}) mm -> '
+                  f'svg=({ax:.2f}, {ay:.2f})'
+              )
+          else:
+              print('Drill/place origin: not set in .kicad_pcb — marker skipped')
+          PY
+
+          rsvg-convert -z 6 -b '#1e2a3a' -o "\$final_png" "\$svg_marked"
+
+          [ -f "\$final_png" ] || { echo 'ERROR: final PNG not produced'; exit 1; }
+          rm -rf "\$TMP"
+          ls -la "\$OUT"
+          DOCKER_SCRIPT
+
+          docker cp "$CID:/ws/$OUT/." "$WS/$OUT/"
+
+          PNG_OUT="$WS/$OUT/${STEM}_pnp_ref_origin.png"
+          [ -f "$PNG_OUT" ] || { echo "ERROR: $PNG_OUT missing after docker"; exit 1; }
+          ls -la "$WS/$OUT/"
+
+      - name: Attach files to release
+        if: steps.wait.outputs.ready == 'true'
+        uses: https://github.com/softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |-
+            pnp_out/${{ steps.paths.outputs.stem }}_pos_neoden.csv
+            pnp_out/${{ steps.paths.outputs.stem }}_pnp_ref_origin.png
+          overwrite: true
+          overwrite_files: true

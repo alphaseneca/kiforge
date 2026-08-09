@@ -570,11 +570,11 @@ class TestKiForgeCLI(unittest.TestCase):
             extra_data_file="/tmp/board.kicad_pcb",
         )
         self.assertIn("--show-fields", args)
-        self.assertIn("References,Value,Footprint,Description,Quantity,DNP,ID,MPN", args)
+        self.assertIn("References,Value,Footprint,Manufacturer,MPN,ID,Description,Quantity,DNP", args)
         self.assertIn("--group-fields", args)
-        self.assertIn("Value,ID,Footprint,DNP", args)
+        self.assertIn("Value,Footprint,Manufacturer,MPN,ID,DNP", args)
         self.assertIn("--extra-fields", args)
-        self.assertIn("ID,MPN", args)
+        self.assertIn("Manufacturer,MPN,ID,Description,DNP", args)
         self.assertIn("--extra-data-file", args)
         self.assertIn("/tmp/board.kicad_pcb", args)
 
@@ -936,23 +936,32 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertNotIn(";", kiforge.normalize_version_suffix("1.0;whoami"))
 
     def test_build_ibom_cli_args(self):
-        """Verify iBOM CLI flags are built from saved settings and BOM defaults."""
+        """Verify iBOM CLI flags include track and netlist parameters but omit other options."""
         args = kiforge.build_ibom_cli_args(
-            {"dark_mode": True, "include_tracks": False, "include_netlist": True},
+            None,
             "/tmp/out",
         )
         self.assertIn("--no-browser", args)
-        self.assertIn("--dark-mode", args)
+        self.assertNotIn("--dark-mode", args)
         self.assertIn("--include-nets", args)
+        self.assertIn("--include-tracks", args)
         self.assertIn("--show-fields", args)
         self.assertIn("--group-fields", args)
-        self.assertNotIn("--include-netlist", args)
-        self.assertNotIn("--include-tracks", args)
+        self.assertIn("--extra-fields", args)
+        extra_idx = args.index("--extra-fields")
+        self.assertIn("Description", args[extra_idx + 1])
+        self.assertIn("DNP", args[extra_idx + 1])
         self.assertEqual(args[-2:], ["--dest-dir", "/tmp/out"])
 
+    def test_ibom_extra_fields_includes_description_and_dnp(self):
+        """Verify Description and DNP are included in --extra-fields for iBOM."""
+        fields_str = "Reference,Value,Footprint,Description,${QUANTITY},${DNP},ID,MPN"
+        extra = kiforge.ibom_extra_fields_from_bom_fields(fields_str)
+        self.assertEqual(extra, "Description,DNP,ID,MPN")
+
     def test_build_ibom_cli_args_always_suppresses_browser(self):
-        """Legacy no_browser=false in saved settings must not open a browser during export."""
-        args = kiforge.build_ibom_cli_args({"no_browser": False}, "/tmp/out")
+        """Verify that build_ibom_cli_args always passes --no-browser."""
+        args = kiforge.build_ibom_cli_args(None, "/tmp/out")
         self.assertEqual(args.count("--no-browser"), 1)
 
     def test_cleanup_partial_ibom_output(self):
@@ -969,10 +978,10 @@ class TestKiForgeCLI(unittest.TestCase):
     def test_build_ibom_subprocess_command(self):
         """iBOM must run as a module so it does not register a pcbnew ActionPlugin."""
         cmd = kiforge.build_ibom_subprocess_command("/usr/bin/python3")
-        self.assertEqual(
-            cmd,
-            ["/usr/bin/python3", "-m", "InteractiveHtmlBom.generate_interactive_bom"],
-        )
+        self.assertEqual(cmd[0], "/usr/bin/python3")
+        self.assertEqual(cmd[1], "-c")
+        self.assertIn("wx.DisableAsserts()", cmd[2])
+        self.assertIn("runpy.run_module", cmd[2])
         env = kiforge.ensure_ibom_subprocess_env({})
         self.assertEqual(env["INTERACTIVE_HTML_BOM_NO_DISPLAY"], "1")
         self.assertEqual(env["INTERACTIVE_HTML_BOM_CLI_MODE"], "1")
@@ -1054,36 +1063,6 @@ class TestKiForgeCLI(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertIn("Exporting Gerber Layers failed", context.warnings[0])
-
-    def test_merged_settings_include_ibom(self):
-        """Verify iBOM defaults merge from global/project JSON."""
-        import tempfile
-
-        temp_dir = tempfile.mkdtemp()
-        global_path = kiforge.get_global_settings_path()
-        backup = None
-        if os.path.isfile(global_path):
-            with open(global_path, "r", encoding="utf-8") as f:
-                backup = f.read()
-        try:
-            kiforge.save_settings({"ibom": {"dark_mode": True}}, scope="global")
-            merged = kiforge.load_merged_settings(temp_dir)
-            self.assertTrue(merged["ibom"]["dark_mode"])
-            project_path = kiforge.get_project_settings_path(temp_dir)
-            with open(project_path, "w", encoding="utf-8") as f:
-                import json
-                json.dump({"ibom": {"dark_mode": False, "checkboxes": True}}, f)
-            merged = kiforge.load_merged_settings(temp_dir)
-            self.assertFalse(merged["ibom"]["dark_mode"])
-            self.assertTrue(merged["ibom"]["checkboxes"])
-        finally:
-            shutil.rmtree(temp_dir)
-            if backup is not None:
-                os.makedirs(os.path.dirname(global_path), exist_ok=True)
-                with open(global_path, "w", encoding="utf-8") as f:
-                    f.write(backup)
-            elif os.path.isfile(global_path):
-                os.remove(global_path)
 
     def test_version_tag_resolution(self):
         """Verify version resolution and normalization from environment, options, and file extraction."""
@@ -1235,6 +1214,53 @@ class TestKiForgeCLI(unittest.TestCase):
                 self.skipTest("wxPython not installed")
             raise
         kiforge_studio._destroy_progress_dialog(None)
+
+    def test_build_subprocess_env_3d_paths(self):
+        """Verify _build_subprocess_env sets KIPRJMOD and 3D environment variables."""
+        with tempfile.TemporaryDirectory() as tmp_proj:
+            local_3d = os.path.join(tmp_proj, "3dmodels")
+            os.makedirs(local_3d, exist_ok=True)
+
+            env = kiforge._build_subprocess_env(None, tmp_proj)
+            self.assertEqual(env.get("KIPRJMOD"), os.path.abspath(tmp_proj))
+            self.assertTrue(bool(env.get("KICAD10_3DMODEL_DIR")))
+            self.assertEqual(env.get("KISYS3DMOD"), env.get("KICAD10_3DMODEL_DIR"))
+
+    def test_render_3d_export_task_fallback(self):
+        """Verify Render3dExportTask falls back to standard rasterizer (--preset 0) when raytracing fails."""
+        from unittest.mock import patch, MagicMock
+
+        task = kiforge.Render3dExportTask()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcb_file = os.path.join(tmp_dir, "test.kicad_pcb")
+            output_png = os.path.join(tmp_dir, "test_3d_front.png")
+            with open(pcb_file, "w") as f:
+                f.write("(kicad_pcb)")
+
+            ctx = MagicMock()
+            ctx.kicad_cli = "kicad-cli"
+            ctx.pcb_file = pcb_file
+            ctx.output_dir = tmp_dir
+            ctx.pcb_name = "test"
+            ctx.logger = MagicMock()
+            ctx.add_warning = MagicMock()
+
+            # Mock _run_subprocess: first call (raytracing preset 2) returns False;
+            # second call (fallback preset 0) creates valid PNG and returns True.
+            def mock_run_subproc(cmd, context):
+                if "--preset" in cmd and cmd[cmd.index("--preset") + 1] == "2":
+                    return False
+                if "--preset" in cmd and cmd[cmd.index("--preset") + 1] == "0":
+                    with open(output_png, "wb") as f:
+                        f.write(b"PNG_DATA")
+                    return True
+                return False
+
+            with patch.object(task, "_run_subprocess", side_effect=mock_run_subproc):
+                res = task._render_view(ctx, output_png, "0,0,0", "Front")
+                self.assertTrue(res)
+                self.assertTrue(os.path.isfile(output_png))
+                ctx.add_warning.assert_called()
 
 
 if __name__ == '__main__':

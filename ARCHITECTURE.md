@@ -200,9 +200,9 @@ Saved JSON structure:
     "pos_side": "both",
     "pos_smd_only": true,
     "pos_exclude_dnp": true,
-    "step_subst_models": true
+    "step_subst_models": true,
+    "bom_include_mfr_mpn": true
   },
-  "ibom": { "include_tracks": false, "dark_mode": false, ... },
   "rotation_offsets": { "0603": 90 }
 }
 ```
@@ -212,14 +212,11 @@ Saved JSON structure:
 | Layer | Python source | JSON key | CLI / Action / CD | Purpose |
 | --- | --- | --- | --- | --- |
 | Export toggles | `EXPORT_SETTING_KEYS` | `exports` | Yes | Which outputs to produce |
-| Export parameters | `EXPORT_PARAM_SPECS` | `export_params` | Yes | Placement CSV & STEP flags |
-| iBOM presentation | `DEFAULT_IBOM_SETTINGS` | `ibom` | Partial¹ | HTML BOM UI options |
+| Export parameters | `EXPORT_PARAM_SPECS` | `export_params` | Yes | Placement, STEP, & BOM flags |
 | Runtime | `RUNTIME_OPTION_SPECS` | _(none)_ | Yes | Per-run behavior (title-block sync) |
 | BOM layout | `BOM_EXPORT_DEFAULTS` | _(none)_ | No | Raw CSV + iBOM columns/grouping |
 | 3D renders | `RENDER_3D_DEFAULTS` | _(none)_ | No | `kicad-cli pcb render` flags |
 | Gerbers / drills | `GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS` | _(none)_ | No | JLC-aligned manufacturing export |
-
-¹ iBOM presentation flags are CLI-only from Studio settings; not baked into CD YAML.
 
 The same registries drive CLI flags (`parse_cli_args` / `build_cli_options`),
 GitHub Action inputs (`action.yml` → `action/run.sh`), and generated CD workflow
@@ -237,32 +234,30 @@ Current `export_params` keys:
 | `pos_smd_only` | `true` | `--smd-only` |
 | `pos_exclude_dnp` | `true` | `--exclude-dnp` |
 | `step_subst_models` | `true` | `--subst-models` |
+| `bom_include_mfr_mpn` | `true` | Include Manufacturer and MPN columns in BOM and iBOM |
 
 STEP export always passes `--no-optimize-step` (fixed; not configurable).
 CLI aliases: `--top` → `pos_side=front`, `--bottom` → `pos_side=back`.
 
-Studio Advanced tab controls placement/STEP params; **Save** writes `export_params`
+Studio Advanced tab controls placement/STEP/BOM params; **Save** writes `export_params`
 to project or global JSON. Successful exports auto-save project settings.
 
-### Fixed BOM pipeline (`BOM_EXPORT_DEFAULTS`)
+### BOM pipeline (`BOM_EXPORT_DEFAULTS`)
 
-Not configurable. Used by `BomExportTask` → `kicad-cli sch export bom` and
-`build_ibom_cli_args()` → InteractiveHtmlBom `--show-fields`, `--group-fields`,
-`--extra-fields`.
+Default fields and groupings are configured under `BOM_EXPORT_DEFAULTS`. They are not directly configurable column-by-column, but setting `bom_include_mfr_mpn` to `false` will dynamically strip those columns from both the fields list and group-by list in both raw BOM and iBOM exports.
 
 ```
-fields: Reference,Value,Footprint,Description,${QUANTITY},${DNP},ID,MPN
-group_by: Value,ID,Footprint,DNP
+fields: Reference,Value,Footprint,Manufacturer,MPN,ID,Description,${QUANTITY},${DNP}
+group_by: Value,Footprint,Manufacturer,MPN,ID,DNP
 ref_range_delimiter: (empty)
 ```
 
 Raw `*_bom.csv` exports symbol `ID` and `MPN`. JLC `LCSC Part #` is filled from `ID`
 only when it matches `^C\d+$` (e.g. `C125111`).
 
-### Fixed 3D renders (`RENDER_3D_DEFAULTS`)
+### Fixed 3D renders (`RENDER_3D_DEFAULTS`) & Multi-Stage Fallback
 
-Preset 2, floor, perspective, zoom 0.8, quality high, 1920×1080. Not exposed as
-parameters anywhere.
+Primary render uses Preset 2 (raytracing), floor, perspective, zoom 0.8, quality high, 1920×1080. If raytracing fails (e.g. VRML `.wrl` mesh parse errors, missing 3D models, or headless environment restrictions), `Render3dExportTask` automatically retries with Preset 0 (standard rasterizer) to guarantee complete 3D PNG rendering of all available SMD components. `_build_subprocess_env()` populates `KIPRJMOD` and resolves `KICAD10_3DMODEL_DIR` / `KISYS3DMOD` for embedded and project-local 3D assets (`3dmodels/`, `3d/`, `packages3d/`).
 
 ### Fixed Gerber / drill export (`GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`)
 
@@ -280,13 +275,13 @@ are excluded from the Gerber ZIP.
 | Function | Role |
 | --- | --- |
 | `load_merged_settings()` | Layer global + project JSON onto defaults |
-| `save_settings()` | Persist `exports`, `export_params`, `ibom` |
-| `merge_export_params()` | Merge and validate placement/STEP dicts |
+| `save_settings()` | Persist `exports` and `export_params` |
+| `merge_export_params()` | Merge and validate placement/STEP/BOM dicts |
 | `apply_export_params_to_options()` | Flatten `export_params` for `ExportContext` |
 | `build_cli_options()` | CLI → options dict |
 | `build_cd_substitutions()` | Options → CD template placeholders |
 | `export_options_from_context()` | Post-export CD sync from a finished run |
-| `build_ibom_cli_args()` | iBOM argv from `ibom` + `BOM_EXPORT_DEFAULTS` |
+| `build_ibom_cli_args()` | iBOM argv from resolved BOM fields |
 | `resolve_jlc_gerber_layers()` | Manufacturing + user drawing/comment layers present on the board |
 | `build_gerber_export_cmd()` / `build_drill_export_cmd()` | JLC-aligned `kicad-cli` argv for gerber/drill tasks |
 

@@ -60,3 +60,6 @@ kiforge_verify/
 *.net
 *.dsn
 *.ses
+
+# KiCad & KiForge patterns added by KiForge
+kiforge_out/

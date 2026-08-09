@@ -80,6 +80,10 @@ inputs:
     description: 'STEP export: substitute missing 3D models (true/false)'
     required: false
     default: 'true'
+  bom_include_mfr_mpn:
+    description: 'BOM/iBOM: include Manufacturer & MPN columns (true/false)'
+    required: false
+    default: 'true'
   sync_title_block_rev:
     description: 'Sync schematic title-block (rev) to export version via staged copy (true/false)'
     required: false
@@ -113,6 +117,7 @@ runs:
         INPUT_POS_SMD_ONLY: ${{ inputs.pos_smd_only }}
         INPUT_POS_EXCLUDE_DNP: ${{ inputs.pos_exclude_dnp }}
         INPUT_STEP_SUBST_MODELS: ${{ inputs.step_subst_models }}
+        INPUT_BOM_INCLUDE_MFR_MPN: ${{ inputs.bom_include_mfr_mpn }}
         INPUT_SYNC_TITLE_BLOCK_REV: ${{ inputs.sync_title_block_rev }}
         INPUT_VERSION: ${{ inputs.version }}
         GITHUB_REF_NAME: ${{ github.ref_name }}

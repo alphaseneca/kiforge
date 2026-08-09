@@ -69,10 +69,13 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `pos_smd_only` | Placement CSV: SMD parts only | `'true'` |
 | `pos_exclude_dnp` | Placement CSV: exclude DNP parts | `'true'` |
 | `step_subst_models` | STEP export: substitute missing 3D models | `'true'` |
+| `bom_include_mfr_mpn` | BOM/iBOM: include Manufacturer & MPN columns | `'true'` |
 | `sync_title_block_rev` | Sync schematic title-block `(rev …)` to the export version | `'true'` |
 | `version` | Override version suffix for output filenames | _(auto from Git tag)_ |
 
-> **Export parameters:** The `pos_*` and `step_*` inputs map to `export_params` in `.kiforge.json`. BOM columns, gerber/drill layers, iBOM grouping, and 3D render quality are fixed (`BOM_EXPORT_DEFAULTS`, `GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`, `RENDER_3D_DEFAULTS`). Raw `*_bom.csv` includes `ID` and `MPN`; JLC copies are produced by `JLCPCBFormatter` when `format_jlc` is on.
+> **Export parameters:** The `pos_*`, `step_*`, and `bom_*` inputs map to `export_params` in `.kiforge.json`. Gerber/drill layers and 3D render quality are fixed (`GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`, `RENDER_3D_DEFAULTS`). BOM fields and iBOM grouping mirror `BOM_EXPORT_DEFAULTS` (with Manufacturer and MPN columns toggled on/off dynamically via the `bom_include_mfr_mpn` flag). Raw `*_bom.csv` includes `ID` and `MPN`; JLC copies are produced by `JLCPCBFormatter` when `format_jlc` is on.
+
+> **Embedded 3D Models & Multi-Stage Rendering:** KiForge automatically resolves KiCad 10 embedded 3D models and local project 3D asset folders (`3dmodels/`, `3d/`, `packages3d/`, `${KIPRJMOD}`). 3D rendering employs a multi-stage fallback ladder: if high-quality raytracing (`--preset 2`) fails due to VRML (`.wrl`) mesh parse errors, missing models, or headless environment limits, KiForge automatically falls back to standard rasterization (`--preset 0`) so that complete board renders with all available SMD 3D models are always preserved.
 
 > **Version tagging:** All output filenames are versioned automatically on every run — locally and in CD. On tag push, KiForge reads `GITHUB_REF_NAME` (e.g. `myboard_v1.0.0_gerbers.zip`, `myboard_v1.0.0_sch.pdf`). Locally, the version comes from `--version-tag`, the latest git tag (when enabled), or defaults to `v0.1.0`. During export only, schematic PDFs sync the title-block `(rev …)` to that version via a temporary staged copy (`--sync-title-block-rev`, on by default in CI and Studio Run Export).
 
@@ -125,7 +128,7 @@ The PCM plugin opens **KiForge Studio** — a tabbed dialog:
 | Tab | Purpose |
 | --- | --- |
 | **Export** | Project folder, output name, presets, live summary |
-| **Advanced** | Individual outputs and iBOM options |
+| **Advanced** | Individual outputs and BOM options |
 | **Releases** | CD workflow generation and auto-sync |
 
 Tab icons load from Google Material Symbols CDN once and cache under `%APPDATA%/kiforge/icon_cache/` (or platform equivalent).

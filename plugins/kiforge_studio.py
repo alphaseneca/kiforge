@@ -53,16 +53,6 @@ except ImportError:
 
 logger = logging.getLogger("KiForge.Studio")
 
-# Shorter iBOM option labels for the Advanced tab.
-IBOM_OPTION_LABELS = {
-    "include_tracks": "Copper tracks",
-    "include_netlist": "Netlist",
-    "dark_mode": "Dark mode",
-    "checkboxes": "Checkboxes column",
-    "show_fabrication": "Fabrication layer",
-    "hide_pads": "Hide pads",
-    "highlight_pin1": "Highlight pin 1",
-}
 
 # ---------------------------------------------------------------------------
 # Studio palette
@@ -220,7 +210,7 @@ class _ExportProgressDialog(wx.Dialog):
         super().__init__(
             parent,
             title="KiForge",
-            style=wx.DEFAULT_DIALOG_STYLE | wx.STAY_ON_TOP,
+            style=wx.DEFAULT_DIALOG_STYLE,
         )
         self._cancelled = False
         self.SetBackgroundColour(_COLORS["app_bg"])
@@ -648,8 +638,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_bom = wx.CheckBox(scroll, label="BOM")
         self.chk_ibom = wx.CheckBox(scroll, label="Interactive BOM")
         self.chk_gerbers.Bind(wx.EVT_CHECKBOX, self.on_gerbers_toggled)
-        self.chk_ibom.Bind(wx.EVT_CHECKBOX, self.on_ibom_toggled)
-        for chk in (self.chk_drills, self.chk_pos, self.chk_bom):
+        for chk in (self.chk_drills, self.chk_pos, self.chk_bom, self.chk_ibom):
             chk.Bind(wx.EVT_CHECKBOX, self.on_export_checkbox_changed)
         for chk in (self.chk_gerbers, self.chk_drills, self.chk_pos, self.chk_bom, self.chk_ibom):
             self._style_choice(chk)
@@ -671,6 +660,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             chk.Bind(wx.EVT_CHECKBOX, self.on_export_setting_changed)
         self.choice_pos_side.Bind(wx.EVT_CHOICE, self.on_export_setting_changed)
 
+        mfg_col.AddSpacer(8)
+        mfg_col.Add(self._muted_label(scroll, "BOM columns"), 0, wx.BOTTOM, 6)
+        self.chk_bom_mfr_mpn = wx.CheckBox(scroll, label="Include Manufacturer & MPN")
+        self._style_choice(self.chk_bom_mfr_mpn)
+        mfg_col.Add(self.chk_bom_mfr_mpn, 0, wx.TOP, 4)
+        self.chk_bom_mfr_mpn.Bind(wx.EVT_CHECKBOX, self.on_export_setting_changed)
+
         doc_col = wx.BoxSizer(wx.VERTICAL)
         doc_col.Add(self._muted_label(scroll, "Documentation"), 0, wx.BOTTOM, 6)
         self.chk_sch_pdf = wx.CheckBox(scroll, label="Schematic PDF")
@@ -687,15 +683,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         sizer.Add(columns, 0, wx.EXPAND | inset | wx.TOP, 6)
         sizer.AddSpacer(_PAD)
 
-        sizer.Add(self._section_label(scroll, "iBOM"), 0, inset, 0)
-        self.ibom_checks = {}
-        grid = wx.FlexGridSizer(cols=2, hgap=20, vgap=4)
-        for key, label in IBOM_OPTION_LABELS.items():
-            chk = wx.CheckBox(scroll, label=label)
-            self._style_choice(chk)
-            self.ibom_checks[key] = chk
-            grid.Add(chk, 0, wx.TOP, 4)
-        sizer.Add(grid, 0, inset | wx.TOP, 6)
 
         scroll.SetSizer(sizer)
         scroll.FitInside()
@@ -791,12 +778,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._update_export_summary()
         self.on_export_setting_changed(event)
 
-    def on_ibom_toggled(self, event):
-        if event is not None and hasattr(event, "Skip"):
-            event.Skip()
-        self._sync_ibom_ui_state()
-        self.on_export_checkbox_changed(event)
-
     def _apply_export_preset(self, preset_id: str):
         preset = EXPORT_PRESETS.get(preset_id)
         if not preset:
@@ -822,7 +803,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                     checkbox_map[key].SetValue(value)
             self._set_preset_choice(preset_id)
             self._sync_drill_checkbox_state()
-            self._sync_ibom_ui_state()
             self._update_export_summary()
             self._schedule_cd_sync()
         finally:
@@ -882,11 +862,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             summary += " · JLC"
         self.lbl_export_summary.SetLabel(summary)
 
-    def _sync_ibom_ui_state(self):
-        enabled = self.chk_ibom.IsChecked()
-        for chk in self.ibom_checks.values():
-            chk.Enable(enabled)
-
     def _on_dialog_resize(self, event):
         if hasattr(self, "lbl_export_summary"):
             width = max(_DIALOG_MIN_WIDTH, self.GetClientSize().width)
@@ -909,8 +884,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """Regenerate CD YAML when export toggles change (debounced)."""
         self.chk_generate_cd.Bind(wx.EVT_CHECKBOX, self.on_export_setting_changed)
         self.txt_output_dir.Bind(wx.EVT_TEXT, self.on_export_setting_changed)
-        for chk in self.ibom_checks.values():
-            chk.Bind(wx.EVT_CHECKBOX, self.on_export_setting_changed)
 
     def on_export_setting_changed(self, event):
         if event is not None and hasattr(event, "Skip"):
@@ -964,13 +937,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_generate_cd.SetValue(
             self._export_setting('generate_cd', self.settings.get('generate_ci', True))
         )
-        ibom_settings = self.settings.get('ibom', kiforge.DEFAULT_IBOM_SETTINGS)
-        for key, chk in self.ibom_checks.items():
-            chk.SetValue(ibom_settings.get(key, kiforge.DEFAULT_IBOM_SETTINGS.get(key, False)))
         self._set_preset_choice(self._detect_active_preset())
         self._sync_drill_checkbox_state()
         self._update_export_summary()
-        self._sync_ibom_ui_state()
         self._apply_export_params_to_ui()
 
     def _export_param(self, key, default=None):
@@ -996,6 +965,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             "pos_side": side_map[min(selection, 2)],
             "pos_smd_only": self.chk_pos_smd_only.IsChecked(),
             "pos_exclude_dnp": self.chk_pos_exclude_dnp.IsChecked(),
+            "bom_include_mfr_mpn": self.chk_bom_mfr_mpn.IsChecked(),
         })
         return params
 
@@ -1004,6 +974,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.choice_pos_side.SetSelection(side_map.get(self._export_param("pos_side", "both"), 0))
         self.chk_pos_smd_only.SetValue(bool(self._export_param("pos_smd_only", True)))
         self.chk_pos_exclude_dnp.SetValue(bool(self._export_param("pos_exclude_dnp", True)))
+        self.chk_bom_mfr_mpn.SetValue(bool(self._export_param("bom_include_mfr_mpn", True)))
 
     def _reload_settings(self, project_dir=None):
         """Reload merged settings into the dialog (global + project when dir is set)."""
@@ -1030,9 +1001,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             **exports,
             'exports': exports,
             'export_params': self._collect_export_params(),
-            'ibom': {
-                key: chk.IsChecked() for key, chk in self.ibom_checks.items()
-            },
         }
 
     def _sync_drill_checkbox_state(self):
@@ -1093,7 +1061,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """Reset dialog controls to built-in KiForge defaults."""
         self.settings = kiforge.DEFAULT_SETTINGS.copy()
         self.settings["exports"] = kiforge.DEFAULT_EXPORT_SETTINGS.copy()
-        self.settings["ibom"] = kiforge.DEFAULT_IBOM_SETTINGS.copy()
         self.settings["export_params"] = kiforge.DEFAULT_EXPORT_PARAMS.copy()
         self.update_ui_from_settings()
         wx.MessageBox("Dialog reset to built-in defaults.", "Reset", wx.OK | wx.ICON_INFORMATION)

@@ -47,6 +47,7 @@ build_cli_args() {
   append_bool_toggle INPUT_POS_SMD_ONLY pos-smd-only
   append_bool_toggle INPUT_POS_EXCLUDE_DNP pos-exclude-dnp
   append_bool_toggle INPUT_STEP_SUBST_MODELS step-subst-models
+  append_bool_toggle INPUT_BOM_INCLUDE_MFR_MPN bom-include-mfr-mpn
 
   # Runtime options (RUNTIME_OPTION_SPECS)
   append_bool_toggle INPUT_SYNC_TITLE_BLOCK_REV sync-title-block-rev
@@ -96,6 +97,9 @@ docker_env=(
   -e GITHUB_REF_NAME="${GITHUB_REF_NAME:-}"
   -e GITHUB_REF_TYPE="${GITHUB_REF_TYPE:-}"
   -e VERSION="${VERSION:-}"
+  -e KICAD10_3DMODEL_DIR="${KICAD10_3DMODEL_DIR:-}"
+  -e KISYS3DMOD="${KISYS3DMOD:-}"
+  -e KIPRJMOD="${KIPRJMOD:-}"
 )
 
 if container_id="$(detect_runner_container_id)"; then

@@ -2,6 +2,9 @@ FROM kicad/kicad:10.0
 
 USER root
 
+ENV KICAD10_3DMODEL_DIR=/usr/share/kicad/3dmodels
+ENV KISYS3DMOD=/usr/share/kicad/3dmodels
+
 # Install python3-pip and InteractiveHtmlBom at build-time
 COPY kiforge.py /tmp/kiforge.py
 RUN apt-get update && \

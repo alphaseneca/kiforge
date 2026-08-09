@@ -225,22 +225,55 @@ DEFAULT_EXPORT_PARAMS = {
     "pos_smd_only": True,
     "pos_exclude_dnp": True,
     "step_subst_models": True,
+    "bom_include_mfr_mpn": True,       # include Manufacturer and MPN columns in BOM/iBOM
 }
 
-# Raw KiCad BOM CSV + InteractiveHtmlBom column/group layout (fixed).
+# Raw KiCad BOM CSV + InteractiveHtmlBom column/group layout.
+# Field order rationale: identify → source → verify → metadata
+#   1. Reference, Value, Footprint — locate, identify & verify physical footprint
+#   2. Manufacturer, MPN           — sourcing pair (toggleable via export_params)
+#   3. ID                          — supplier/LCSC code for procurement
+#   4. Description                 — physical package & supplementary detail
+#   5. ${QUANTITY}, ${DNP}         — assembly metadata (count & do-not-place)
 BOM_EXPORT_DEFAULTS = {
-    "fields": "Reference,Value,Footprint,Description,${QUANTITY},${DNP},ID,MPN",
-    "group_by": "Value,ID,Footprint,DNP",
+    "fields": "Reference,Value,Footprint,Manufacturer,MPN,ID,Description,${QUANTITY},${DNP}",
+    "group_by": "Value,Footprint,Manufacturer,MPN,ID,DNP",
     "ref_range_delimiter": "",
 }
 
+
+def resolve_bom_fields(export_params: dict | None = None) -> dict:
+    """
+    Return BOM fields/group_by strings with Manufacturer and MPN conditionally included.
+
+    When ``bom_include_mfr_mpn`` is False in *export_params*,
+    those columns are stripped from both the field list and the group-by list.
+    Returns a dict with ``fields``, ``group_by``, and ``ref_range_delimiter`` keys.
+    """
+    params = export_params or {}
+    include_sourcing = params.get("bom_include_mfr_mpn", DEFAULT_EXPORT_PARAMS["bom_include_mfr_mpn"])
+
+    exclude = set()
+    if not include_sourcing:
+        exclude.add("Manufacturer")
+        exclude.add("MPN")
+
+    def _filter(csv_str: str) -> str:
+        return ",".join(t.strip() for t in csv_str.split(",") if t.strip() not in exclude)
+
+    return {
+        "fields": _filter(BOM_EXPORT_DEFAULTS["fields"]),
+        "group_by": _filter(BOM_EXPORT_DEFAULTS["group_by"]),
+        "ref_range_delimiter": BOM_EXPORT_DEFAULTS["ref_range_delimiter"],
+    }
+
 # 3D PNG render flags for kicad-cli pcb render (fixed).
 RENDER_3D_DEFAULTS = {
-    "zoom": 0.8,
-    "quality": "high",
-    "width": 1920,
-    "height": 1080,
-    "preset": "2",
+    "zoom": 0.8,        # 80% zoom-out to add padding around the board edges
+    "quality": "high",  # render quality: basic | high | user | job_settings
+    "width": 2560,      # output image width in pixels (2K QHD)
+    "height": 1440,     # output image height in pixels (2K QHD)
+    "preset": "2",      # appearance preset: 0 = standard rasterizer, 2 = raytracing
 }
 
 # Gerber/drill export aligned with JLCPCB KiCad 9 guide (manufacturing layers only).
@@ -306,6 +339,14 @@ EXPORT_PARAM_SPECS = (
         "action_input": "step_subst_models",
         "cd_placeholder": "STEP_SUBST_MODELS",
     },
+    {
+        "key": "bom_include_mfr_mpn",
+        "type": "bool",
+        "cli": "--bom-include-mfr-mpn",
+        "help": "BOM/iBOM: include Manufacturer and MPN columns",
+        "action_input": "bom_include_mfr_mpn",
+        "cd_placeholder": "BOM_INCLUDE_MFR_MPN",
+    },
 )
 
 EXPORT_PARAM_KEYS = tuple(spec["key"] for spec in EXPORT_PARAM_SPECS)
@@ -339,17 +380,6 @@ DEFAULT_SETTINGS = {
     "output_dir": "kiforge",
     **DEFAULT_EXPORT_SETTINGS,
 }
-
-DEFAULT_IBOM_SETTINGS = {
-    "include_tracks": False,
-    "include_netlist": False,
-    "dark_mode": False,
-    "checkboxes": False,
-    "show_fabrication": False,
-    "hide_pads": False,
-    "highlight_pin1": True,
-}
-
 
 def get_project_settings_path(project_dir: str) -> str:
     """Return the path to a KiCad project's .kiforge.json settings file."""
@@ -910,20 +940,6 @@ def _coerce_setting_value(default, value):
 # missing fields export as empty columns without error.
 # ---------------------------------------------------------------------------
 
-def merge_ibom_settings(base: dict | None, overlay: dict | None) -> dict:
-    """Merge iBOM option dicts (overlay wins)."""
-    merged = DEFAULT_IBOM_SETTINGS.copy()
-    if base:
-        for key in DEFAULT_IBOM_SETTINGS:
-            if key in base:
-                merged[key] = _coerce_setting_value(DEFAULT_IBOM_SETTINGS[key], base[key])
-    if overlay:
-        for key in DEFAULT_IBOM_SETTINGS:
-            if key in overlay:
-                merged[key] = _coerce_setting_value(DEFAULT_IBOM_SETTINGS[key], overlay[key])
-    return merged
-
-
 _KICAD_TO_IBOM_FIELD_NAMES = {
     "Reference": "References",
     "${QUANTITY}": "Quantity",
@@ -954,14 +970,16 @@ def ibom_group_fields_from_bom_group_by(bom_group_by: str) -> str:
 def ibom_extra_fields_from_bom_fields(bom_fields: str) -> str:
     """Return custom schematic fields iBOM should load via --extra-fields."""
     builtin = {
-        "Reference", "References", "Value", "Footprint", "Description",
-        "${QUANTITY}", "Quantity", "${DNP}", "DNP",
+        "Reference", "References", "Value", "Footprint",
+        "${QUANTITY}", "Quantity",
     }
     extra = []
     for token in bom_fields.split(","):
         token = token.strip()
-        if token and token not in builtin and token not in extra:
-            extra.append(token)
+        mapped = _KICAD_TO_IBOM_FIELD_NAMES.get(token, token)
+        if token and token not in builtin and mapped not in builtin:
+            if mapped not in extra:
+                extra.append(mapped)
     return ",".join(extra)
 
 
@@ -969,36 +987,26 @@ def build_ibom_cli_args(
     ibom_settings: dict | None,
     output_dir: str,
     extra_data_file: str | None = None,
+    export_params: dict | None = None,
 ) -> list[str]:
     """
-    Build InteractiveHtmlBom CLI argv from iBOM settings and BOM_EXPORT_DEFAULTS.
+    Build InteractiveHtmlBom CLI argv.
 
-    Maps kicad-cli field names to iBOM names (Reference→References, etc.), sets
-    ``--show-fields`` / ``--group-fields`` / ``--extra-fields``, and always passes
-    ``--no-browser`` for unattended export. ``extra_data_file`` should be the
-    staged PCB copy so DNP flags resolve correctly in CLI mode.
+    Always includes copper tracks and netlist information, maps kicad-cli field
+    names to iBOM names, and passes --no-browser for unattended export.
     """
-    settings = merge_ibom_settings(None, ibom_settings)
-    args = []
-    flag_map = {
-        "include_tracks": "--include-tracks",
-        "include_netlist": "--include-nets",
-        "dark_mode": "--dark-mode",
-        "checkboxes": "--checkboxes",
-        "show_fabrication": "--show-fabrication",
-        "hide_pads": "--hide-pads",
-        "highlight_pin1": "--highlight-pin1",
-    }
-    for key, flag in flag_map.items():
-        if settings.get(key):
-            args.append(flag)
-    show_fields = ibom_show_fields_from_bom_fields(BOM_EXPORT_DEFAULTS["fields"])
-    group_fields = ibom_group_fields_from_bom_group_by(BOM_EXPORT_DEFAULTS["group_by"])
+    args = [
+        "--include-tracks",
+        "--include-nets",
+    ]
+    resolved = resolve_bom_fields(export_params)
+    show_fields = ibom_show_fields_from_bom_fields(resolved["fields"])
+    group_fields = ibom_group_fields_from_bom_group_by(resolved["group_by"])
     if show_fields:
         args.extend(["--show-fields", show_fields])
     if group_fields:
         args.extend(["--group-fields", group_fields])
-    extra_fields = ibom_extra_fields_from_bom_fields(BOM_EXPORT_DEFAULTS["fields"])
+    extra_fields = ibom_extra_fields_from_bom_fields(resolved["fields"])
     if extra_fields:
         args.extend(["--extra-fields", extra_fields])
     if extra_data_file:
@@ -1027,11 +1035,21 @@ def build_ibom_subprocess_command(python_executable: str) -> list[str]:
     """
     Build the InteractiveHtmlBom CLI invocation for a subprocess.
 
-    Must use ``python -m InteractiveHtmlBom.generate_interactive_bom`` — importing the
-    package via ``python -c`` makes iBOM register a pcbnew ActionPlugin and fails when
-    KiCad is not running that interpreter as the main program.
+    Uses runpy.run_module to run under the __main__ context (matching -m behavior)
+    while allowing us to call wx.DisableAsserts() beforehand to suppress blocking C++
+    wxWidgets debug dialogs/alerts in debug/assertion-enabled builds of KiCad.
     """
-    return [python_executable, "-m", "InteractiveHtmlBom.generate_interactive_bom"]
+    code = (
+        "import sys\n"
+        "try:\n"
+        "    import wx\n"
+        "    wx.DisableAsserts()\n"
+        "except Exception:\n"
+        "    pass\n"
+        "import runpy\n"
+        "runpy.run_module('InteractiveHtmlBom.generate_interactive_bom', run_name='__main__')"
+    )
+    return [python_executable, "-c", code]
 
 
 def ensure_ibom_subprocess_env(env: dict | None) -> dict:
@@ -1119,24 +1137,24 @@ def format_task_failure_message(
 
 def stage_ibom_project_copy(context: "ExportContext") -> tuple[str, str]:
     """
-    Copy the open board (and minimal project files) to a temp folder.
+    Copy the PCB and project schematic files to a temporary staging folder.
 
-    pcbnew refuses to load a board that is already open in the PCB editor; a temp copy
-    avoids touching the live project lock file.
+    Avoids pcbnew lock file conflicts when open in KiCad GUI and allows iBOM
+    to extract schematic extra fields (Description, DNP, ID, MPN) directly.
     """
     ibom_temp_dir = tempfile.mkdtemp(prefix="kiforge_ibom_")
     pcb_basename = os.path.basename(context.pcb_file)
-    names_to_copy = {pcb_basename}
-    for suffix in (".kicad_pro", ".kicad_sch", ".kicad_prl"):
-        candidate = f"{context.pcb_name}{suffix}"
-        if os.path.isfile(os.path.join(context.project_dir, candidate)):
-            names_to_copy.add(candidate)
-    for name in sorted(names_to_copy):
-        shutil.copy2(
-            os.path.join(context.project_dir, name),
-            os.path.join(ibom_temp_dir, name),
-        )
-    return ibom_temp_dir, os.path.join(ibom_temp_dir, pcb_basename)
+    staged_pcb_path = os.path.join(ibom_temp_dir, pcb_basename)
+    shutil.copy2(context.pcb_file, staged_pcb_path)
+
+    if context.project_dir and os.path.isdir(context.project_dir):
+        for f in os.listdir(context.project_dir):
+            if f.endswith((".kicad_sch", ".kicad_pro", ".kicad_prl", ".net", ".xml")):
+                src_f = os.path.join(context.project_dir, f)
+                if os.path.isfile(src_f):
+                    shutil.copy2(src_f, os.path.join(ibom_temp_dir, f))
+
+    return ibom_temp_dir, staged_pcb_path
 
 
 def _load_settings_file(path: str) -> dict:
@@ -1172,7 +1190,6 @@ def _apply_settings_layer(settings: dict, loaded: dict) -> None:
     for key in EXPORT_SETTING_KEYS:
         settings[key] = settings["exports"][key]
 
-    settings["ibom"] = merge_ibom_settings(settings.get("ibom"), loaded.get("ibom"))
     settings["export_params"] = merge_export_params(
         settings.get("export_params"),
         loaded.get("export_params"),
@@ -1201,7 +1218,6 @@ def load_merged_settings(project_dir=None):
     """
     settings = DEFAULT_SETTINGS.copy()
     settings["exports"] = DEFAULT_EXPORT_SETTINGS.copy()
-    settings["ibom"] = DEFAULT_IBOM_SETTINGS.copy()
     settings["export_params"] = DEFAULT_EXPORT_PARAMS.copy()
     settings["rotation_offsets"] = {}
 
@@ -1248,7 +1264,6 @@ def save_settings(settings, project_dir=None, scope="project"):
     payload = {
         "output_dir": settings.get("output_dir", DEFAULT_SETTINGS["output_dir"]),
         "exports": exports,
-        "ibom": merge_ibom_settings(None, settings.get("ibom")),
         "export_params": merge_export_params(None, settings.get("export_params")),
     }
 
@@ -1363,13 +1378,13 @@ def export_options_from_context(context: "ExportContext") -> dict:
     return _normalize_cd_options(options)
 
 
-def _build_subprocess_env(kicad_cli: str | None) -> dict:
+def _build_subprocess_env(kicad_cli: str | None, project_dir: str | None = None) -> dict:
     """
     Build the environment passed to kicad-cli and helper subprocesses.
 
     Ensures user site-packages and KiCad PCM paths are on PYTHONPATH and prepends
-    the KiCad bin directory to PATH. iBOM-specific flags are applied separately via
-    ensure_ibom_subprocess_env() only when launching InteractiveHtmlBom.
+    the KiCad bin directory to PATH. Configures KIPRJMOD and 3D model search path
+    variables (KICAD10_3DMODEL_DIR, KISYS3DMOD) for embedded and project-local 3D assets.
     """
     env = os.environ.copy()
     python_paths: list[str] = []
@@ -1393,6 +1408,55 @@ def _build_subprocess_env(kicad_cli: str | None) -> dict:
         kicad_bin_dir = os.path.dirname(kicad_cli)
         path_env = env.get("PATH", "")
         env["PATH"] = f"{kicad_bin_dir}{os.pathsep}{path_env}" if path_env else kicad_bin_dir
+
+    if project_dir and os.path.isdir(project_dir):
+        abs_proj = os.path.abspath(project_dir)
+        env["KIPRJMOD"] = abs_proj
+
+        local_3d_dir = None
+        for candidate in ("3dmodels", "3d", "packages3d", ".3dshapes", "shapes"):
+            cand_path = os.path.join(abs_proj, candidate)
+            if os.path.isdir(cand_path):
+                local_3d_dir = cand_path
+                break
+
+        if "KICAD10_3DMODEL_DIR" not in env:
+            system_3d_dir = None
+            if sys.platform == "win32":
+                for win_path in (
+                    r"C:\Program Files\KiCad\10.0\share\kicad\3dmodels",
+                    r"C:\Program Files\KiCad\9.0\share\kicad\3dmodels",
+                    r"C:\Program Files\KiCad\8.0\share\kicad\3dmodels",
+                ):
+                    if os.path.isdir(win_path):
+                        system_3d_dir = win_path
+                        break
+            elif sys.platform == "darwin":
+                for mac_path in (
+                    "/Library/Application Support/kicad/3dmodels",
+                    "/Applications/KiCad/KiCad.app/Contents/SharedSupport/3dmodels",
+                ):
+                    if os.path.isdir(mac_path):
+                        system_3d_dir = mac_path
+                        break
+            else:
+                for linux_path in (
+                    "/usr/share/kicad/3dmodels",
+                    "/usr/share/kicad/modules/packages3d",
+                ):
+                    if os.path.isdir(linux_path):
+                        system_3d_dir = linux_path
+                        break
+
+            chosen_3d_dir = system_3d_dir or local_3d_dir
+            if chosen_3d_dir:
+                env["KICAD10_3DMODEL_DIR"] = chosen_3d_dir
+
+        resolved_3d = env.get("KICAD10_3DMODEL_DIR", "")
+        if resolved_3d:
+            for alias in ("KISYS3DMOD", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR", "KICAD7_3DMODEL_DIR"):
+                if alias not in env:
+                    env[alias] = resolved_3d
 
     return env
 
@@ -1573,10 +1637,11 @@ class ExportContext:
         self.kicad_cli = PathResolver.get_kicad_cli_path()
         self.kicad_python = PathResolver.get_kicad_python_path()
         self.startupinfo = _subprocess_startupinfo()
-        self.env = _build_subprocess_env(self.kicad_cli)
 
         if not self._discover_project_files():
             return False
+
+        self.env = _build_subprocess_env(self.kicad_cli, self.project_dir)
 
         merged_settings = load_merged_settings(self.project_dir)
         self._merge_options_from_settings(merged_settings)
@@ -1638,10 +1703,6 @@ class ExportContext:
             if key not in self.options:
                 self.options[key] = merged_settings[key]
 
-        self.options["ibom"] = merge_ibom_settings(
-            merged_settings.get("ibom"),
-            self.options.get("ibom"),
-        )
 
         export_overlay = (
             self.options.get("exports") if isinstance(self.options.get("exports"), dict) else None
@@ -2121,11 +2182,12 @@ class BomExportTask(ExportTask):
 
     def run(self, context: ExportContext) -> bool:
         raw_bom_path = os.path.join(context.output_dir, "raw_bom.csv")
+        resolved = resolve_bom_fields(context.options)
         cmd = [
             context.kicad_cli, "sch", "export", "bom",
-            "--fields", BOM_EXPORT_DEFAULTS["fields"],
-            "--group-by", BOM_EXPORT_DEFAULTS["group_by"],
-            "--ref-range-delimiter", BOM_EXPORT_DEFAULTS["ref_range_delimiter"],
+            "--fields", resolved["fields"],
+            "--group-by", resolved["group_by"],
+            "--ref-range-delimiter", resolved["ref_range_delimiter"],
             context.sch_file, "-o", raw_bom_path,
         ]
         return self._run_subprocess(cmd, context)
@@ -2203,42 +2265,78 @@ class Step3dExportTask(ExportTask):
 
 
 class Render3dExportTask(ExportTask):
-    """Render front/back 3D PNGs using fixed :data:`RENDER_3D_DEFAULTS`."""
+    """
+    Render front/back 3D PNGs using fixed :data:`RENDER_3D_DEFAULTS`.
+
+    Features multi-stage rendering fallback ladder:
+      1. Primary high-quality raytracing preset (--preset 2).
+      2. Automatic fallback to standard rasterizer (--preset 0) if raytracing fails
+         due to VRML (.wrl) mesh incompatibility, missing 3D models, or headless environment.
+    """
     def __init__(self):
         super().__init__("Rendering 3D Views")
 
     def is_applicable(self, context: ExportContext) -> bool:
         return context.options.get("export_3d", True) and bool(context.pcb_file)
 
-    def run(self, context: ExportContext) -> bool:
-        render_flags = [
-            "--preset", RENDER_3D_DEFAULTS["preset"], "--floor", "--perspective",
+    def _render_view(self, context: ExportContext, output_png: str, rotate_str: str, view_label: str) -> bool:
+        primary_flags = [
+            "--preset", RENDER_3D_DEFAULTS["preset"], "--floor",
             "--zoom", str(RENDER_3D_DEFAULTS["zoom"]),
             "--quality", RENDER_3D_DEFAULTS["quality"],
             "--width", str(RENDER_3D_DEFAULTS["width"]),
             "--height", str(RENDER_3D_DEFAULTS["height"]),
         ]
-        # Render Front
-        front_png = os.path.join(context.output_dir, f"{context.pcb_name}_3d_front.png")
-        cmd_front = [
+        cmd_primary = [
             context.kicad_cli, "pcb", "render", context.pcb_file,
-            "--output", front_png,
-            "--rotate", "0,0,0",
-            *render_flags,
+            "--output", output_png,
+            "--rotate", rotate_str,
+            *primary_flags,
         ]
-        ok_front = self._run_subprocess(cmd_front, context)
+        if self._run_subprocess(cmd_primary, context):
+            if os.path.isfile(output_png) and os.path.getsize(output_png) > 0:
+                return True
+
+        context.logger.warning(
+            "%s 3D raytracing render failed; attempting standard rasterizer fallback mode (--preset 0)...",
+            view_label,
+        )
+        fallback_flags = [
+            "--preset", "0", "--floor",
+            "--zoom", str(RENDER_3D_DEFAULTS["zoom"]),
+            "--quality", "normal",
+            "--width", str(RENDER_3D_DEFAULTS["width"]),
+            "--height", str(RENDER_3D_DEFAULTS["height"]),
+        ]
+        cmd_fallback = [
+            context.kicad_cli, "pcb", "render", context.pcb_file,
+            "--output", output_png,
+            "--rotate", rotate_str,
+            *fallback_flags,
+        ]
+        if self._run_subprocess(cmd_fallback, context):
+            if os.path.isfile(output_png) and os.path.getsize(output_png) > 0:
+                context.add_warning(
+                    f"{view_label} 3D render used standard rasterizer fallback due to model/raytracing incompatibility."
+                )
+                return True
+
+        if os.path.isfile(output_png) and os.path.getsize(output_png) > 0:
+            context.add_warning(
+                f"{view_label} 3D render completed with warnings; output PNG was saved."
+            )
+            return True
+
+        return False
+
+    def run(self, context: ExportContext) -> bool:
+        front_png = os.path.join(context.output_dir, f"{context.pcb_name}_3d_front.png")
+        ok_front = self._render_view(context, front_png, "0,0,0", "Front")
         if not ok_front:
             context.logger.warning("Front 3D render failed; attempting back view anyway.")
 
-        # Render Back
         back_png = os.path.join(context.output_dir, f"{context.pcb_name}_3d_back.png")
-        cmd_back = [
-            context.kicad_cli, "pcb", "render", context.pcb_file,
-            "--output", back_png,
-            "--rotate", "0,180,0",
-            *render_flags,
-        ]
-        ok_back = self._run_subprocess(cmd_back, context)
+        ok_back = self._render_view(context, back_png, "0,180,0", "Back")
         return ok_front or ok_back
 
 
@@ -2375,6 +2473,7 @@ class InteractiveBomTask(ExportTask):
                 context.options.get("ibom"),
                 context.output_dir,
                 extra_data_file=ibom_input,
+                export_params=context.options,
             ) + [ibom_input]
             try:
                 success = self._run_subprocess(
@@ -2414,11 +2513,16 @@ class InteractiveBomTask(ExportTask):
                         )
 
                         # json.dumps produces a safely-quoted, escaped JS string literal.
+                        import datetime
                         title_js = json.dumps(context.pcb_name)
+                        revision_js = json.dumps(context.version_str or "")
+                        date_js = json.dumps(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                         override_script = (
                             "\n<script type=\"text/javascript\">\n"
                             "  if (typeof pcbdata !== 'undefined' && pcbdata && pcbdata.metadata) {\n"
                             f"    pcbdata.metadata.title = {title_js};\n"
+                            f"    pcbdata.metadata.revision = {revision_js};\n"
+                            f"    pcbdata.metadata.date = {date_js};\n"
                             "  }\n"
                             "</script>\n"
                         )

@@ -25,7 +25,7 @@ kiforge/
 
 | Scope | Path | Contents |
 |---|---|---|
-| Project | `<project>/.kiforge.json` | `exports`, `export_params`, `ibom`, `rotation_offsets`, output dir |
+| Project | `<project>/.kiforge.json` | `exports`, `export_params`, `rotation_offsets`, output dir |
 | Global | `%APPDATA%/kiforge/settings.json` (Windows) | Same keys; project overrides |
 
 Load order: built-in defaults → global → project → runtime dialog/CLI flags.

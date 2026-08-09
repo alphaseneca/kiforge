@@ -257,21 +257,6 @@ class TestKiForgeStudio(unittest.TestCase):
         self.assertTrue(dialog.chk_drills.IsEnabled())
         dialog.Destroy()
 
-    def test_advanced_tab_ibom_controls(self):
-        """iBOM appearance controls follow the main iBOM export toggle."""
-        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
-        self.assertEqual(dialog.notebook.GetPageCount(), 3)
-        self.assertEqual(dialog.notebook.GetPageText(1), "Advanced")
-        dialog.chk_ibom.SetValue(False)
-        dialog._sync_ibom_ui_state()
-        for chk in dialog.ibom_checks.values():
-            self.assertFalse(chk.IsEnabled())
-        dialog.chk_ibom.SetValue(True)
-        dialog._sync_ibom_ui_state()
-        for chk in dialog.ibom_checks.values():
-            self.assertTrue(chk.IsEnabled())
-        dialog.Destroy()
-
     def test_custom_preset_opens_advanced_tab(self):
         """Choosing Custom switches to the Advanced tab for individual outputs."""
         dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
@@ -292,13 +277,6 @@ class TestKiForgeStudio(unittest.TestCase):
         self.assertFalse(dialog.chk_sch_pdf.IsChecked())
         self.assertTrue(dialog._export_setting("format_jlc"))
         dialog.Destroy()
-
-    def test_ibom_option_labels_cover_defaults(self):
-        """Every persisted iBOM setting has a Studio control label."""
-        self.assertEqual(
-            set(kiforge_studio.IBOM_OPTION_LABELS),
-            set(kiforge.DEFAULT_IBOM_SETTINGS),
-        )
 
 if __name__ == '__main__':
     unittest.main()
