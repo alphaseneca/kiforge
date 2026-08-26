@@ -273,6 +273,8 @@ my-board_v1.2.0_3d_back.png
 my-board_v1.2.0_front.svg
 my-board_v1.2.0_back.svg
 my-board_v1.2.0_ibom.html   ← <title> and in-page header also updated
+my-board_v1.2.0_pos_neoden.csv    ← generated via templates/gitea-pnp-neoden.yml
+my-board_v1.2.0_pnp_ref_origin.png ← optical alignment reference with origin crosshair
 ```
 
 ---

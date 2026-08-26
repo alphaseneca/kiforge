@@ -101,6 +101,28 @@ KiForge writes all files into `output_dir/` on the GitHub Actions runner — not
 | `<name>_front.svg` | Front copper layer SVG | `export_svg` |
 | `<name>_back.svg` | Back copper layer SVG | `export_svg` |
 | `<name>_ibom.html` | Interactive HTML BOM | `export_ibom` |
+| `<name>_pos_neoden.csv` | NeoDen formatted pick-and-place CSV | `templates/gitea-pnp-neoden.yml` |
+| `<name>_pnp_ref_origin.png` | Front-copper optical alignment image with origin crosshairs | `templates/gitea-pnp-neoden.yml` |
+
+---
+
+## NeoDen Pick-and-Place Post-Processing
+
+For automated SMT assembly on NeoDen pick-and-place machines (e.g. NeoDen 4, NeoDen 9, NeoDen YY1), KiForge includes a dedicated post-process workflow template: `templates/gitea-pnp-neoden.yml`.
+
+### Workflow Features:
+1. **Direct Extraction from PCB:** Runs `kicad-cli pcb export pos` inside KiCad 10 Docker directly on the checked-out `.kicad_pcb`.
+2. **Config-Aware:** Reads `.kiforge.json` (or `.kiforge.json` in the PCB folder) for `pos_side` (`both`, `front`, `back`), `pos_smd_only`, and `pos_exclude_dnp`.
+3. **Format Conversion:** Converts position data to NeoDen column specifications:
+   `Designator, Footprint, Mid X, Mid Y, Layer, Rotation, Comment` (Layer formatted as `T` / `B`).
+4. **Optical Reference Image:** Renders a high-resolution front-copper alignment PNG with optical crosshairs at `aux_axis_origin` (drill/place origin) and `grid_origin` for machine fiducial/board calibration.
+5. **Tag Release Attachment:** Uploads both files directly to the tag release without overwriting other release artifacts.
+
+To enable in your project:
+```bash
+# Copy template into your project's workflow directory
+cp templates/gitea-pnp-neoden.yml <your-kicad-project>/.gitea/workflows/pnp-neoden.yml
+```
 
 ---
 
@@ -115,7 +137,7 @@ When `format_jlc` is enabled (default), KiForge exports with `kicad-cli`, then `
 | `*_bom.csv` | `*_bom_jlc.csv` | Value→Comment, Reference→Designator, `ID`→`LCSC Part #` when `^C\d+$`, `${QUANTITY}`→Quantity |
 | `*_pos.csv` | `*_cpl_jlc.csv` | Ref→Designator, PosX/Y→Mid X/Y, Rot→Rotation, Side→Layer |
 
-Placement uses CSV, millimetres, drill-file origin, and configurable side/SMD/DNP via `export_params`. Add **ID** on symbols for JLC numbers (`C125111`); **MPN** for manufacturer data in the raw BOM only.
+Placement uses CSV, millimetres, drill-file origin, and configurable side (`both`, `front`, `back`), SMD, and DNP via `export_params`. Add **ID** on symbols for JLC numbers (`C125111`); **MPN** for manufacturer data in the raw BOM only.
 
 Disable JLC copies only: `format_jlc: false` or `--no-format-jlc`.
 
@@ -128,8 +150,8 @@ The PCM plugin opens **KiForge Studio** — a tabbed dialog:
 | Tab | Purpose |
 | --- | --- |
 | **Export** | Project folder, output name, presets, live summary |
-| **Advanced** | Individual outputs and BOM options |
-| **Releases** | CD workflow generation and auto-sync |
+| **Advanced** | Individual output toggles, placement sides (`Both`, `Front`, `Back`), SMD/DNP options, BOM columns |
+| **Releases** | CD workflow generation ("Set up workflows") and live auto-sync |
 
 Tab icons load from Google Material Symbols CDN once and cache under `%APPDATA%/kiforge/icon_cache/` (or platform equivalent).
 

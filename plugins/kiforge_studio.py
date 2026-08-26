@@ -647,7 +647,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         mfg_col.AddSpacer(8)
         side_row = wx.BoxSizer(wx.HORIZONTAL)
         side_row.Add(self._muted_label(scroll, "Placement side"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, _PAD_SM)
-        self.choice_pos_side = wx.Choice(scroll, choices=["Both", "Top", "Bottom"])
+        self.choice_pos_side = wx.Choice(scroll, choices=["Both", "Front", "Back"])
         self.choice_pos_side.SetBackgroundColour(_COLORS["input_bg"])
         self.choice_pos_side.SetForegroundColour(_COLORS["input_fg"])
         side_row.Add(self.choice_pos_side, 1, wx.EXPAND)
@@ -746,7 +746,10 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.Bind(wx.EVT_MENU, self.on_save_global_defaults, item_save_global)
         self.Bind(wx.EVT_MENU, self.on_reset_defaults, item_reset)
         btn = event.GetEventObject()
-        btn.PopupMenu(menu)
+        if isinstance(btn, wx.Window):
+            btn.PopupMenu(menu, wx.Point(0, 0))
+        else:
+            self.PopupMenu(menu)
         menu.Destroy()
 
     def _selected_preset_index(self) -> int:

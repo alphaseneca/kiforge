@@ -239,8 +239,8 @@ Current `export_params` keys:
 STEP export always passes `--no-optimize-step` (fixed; not configurable).
 CLI aliases: `--top` → `pos_side=front`, `--bottom` → `pos_side=back`.
 
-Studio Advanced tab controls placement/STEP/BOM params; **Save** writes `export_params`
-to project or global JSON. Successful exports auto-save project settings.
+Studio Advanced tab controls placement/STEP/BOM params; the **Save** menu writes `export_params`
+to project `.kiforge.json` or global `settings.json`.
 
 ### BOM pipeline (`BOM_EXPORT_DEFAULTS`)
 
