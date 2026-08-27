@@ -53,6 +53,7 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertEqual(args.output_dir, "kiforge")
         self.assertTrue(args.export_3d)
         self.assertTrue(args.export_svg)
+        self.assertTrue(args.export_print_pdf)
         self.assertTrue(args.export_bom)
         self.assertTrue(args.export_sch_pdf)
         self.assertTrue(args.export_pos)
@@ -74,6 +75,7 @@ class TestKiForgeCLI(unittest.TestCase):
         args = kiforge.parse_cli_args([
             "--no-export-3d",
             "--no-export-svg",
+            "--no-export-print-pdf",
             "--no-export-bom",
             "--no-export-sch-pdf",
             "--no-export-pos",
@@ -84,6 +86,7 @@ class TestKiForgeCLI(unittest.TestCase):
         ])
         self.assertFalse(args.export_3d)
         self.assertFalse(args.export_svg)
+        self.assertFalse(args.export_print_pdf)
         self.assertFalse(args.export_bom)
         self.assertFalse(args.export_sch_pdf)
         self.assertFalse(args.export_pos)
@@ -1262,6 +1265,83 @@ class TestKiForgeCLI(unittest.TestCase):
                 self.assertTrue(os.path.isfile(output_png))
                 ctx.add_warning.assert_called()
 
+    def test_parse_svg_dimensions(self):
+        """Verify SVG dimensions and viewBox parsing in millimeters."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            svg_file = os.path.join(tmp_dir, "test.svg")
+            with open(svg_file, "w", encoding="utf-8") as f:
+                f.write('<svg width="100mm" height="50mm" viewBox="0 0 100 50"></svg>')
+            min_x, min_y, w, h = kiforge.parse_svg_dimensions(svg_file)
+            self.assertEqual((min_x, min_y), (0.0, 0.0))
+            self.assertEqual((w, h), (100.0, 50.0))
+
+            # Test inch units
+            with open(svg_file, "w", encoding="utf-8") as f:
+                f.write('<svg width="5in" height="3.5in" viewBox="0 0 127 88.9"></svg>')
+            min_x, min_y, w, h = kiforge.parse_svg_dimensions(svg_file)
+            self.assertAlmostEqual(w, 127.0, places=1)
+            self.assertAlmostEqual(h, 88.9, places=1)
+
+    def test_calculate_a4_layout_solver(self):
+        """Verify A4 layout optimization evaluates 8 configurations and selects optimal fit."""
+        # 5x3.5 inch board (127 x 88.9 mm) -> fits stacked portrait
+        layout_5x35 = kiforge.calculate_a4_layout(127.0, 88.9)
+        self.assertEqual(layout_5x35["page_orientation"], "portrait")
+        self.assertFalse(layout_5x35["rotated"])
+        self.assertEqual(layout_5x35["layout_type"], "stacked")
+        self.assertIsNotNone(layout_5x35["front_pos"])
+        self.assertIsNotNone(layout_5x35["back_pos"])
+
+        # 3.5x5 inch board (88.9 x 127 mm tall) -> automatically rotates 90 deg or fits
+        layout_tall = kiforge.calculate_a4_layout(88.9, 127.0)
+        self.assertIn(layout_tall["page_orientation"], ("portrait", "landscape"))
+        self.assertIsNotNone(layout_tall["front_pos"])
+        self.assertIsNotNone(layout_tall["back_pos"])
+
+        # Single layer board placement
+        layout_single = kiforge.calculate_a4_layout(50.0, 40.0, single_layer=True)
+        self.assertEqual(layout_single["layout_type"], "single")
+        self.assertIsNotNone(layout_single["front_pos"])
+        self.assertIsNone(layout_single["back_pos"])
+
+    def test_generate_a4_merged_svg_and_pdf(self):
+        """Verify merged A4 print SVG and 1200 DPI PDF generation."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            front_svg = os.path.join(tmp_dir, "test_front.svg")
+            back_svg = os.path.join(tmp_dir, "test_back.svg")
+            out_svg = os.path.join(tmp_dir, "test_print.svg")
+            out_pdf = os.path.join(tmp_dir, "test_print.pdf")
+
+            with open(front_svg, "w", encoding="utf-8") as f:
+                f.write(
+                    '<svg width="30mm" height="20mm" viewBox="0 0 30 20">'
+                    '<rect x="0" y="0" width="30" height="20" fill="black" />'
+                    '</svg>'
+                )
+            with open(back_svg, "w", encoding="utf-8") as f:
+                f.write(
+                    '<svg width="30mm" height="20mm" viewBox="0 0 30 20">'
+                    '<rect x="0" y="0" width="30" height="20" fill="black" />'
+                    '</svg>'
+                )
+
+            res_svg = kiforge.generate_a4_merged_svg(front_svg, back_svg, out_svg, "test_board")
+            self.assertTrue(res_svg)
+            self.assertTrue(os.path.isfile(out_svg))
+
+            with open(out_svg, "r", encoding="utf-8") as f:
+                svg_content = f.read()
+            self.assertIn("class=\"layer-mark\">F.Cu</text>", svg_content)
+            self.assertIn("class=\"layer-mark\">B.Cu (Mirrored)</text>", svg_content)
+            self.assertIn("class=\"fiducial\"", svg_content)
+            self.assertIn("clip-path=\"url(#clip_front_copper)\"", svg_content)
+
+            res_pdf = kiforge.export_svg_to_1200dpi_pdf(out_svg, out_pdf)
+            self.assertTrue(res_pdf)
+            self.assertTrue(os.path.isfile(out_pdf))
+            self.assertGreater(os.path.getsize(out_pdf), 0)
+
 
 if __name__ == '__main__':
     unittest.main()
+

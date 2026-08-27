@@ -31,6 +31,7 @@ build_cli_args() {
   # Export toggles (EXPORT_SETTING_KEYS)
   append_bool_toggle INPUT_EXPORT_3D export-3d
   append_bool_toggle INPUT_EXPORT_SVG export-svg
+  append_bool_toggle INPUT_EXPORT_PRINT_PDF export-print-pdf
   append_bool_toggle INPUT_EXPORT_BOM export-bom
   append_bool_toggle INPUT_EXPORT_SCH_PDF export-sch-pdf
   append_bool_toggle INPUT_EXPORT_POS export-pos

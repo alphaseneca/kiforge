@@ -27,6 +27,7 @@ jobs:
           output_dir: '{{OUTPUT_DIR}}'
           export_3d: '{{EXPORT_3D}}'
           export_svg: '{{EXPORT_SVG}}'
+          export_print_pdf: '{{EXPORT_PRINT_PDF}}'
           export_bom: '{{EXPORT_BOM}}'
           export_sch_pdf: '{{EXPORT_SCH_PDF}}'
           export_pos: '{{EXPORT_POS}}'

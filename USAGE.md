@@ -63,6 +63,7 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `export_step` | Export STEP 3D model | `'true'` |
 | `export_3d` | Export front & back 3D PNG renders | `'true'` |
 | `export_svg` | Export front & back copper layer SVGs | `'true'` |
+| `export_print_pdf` | Export 1200 DPI print-ready etching & mask PDF (1:1 true scale) | `'true'` |
 | `export_ibom` | Export Interactive HTML BOM | `'true'` |
 | `format_jlc` | Also produce JLC-ready BOM/CPL from KiCad CSV exports | `'true'` |
 | `pos_side` | Placement CSV side: `both`, `front` (top), or `back` (bottom) | `'both'` |
@@ -98,8 +99,10 @@ KiForge writes all files into `output_dir/` on the GitHub Actions runner — not
 | `<name>.step` | STEP 3D model | `export_step` |
 | `<name>_3d_front.png` | 3D front render | `export_3d` |
 | `<name>_3d_back.png` | 3D back render | `export_3d` |
-| `<name>_front.svg` | Front copper layer SVG | `export_svg` |
-| `<name>_back.svg` | Back copper layer SVG | `export_svg` |
+| `<name>_front.svg` | Front copper layer SVG (negative B&W) | `export_svg` |
+| `<name>_back.svg` | Back copper layer SVG (mirrored negative B&W) | `export_svg` |
+| `<name>_homebrew.svg` | Merged A4 homebrew etching sheet with calibration scale & optical fiducials | `export_svg` |
+| `<name>_homebrew.pdf` | 1200 DPI homebrew etching & mask PDF (1:1 true scale) | `export_print_pdf` |
 | `<name>_ibom.html` | Interactive HTML BOM | `export_ibom` |
 | `<name>_pos_neoden.csv` | NeoDen formatted pick-and-place CSV | `templates/gitea-pnp-neoden.yml` |
 | `<name>_pnp_ref_origin.png` | Front-copper optical alignment image with origin crosshairs | `templates/gitea-pnp-neoden.yml` |

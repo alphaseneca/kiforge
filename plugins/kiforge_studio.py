@@ -279,6 +279,7 @@ EXPORT_PRESETS = {
         "export_step": True,
         "export_3d": True,
         "export_svg": True,
+        "export_print_pdf": True,
         "format_jlc": True,
     },
     "jlcpcb": {
@@ -291,6 +292,7 @@ EXPORT_PRESETS = {
         "export_step": False,
         "export_3d": False,
         "export_svg": False,
+        "export_print_pdf": False,
         "format_jlc": True,
     },
     "documentation": {
@@ -303,12 +305,13 @@ EXPORT_PRESETS = {
         "export_step": True,
         "export_3d": True,
         "export_svg": True,
+        "export_print_pdf": True,
         "format_jlc": False,
     },
 }
 _EXPORT_TOGGLE_KEYS = (
     "export_gerbers", "export_drills", "export_pos", "export_bom", "export_ibom",
-    "export_sch_pdf", "export_step", "export_3d", "export_svg",
+    "export_sch_pdf", "export_step", "export_3d", "export_svg", "export_print_pdf",
 )
 
 _TAB_ICON_NAMES = ("export", "advanced", "releases")
@@ -673,10 +676,15 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_step = wx.CheckBox(scroll, label="STEP")
         self.chk_3d = wx.CheckBox(scroll, label="3D renders")
         self.chk_svg = wx.CheckBox(scroll, label="Copper SVG")
+        self.chk_print_pdf = wx.CheckBox(scroll, label="Homebrew PDF")
         for chk in (self.chk_sch_pdf, self.chk_step, self.chk_3d, self.chk_svg):
             self._style_choice(chk)
             doc_col.Add(chk, 0, wx.TOP, 4)
             chk.Bind(wx.EVT_CHECKBOX, self.on_export_checkbox_changed)
+
+        self._style_choice(self.chk_print_pdf)
+        doc_col.Add(self.chk_print_pdf, 0, wx.TOP, 4)
+        self.chk_print_pdf.Bind(wx.EVT_CHECKBOX, self.on_print_pdf_toggled)
 
         columns.Add(mfg_col, 1, wx.EXPAND | wx.RIGHT, 12)
         columns.Add(doc_col, 1, wx.EXPAND)
@@ -795,6 +803,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             "export_step": self.chk_step,
             "export_3d": self.chk_3d,
             "export_svg": self.chk_svg,
+            "export_print_pdf": self.chk_print_pdf,
         }
         self._applying_preset = True
         try:
@@ -806,6 +815,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                     checkbox_map[key].SetValue(value)
             self._set_preset_choice(preset_id)
             self._sync_drill_checkbox_state()
+            self._sync_svg_pdf_checkbox_state()
             self._update_export_summary()
             self._schedule_cd_sync()
         finally:
@@ -838,6 +848,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             "export_step": "chk_step",
             "export_3d": "chk_3d",
             "export_svg": "chk_svg",
+            "export_print_pdf": "chk_print_pdf",
         }
         return mapping[export_key]
 
@@ -853,6 +864,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             "export_step": "STEP",
             "export_3d": "3D renders",
             "export_svg": "SVG",
+            "export_print_pdf": "Homebrew PDF",
         }
         for key in _EXPORT_TOGGLE_KEYS:
             if getattr(self, self._export_checkbox_attr(key)).IsChecked():
@@ -936,12 +948,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_step.SetValue(self._export_setting('export_step'))
         self.chk_3d.SetValue(self._export_setting('export_3d'))
         self.chk_svg.SetValue(self._export_setting('export_svg'))
+        self.chk_print_pdf.SetValue(self._export_setting('export_print_pdf'))
         self.txt_output_dir.SetValue(self.settings.get('output_dir', 'kiforge'))
         self.chk_generate_cd.SetValue(
             self._export_setting('generate_cd', self.settings.get('generate_ci', True))
         )
         self._set_preset_choice(self._detect_active_preset())
         self._sync_drill_checkbox_state()
+        self._sync_svg_pdf_checkbox_state()
         self._update_export_summary()
         self._apply_export_params_to_ui()
 
@@ -996,6 +1010,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             'export_step': self.chk_step.IsChecked(),
             'export_3d': self.chk_3d.IsChecked(),
             'export_svg': self.chk_svg.IsChecked(),
+            'export_print_pdf': self.chk_print_pdf.IsChecked(),
             'format_jlc': self._export_setting('format_jlc'),
             'generate_cd': self.chk_generate_cd.IsChecked(),
         }
@@ -1014,11 +1029,26 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         else:
             self.chk_drills.Enable()
 
+    def _sync_svg_pdf_checkbox_state(self):
+        """Copper SVG export is required whenever Print PDF is enabled."""
+        if self.chk_print_pdf.IsChecked():
+            self.chk_svg.SetValue(True)
+            self.chk_svg.Disable()
+        else:
+            self.chk_svg.Enable()
+
     def on_gerbers_toggled(self, event):
         """Keep drill export aligned with Gerber export requirements."""
         if event is not None and hasattr(event, "Skip"):
             event.Skip()
         self._sync_drill_checkbox_state()
+        self.on_export_checkbox_changed(event)
+
+    def on_print_pdf_toggled(self, event):
+        """Keep Copper SVG export aligned with Print PDF requirements."""
+        if event is not None and hasattr(event, "Skip"):
+            event.Skip()
+        self._sync_svg_pdf_checkbox_state()
         self.on_export_checkbox_changed(event)
 
     def on_project_dir_changed(self, event):

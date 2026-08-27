@@ -32,7 +32,8 @@ All outputs are versioned automatically in every run (GUI, CLI, and CD) — ever
 | Schematic PDF | `<name>_sch.pdf` | `export_sch_pdf` |
 | STEP 3D Model | `<name>.step` | `export_step` |
 | 3D Front & Back Renders | `<name>_3d_front/back.png` | `export_3d` |
-| Copper Layer SVGs | `<name>_front/back.svg` | `export_svg` |
+| Copper Layer SVGs | `<name>_front.svg`, `<name>_back.svg`, `<name>_homebrew.svg` | `export_svg` |
+| Homebrew Etching PDF | `<name>_homebrew.pdf` | `export_print_pdf` |
 | Interactive HTML BOM | `<name>_ibom.html` | `export_ibom` |
 
 ---
@@ -148,6 +149,7 @@ Every input is optional. All exports are enabled by default — set to `'false'`
 | `export_step` | STEP 3D model | `'true'` |
 | `export_3d` | Front & back 3D renders (PNG) | `'true'` |
 | `export_svg` | Front & back copper layer SVGs | `'true'` |
+| `export_print_pdf` | 1200 DPI print-ready etching & mask PDF | `'true'` |
 | `export_ibom` | Interactive HTML BOM | `'true'` |
 | `format_jlc` | JLC-ready BOM/CPL column formatting | `'true'` |
 

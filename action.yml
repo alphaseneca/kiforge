@@ -32,6 +32,10 @@ inputs:
     description: 'Export copper layer SVGs (true/false)'
     required: false
     default: 'true'
+  export_print_pdf:
+    description: 'Export 1200 DPI print-ready etching & mask PDF (true/false)'
+    required: false
+    default: 'true'
   export_bom:
     description: 'Export Bill of Materials (true/false)'
     required: false
@@ -105,6 +109,7 @@ runs:
         INPUT_OUTPUT_DIR: ${{ inputs.output_dir }}
         INPUT_EXPORT_3D: ${{ inputs.export_3d }}
         INPUT_EXPORT_SVG: ${{ inputs.export_svg }}
+        INPUT_EXPORT_PRINT_PDF: ${{ inputs.export_print_pdf }}
         INPUT_EXPORT_BOM: ${{ inputs.export_bom }}
         INPUT_EXPORT_SCH_PDF: ${{ inputs.export_sch_pdf }}
         INPUT_EXPORT_POS: ${{ inputs.export_pos }}

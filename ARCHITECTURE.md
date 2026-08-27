@@ -95,7 +95,7 @@ Schematic PDF export optionally writes `(rev …)` into a staged schematic copy 
 
 ### Phase 2: Pipeline Initialization
 `ExportRunner` builds an ordered task pipeline consisting of two parts:
-1. **CLI Core Exporters**: Runs `kicad-cli` commands to generate raw Gerbers, drills, positions, BOMs, schematic PDFs, STEP models, 3D renders, SVGs, and Interactive HTML BOMs.
+1. **CLI Core Exporters**: Runs `kicad-cli` commands to generate raw Gerbers, drills, positions, BOMs, schematic PDFs, STEP models, 3D renders, vector SVGs (plus an intelligent A4 merged `{name}_homebrew.svg` and 1200 DPI `{name}_homebrew.pdf` for home etching/printing), and Interactive HTML BOMs.
 2. **Post-Processors**:
    - `GerberPackTask` — zip `temp_gerbers/` into `{name}_gerbers.zip`
    - `BomOutputTask` — rename `raw_bom.csv` → `{name}_bom.csv`; optionally `{name}_bom_jlc.csv`

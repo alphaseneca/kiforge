@@ -111,6 +111,7 @@ import json
 import re
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 
 # Ensure the user's local site-packages folder is in sys.path
 # This is critical for KiCad's isolated Python environment to recognize --user pip packages.
@@ -213,6 +214,7 @@ DEFAULT_EXPORT_SETTINGS = {
     "export_step": True,
     "export_3d": True,
     "export_svg": True,
+    "export_print_pdf": True,
     "format_jlc": True,
     "generate_cd": True,
 }
@@ -1367,7 +1369,7 @@ def export_options_from_context(context: "ExportContext") -> dict:
     """
     keys = (
         "export_gerbers", "export_drills", "export_pos", "export_bom", "export_ibom",
-        "export_sch_pdf", "export_step", "export_3d", "export_svg", "format_jlc",
+        "export_sch_pdf", "export_step", "export_3d", "export_svg", "export_print_pdf", "format_jlc",
         "generate_cd", "version",
     )
     options = {key: context.options.get(key, DEFAULT_SETTINGS.get(key, True)) for key in keys}
@@ -2340,11 +2342,561 @@ class Render3dExportTask(ExportTask):
         return ok_front or ok_back
 
 
+def parse_svg_dimensions(svg_path: str) -> tuple[float, float, float, float]:
+    """
+    Parse the bounding dimensions of an SVG in millimeters.
+
+    Returns:
+        tuple[float, float, float, float]: (min_x, min_y, width_mm, height_mm)
+    """
+    try:
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+        vb = root.attrib.get("viewBox", "")
+        w_str = root.attrib.get("width", "")
+        h_str = root.attrib.get("height", "")
+
+        def parse_len(val):
+            if not val:
+                return None
+            val = str(val).strip().lower()
+            if val.endswith("mm"):
+                return float(val[:-2])
+            elif val.endswith("in") or val.endswith("inch"):
+                return float(val.replace("inch", "").replace("in", "")) * 25.4
+            elif val.endswith("pt"):
+                return float(val[:-2]) * (25.4 / 72.0)
+            elif val.endswith("cm"):
+                return float(val[:-2]) * 10.0
+            elif val.endswith("px"):
+                return float(val[:-2]) * (25.4 / 96.0)
+            try:
+                return float(val)
+            except ValueError:
+                return None
+
+        w_mm = parse_len(w_str)
+        h_mm = parse_len(h_str)
+        min_x, min_y = 0.0, 0.0
+
+        if vb:
+            parts = [float(p) for p in re.split(r"[\s,]+", vb.strip()) if p]
+            if len(parts) == 4:
+                min_x, min_y = parts[0], parts[1]
+                vb_w, vb_h = parts[2], parts[3]
+                if w_mm is None:
+                    w_mm = vb_w
+                if h_mm is None:
+                    h_mm = vb_h
+
+        return (min_x, min_y, w_mm or 100.0, h_mm or 80.0)
+    except Exception:
+        return (0.0, 0.0, 100.0, 80.0)
+
+
+def calculate_a4_layout(
+    board_w_mm: float,
+    board_h_mm: float,
+    gap_mm: float = 10.0,
+    margin_mm: float = 8.0,
+    single_layer: bool = False,
+) -> dict:
+    """
+    Calculate the optimal 2D arrangement for Front and Back copper layers on an A4 sheet.
+
+    Evaluates candidate configurations across both Portrait (210 x 297 mm) and Landscape (297 x 210 mm)
+    orientations, testing unrotated (0°) and 90° rotated boards in stacked and side-by-side layouts.
+    """
+    A4_PORTRAIT = (210.0, 297.0)
+    A4_LANDSCAPE = (297.0, 210.0)
+
+    candidates = []
+
+    for page_name, (pw, ph), page_bonus in [("portrait", A4_PORTRAIT, 20.0), ("landscape", A4_LANDSCAPE, 0.0)]:
+        usable_w = pw - 2 * margin_mm
+        usable_h = ph - 2 * margin_mm
+
+        if single_layer:
+            for rotated in [False, True]:
+                bw = board_h_mm if rotated else board_w_mm
+                bh = board_w_mm if rotated else board_h_mm
+                if bw <= usable_w and bh <= usable_h:
+                    mx = (pw - bw) / 2.0
+                    my = (ph - bh) / 2.0
+                    score = page_bonus + (15.0 if not rotated else 0.0) + min(mx, my)
+                    candidates.append({
+                        "page_orientation": page_name,
+                        "page_w": pw, "page_h": ph,
+                        "rotated": rotated,
+                        "layout_type": "single",
+                        "front_pos": (mx, my),
+                        "back_pos": None,
+                        "board_w": bw, "board_h": bh,
+                        "orig_w": board_w_mm, "orig_h": board_h_mm,
+                        "gap": 0.0,
+                        "score": score,
+                    })
+        else:
+            for rotated in [False, True]:
+                bw = board_h_mm if rotated else board_w_mm
+                bh = board_w_mm if rotated else board_h_mm
+
+                # 1. Stacked (Vertical: Front on top, Back on bottom)
+                min_total_h = 2 * bh + gap_mm
+                if bw <= usable_w and min_total_h <= usable_h:
+                    extra_h = usable_h - min_total_h
+                    actual_gap = min(gap_mm + extra_h * 0.3, 30.0)
+                    total_h = 2 * bh + actual_gap
+                    mx = (pw - bw) / 2.0
+                    my_start = (ph - total_h) / 2.0
+
+                    score = page_bonus + (15.0 if not rotated else 0.0) + 10.0 + min(mx, my_start)
+                    candidates.append({
+                        "page_orientation": page_name,
+                        "page_w": pw, "page_h": ph,
+                        "rotated": rotated,
+                        "layout_type": "stacked",
+                        "front_pos": (mx, my_start),
+                        "back_pos": (mx, my_start + bh + actual_gap),
+                        "board_w": bw, "board_h": bh,
+                        "orig_w": board_w_mm, "orig_h": board_h_mm,
+                        "cut_line": (
+                            (mx - 4.0, my_start + bh + actual_gap / 2.0),
+                            (mx + bw + 4.0, my_start + bh + actual_gap / 2.0),
+                        ),
+                        "gap": actual_gap,
+                        "score": score,
+                    })
+
+                # 2. Side-by-Side (Horizontal: Front left, Back right)
+                min_total_w = 2 * bw + gap_mm
+                if min_total_w <= usable_w and bh <= usable_h:
+                    extra_w = usable_w - min_total_w
+                    actual_gap = min(gap_mm + extra_w * 0.3, 30.0)
+                    total_w = 2 * bw + actual_gap
+                    mx_start = (pw - total_w) / 2.0
+                    my = (ph - bh) / 2.0
+
+                    score = page_bonus + (15.0 if not rotated else 0.0) + min(mx_start, my)
+                    candidates.append({
+                        "page_orientation": page_name,
+                        "page_w": pw, "page_h": ph,
+                        "rotated": rotated,
+                        "layout_type": "side_by_side",
+                        "front_pos": (mx_start, my),
+                        "back_pos": (mx_start + bw + actual_gap, my),
+                        "board_w": bw, "board_h": bh,
+                        "orig_w": board_w_mm, "orig_h": board_h_mm,
+                        "cut_line": (
+                            (mx_start + bw + actual_gap / 2.0, my - 4.0),
+                            (mx_start + bw + actual_gap / 2.0, my + bh + 4.0),
+                        ),
+                        "gap": actual_gap,
+                        "score": score,
+                    })
+
+    if not candidates:
+        return {
+            "page_orientation": "portrait",
+            "page_w": 210.0, "page_h": 297.0,
+            "rotated": False,
+            "layout_type": "stacked",
+            "front_pos": (margin_mm, margin_mm),
+            "back_pos": (margin_mm, margin_mm + board_h_mm + 15.0) if not single_layer else None,
+            "board_w": board_w_mm, "board_h": board_h_mm,
+            "orig_w": board_w_mm, "orig_h": board_h_mm,
+            "gap": gap_mm,
+            "score": -1,
+        }
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[0]
+
+
+def _build_crosshairs_svg(pos_x: float, pos_y: float, width: float, height: float, offset: float = 2.5) -> str:
+    """Generate optical corner fiducials and alignment crosshairs with clear margin from board edges."""
+    corners = [
+        (pos_x - offset, pos_y - offset),
+        (pos_x + width + offset, pos_y - offset),
+        (pos_x - offset, pos_y + height + offset),
+        (pos_x + width + offset, pos_y + height + offset),
+    ]
+    elements = []
+    for cx, cy in corners:
+        elements.append(
+            f'<g class="fiducial">'
+            f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="1.2" />'
+            f'<line x1="{cx - 2.5:.3f}" y1="{cy:.3f}" x2="{cx + 2.5:.3f}" y2="{cy:.3f}" />'
+            f'<line x1="{cx:.3f}" y1="{cy - 2.5:.3f}" x2="{cx:.3f}" y2="{cy + 2.5:.3f}" />'
+            f'</g>'
+        )
+    return "\n".join(elements)
+
+
+def _extract_svg_body(svg_path: str) -> str:
+    """Extract graphic elements from an SVG file, preserving exact SVG syntax without namespace prefixes."""
+    if not os.path.isfile(svg_path):
+        return ""
+    try:
+        with open(svg_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        content = re.sub(r"<\?xml[^>]*\?>", "", content)
+        content = re.sub(r"<!DOCTYPE[^>]*>", "", content)
+        match = re.search(r"<svg\b[^>]*>(.*)</svg>", content, re.DOTALL | re.IGNORECASE)
+        if match:
+            inner = match.group(1).strip()
+            inner = re.sub(r"<title\b[^>]*>.*?</title>", "", inner, flags=re.DOTALL | re.IGNORECASE)
+            inner = re.sub(r"<desc\b[^>]*>.*?</desc>", "", inner, flags=re.DOTALL | re.IGNORECASE)
+            return inner
+        return ""
+    except Exception:
+        return ""
+
+
+def generate_a4_merged_svg(
+    front_svg_path: str | None,
+    back_svg_path: str | None,
+    output_svg_path: str,
+    pcb_name: str,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """
+    Merge front and back copper layer SVGs into an A4 print sheet with coordinate normalization,
+    clip-path containment, alignment crosshairs, generous middle spacing, and true 1:1 scale.
+    """
+    has_front = bool(front_svg_path and os.path.isfile(front_svg_path))
+    has_back = bool(back_svg_path and os.path.isfile(back_svg_path))
+
+    if not has_front and not has_back:
+        return False
+
+    ref_svg = front_svg_path if has_front else back_svg_path
+    _, _, board_w, board_h = parse_svg_dimensions(ref_svg)
+
+    single_layer = not (has_front and has_back)
+    layout = calculate_a4_layout(board_w, board_h, gap_mm=15.0, margin_mm=8.0, single_layer=single_layer)
+
+    if layout.get("score", 0) < 0:
+        if logger:
+            logger.warning("Board dimensions (%.1f x %.1f mm) exceed printable single-page A4 area.", board_w, board_h)
+        return False
+
+    pw, ph = layout["page_w"], layout["page_h"]
+    rotated = layout["rotated"]
+    bw, bh = layout["board_w"], layout["board_h"]
+    orig_w, orig_h = layout["orig_w"], layout["orig_h"]
+
+    clip_defs = []
+    layers_svg = []
+
+    # Front Board
+    if has_front and layout["front_pos"]:
+        fx, fy = layout["front_pos"]
+        min_fx, min_fy, _, _ = parse_svg_dimensions(front_svg_path)
+        body_f = _extract_svg_body(front_svg_path)
+
+        clip_defs.append(
+            f'    <clipPath id="clip_front_copper">\n'
+            f'      <rect x="{fx:.3f}" y="{fy:.3f}" width="{bw:.3f}" height="{bh:.3f}" />\n'
+            f'    </clipPath>'
+        )
+
+        if rotated:
+            transform_f = f'translate({fx + orig_h:.3f}, {fy:.3f}) rotate(90) translate({-min_fx:.3f}, {-min_fy:.3f})'
+        else:
+            transform_f = f'translate({fx - min_fx:.3f}, {fy - min_fy:.3f})'
+
+        content_f = (
+            f'  <g id="layer_front_copper" clip-path="url(#clip_front_copper)">\n'
+            f'    <g transform="{transform_f}">\n'
+            f'{body_f}\n'
+            f'    </g>\n'
+            f'  </g>'
+        )
+        crosshairs_f = _build_crosshairs_svg(fx, fy, bw, bh)
+        mark_f = f'  <text x="{fx + bw / 2.0:.2f}" y="{fy - 2.5:.2f}" class="layer-mark">F.Cu</text>'
+        layers_svg.append(f"  <!-- FRONT COPPER LAYER (F.Cu) -->\n{content_f}\n{crosshairs_f}\n{mark_f}")
+
+    # Back Board
+    if has_back and layout["back_pos"]:
+        bx, by = layout["back_pos"]
+        min_bx, min_by, _, _ = parse_svg_dimensions(back_svg_path)
+        body_b = _extract_svg_body(back_svg_path)
+
+        clip_defs.append(
+            f'    <clipPath id="clip_back_copper">\n'
+            f'      <rect x="{bx:.3f}" y="{by:.3f}" width="{bw:.3f}" height="{bh:.3f}" />\n'
+            f'    </clipPath>'
+        )
+
+        if rotated:
+            transform_b = f'translate({bx + orig_h:.3f}, {by:.3f}) rotate(90) translate({-min_bx:.3f}, {-min_by:.3f})'
+        else:
+            transform_b = f'translate({bx - min_bx:.3f}, {by - min_by:.3f})'
+
+        content_b = (
+            f'  <g id="layer_back_copper" clip-path="url(#clip_back_copper)">\n'
+            f'    <g transform="{transform_b}">\n'
+            f'{body_b}\n'
+            f'    </g>\n'
+            f'  </g>'
+        )
+        crosshairs_b = _build_crosshairs_svg(bx, by, bw, bh)
+        mark_b = f'  <text x="{bx + bw / 2.0:.2f}" y="{by - 2.5:.2f}" class="layer-mark">B.Cu (Mirrored)</text>'
+        layers_svg.append(f"  <!-- BACK COPPER LAYER (B.Cu Mirrored) -->\n{content_b}\n{crosshairs_b}\n{mark_b}")
+
+    # Cut/fold line
+    cut_line_svg = ""
+    if "cut_line" in layout:
+        (x1, y1), (x2, y2) = layout["cut_line"]
+        cut_line_svg = f'  <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" class="guide" id="cut_guide" />'
+
+    # Conditional calibration scale bar (only placed if ample bottom margin >= 22mm exists)
+    calibration_svg = ""
+    lowest_y = max(
+        (layout["front_pos"][1] + bh) if layout.get("front_pos") else 0,
+        (layout["back_pos"][1] + bh) if layout.get("back_pos") else 0,
+    )
+    if (ph - lowest_y) >= 22.0:
+        ruler_x = (pw - 50.0) / 2.0
+        ruler_y = ph - 12.0
+        calibration_svg = f"""  <!-- 50.0 mm Calibration Scale Bar -->
+  <g id="calibration_ruler" transform="translate({ruler_x:.2f}, {ruler_y:.2f})">
+    <rect x="0" y="0" width="50" height="1.0" class="ruler-bar" />
+    <line x1="0" y1="-2.0" x2="0" y2="3.0" stroke="#000000" stroke-width="0.3" />
+    <line x1="10" y1="-1.2" x2="10" y2="2.2" stroke="#000000" stroke-width="0.2" />
+    <line x1="20" y1="-1.2" x2="20" y2="2.2" stroke="#000000" stroke-width="0.2" />
+    <line x1="30" y1="-1.2" x2="30" y2="2.2" stroke="#000000" stroke-width="0.2" />
+    <line x1="40" y1="-1.2" x2="40" y2="2.2" stroke="#000000" stroke-width="0.2" />
+    <line x1="50" y1="-2.0" x2="50" y2="3.0" stroke="#000000" stroke-width="0.3" />
+    <text x="25" y="6.5" class="ruler-text" text-anchor="middle">50 mm CALIBRATION</text>
+  </g>"""
+
+    all_defs_str = "\n".join(clip_defs)
+    all_layers_str = "\n\n".join(layers_svg)
+
+    svg_doc = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1"
+     width="{pw:.1f}mm" height="{ph:.1f}mm" viewBox="0 0 {pw:.1f} {ph:.1f}">
+  <style>
+    .layer-mark {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 2.2mm; font-weight: bold; fill: #000000; text-anchor: middle; }}
+    .guide {{ stroke: #888888; stroke-width: 0.2; stroke-dasharray: 2, 2; }}
+    .fiducial {{ stroke: #000000; stroke-width: 0.15; fill: none; }}
+    .ruler-bar {{ fill: #000000; }}
+    .ruler-text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 1.6mm; fill: #000000; }}
+  </style>
+
+  <defs>
+{all_defs_str}
+  </defs>
+
+  <!-- Solid White A4 Sheet Background -->
+  <rect width="{pw:.1f}" height="{ph:.1f}" fill="#FFFFFF" />
+
+{all_layers_str}
+
+{cut_line_svg}
+
+{calibration_svg}
+</svg>
+"""
+
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(output_svg_path)), exist_ok=True)
+        with open(output_svg_path, "w", encoding="utf-8") as f:
+            f.write(svg_doc)
+        if logger:
+            logger.info("Generated merged A4 homebrew SVG: %s", output_svg_path)
+        return True
+    except Exception as exc:
+        if logger:
+            logger.error("Failed to write merged A4 SVG '%s': %s", output_svg_path, exc)
+        return False
+
+
+def generate_single_a4_sheet_svg(
+    layer_svg_path: str,
+    output_svg_path: str,
+    mark: str = "F.Cu",
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Generate a single-layer A4 sheet for 1-board-per-page multi-page homebrew PDF export."""
+    if not os.path.isfile(layer_svg_path):
+        return False
+    try:
+        min_x, min_y, bw, bh = parse_svg_dimensions(layer_svg_path)
+        body = _extract_svg_body(layer_svg_path)
+        pw, ph = 210.0, 297.0
+
+        rotated = False
+        if bw > (pw - 16.0) or bh > (ph - 16.0):
+            if bh <= (pw - 16.0) and bw <= (ph - 16.0):
+                rotated = True
+
+        orig_w, orig_h = bw, bh
+        w = orig_h if rotated else orig_w
+        h = orig_w if rotated else orig_h
+
+        x = (pw - w) / 2.0
+        y = (ph - h) / 2.0
+
+        if rotated:
+            transform = f'translate({x + orig_h:.3f}, {y:.3f}) rotate(90) translate({-min_x:.3f}, {-min_y:.3f})'
+        else:
+            transform = f'translate({x - min_x:.3f}, {y - min_y:.3f})'
+
+        crosshairs = _build_crosshairs_svg(x, y, w, h)
+        layer_id = "layer_front_copper" if "F" in mark else "layer_back_copper"
+        clip_id = "clip_single_front" if "F" in mark else "clip_single_back"
+
+        svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1"
+     width="{pw:.1f}mm" height="{ph:.1f}mm" viewBox="0 0 {pw:.1f} {ph:.1f}">
+  <style>
+    .layer-mark {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 2.5mm; font-weight: bold; fill: #000000; text-anchor: middle; }}
+    .fiducial {{ stroke: #000000; stroke-width: 0.15; fill: none; }}
+    .ruler-bar {{ fill: #000000; }}
+    .ruler-text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 1.6mm; fill: #000000; }}
+  </style>
+  <defs>
+    <clipPath id="{clip_id}">
+      <rect x="{x:.3f}" y="{y:.3f}" width="{w:.3f}" height="{h:.3f}" />
+    </clipPath>
+  </defs>
+  <rect width="{pw:.1f}" height="{ph:.1f}" fill="#FFFFFF" />
+  <g id="{layer_id}" clip-path="url(#{clip_id})">
+    <g transform="{transform}">
+{body}
+    </g>
+  </g>
+{crosshairs}
+  <text x="{x + w / 2.0:.2f}" y="{y - 3.0:.2f}" class="layer-mark">{mark}</text>
+  <!-- 50.0 mm Calibration Scale Bar -->
+  <g id="calibration_ruler" transform="translate({(pw - 50.0) / 2.0:.2f}, {ph - 12.0:.2f})">
+    <rect x="0" y="0" width="50" height="1.0" class="ruler-bar" />
+    <line x1="0" y1="-2.0" x2="0" y2="3.0" stroke="#000000" stroke-width="0.3" />
+    <line x1="10" y1="-1.2" x2="10" y2="2.2" stroke="#000000" stroke-width="0.2" />
+    <line x1="20" y1="-1.2" x2="20" y2="2.2" stroke="#000000" stroke-width="0.2" />
+    <line x1="30" y1="-1.2" x2="30" y2="2.2" stroke="#000000" stroke-width="0.2" />
+    <line x1="40" y1="-1.2" x2="40" y2="2.2" stroke="#000000" stroke-width="0.2" />
+    <line x1="50" y1="-2.0" x2="50" y2="3.0" stroke="#000000" stroke-width="0.3" />
+    <text x="25" y="6.5" class="ruler-text" text-anchor="middle">50 mm CALIBRATION</text>
+  </g>
+</svg>"""
+        os.makedirs(os.path.dirname(os.path.abspath(output_svg_path)), exist_ok=True)
+        with open(output_svg_path, "w", encoding="utf-8") as f:
+            f.write(svg)
+        return True
+    except Exception as exc:
+        if logger:
+            logger.error("Failed to write single A4 sheet '%s': %s", output_svg_path, exc)
+        return False
+
+
+def export_svg_to_1200dpi_pdf(
+    svg_path: str | list[str],
+    output_pdf_path: str,
+    is_landscape: bool = False,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """
+    Render SVG file(s) into a true 1:1 scale 1200 DPI vector / high-res PDF.
+
+    Accepts either a single SVG file path (1-page PDF) or a list of SVG paths (multi-page PDF).
+    """
+    svg_paths = [svg_path] if isinstance(svg_path, str) else list(svg_path)
+    svg_paths = [p for p in svg_paths if p and os.path.isfile(p)]
+    if not svg_paths:
+        return False
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_pdf_path)), exist_ok=True)
+
+    # --- Tier 1: PyQt6 (Vector 1200 DPI PDF) ---
+    try:
+        from PyQt6 import QtCore, QtGui, QtSvg
+        app = QtGui.QGuiApplication.instance()
+        if app is None:
+            app = QtGui.QGuiApplication([])
+        writer = QtGui.QPdfWriter(output_pdf_path)
+        writer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.PageSizeId.A4))
+        if is_landscape:
+            writer.setPageOrientation(QtGui.QPageLayout.Orientation.Landscape)
+        else:
+            writer.setPageOrientation(QtGui.QPageLayout.Orientation.Portrait)
+        writer.setResolution(1200)
+        writer.setPageMargins(QtCore.QMarginsF(0, 0, 0, 0))
+
+        painter = QtGui.QPainter(writer)
+        for idx, sp in enumerate(svg_paths):
+            if idx > 0:
+                writer.newPage()
+            renderer = QtSvg.QSvgRenderer(sp)
+            renderer.render(painter)
+        painter.end()
+
+        if os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
+            if logger:
+                logger.info("Exported 1200 DPI vector PDF (%d page(s)) via PyQt6: %s", len(svg_paths), output_pdf_path)
+            return True
+    except Exception as exc:
+        if logger:
+            logger.debug("PyQt6 PDF export unavailable or failed: %s", exc)
+
+    # --- Tier 2: wxPython + Pillow (1200 DPI High-Resolution Raster PDF) ---
+    try:
+        import wx
+        from PIL import Image
+        app = wx.GetApp()
+        if app is None:
+            app = wx.App()
+        dpi = 1200
+        if is_landscape:
+            pw_px = int(297.0 / 25.4 * dpi)
+            ph_px = int(210.0 / 25.4 * dpi)
+        else:
+            pw_px = int(210.0 / 25.4 * dpi)
+            ph_px = int(297.0 / 25.4 * dpi)
+
+        frames = []
+        for sp in svg_paths:
+            bundle = wx.BitmapBundle.FromSVGFile(sp, wx.Size(pw_px, ph_px))
+            if bundle.IsOk():
+                bmp = bundle.GetBitmap(wx.Size(pw_px, ph_px))
+                img = bmp.ConvertToImage()
+                pil_img = Image.frombuffer("RGB", (img.GetWidth(), img.GetHeight()), img.GetData(), "raw", "RGB", 0, 1)
+                bw_img = pil_img.convert("1", dither=Image.Dither.NONE)
+                frames.append(bw_img)
+        if frames:
+            frames[0].save(output_pdf_path, "PDF", resolution=float(dpi), save_all=True, append_images=frames[1:])
+            if os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
+                if logger:
+                    logger.info("Exported 1200 DPI PDF (%d page(s)) via wx+Pillow: %s", len(frames), output_pdf_path)
+                return True
+    except Exception as exc:
+        if logger:
+            logger.debug("wx+Pillow PDF export failed: %s", exc)
+
+    # --- Tier 3: CLI Tools (Inkscape / rsvg-convert / cairosvg) ---
+    inkscape = shutil.which("inkscape")
+    if inkscape and len(svg_paths) == 1:
+        try:
+            res = subprocess.run([inkscape, svg_paths[0], f"--export-filename={output_pdf_path}", "--export-dpi=1200"], capture_output=True)
+            if res.returncode == 0 and os.path.isfile(output_pdf_path):
+                if logger:
+                    logger.info("Exported 1200 DPI PDF via Inkscape: %s", output_pdf_path)
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
 class SvgExportTask(ExportTask):
-    """Export front and back copper SVG previews (``{pcb_name}_front/back.svg``)."""
+    """Export front/back copper SVGs and merged A4 homebrew sheet (``{pcb_name}_front.svg``, ``{pcb_name}_back.svg``, ``{pcb_name}_homebrew.svg``)."""
 
     def __init__(self):
-        super().__init__("Exporting Vector SVGs")
+        super().__init__("Exporting Copper SVGs")
 
     def is_applicable(self, context: ExportContext) -> bool:
         return context.options.get("export_svg", True) and bool(context.pcb_file)
@@ -2356,12 +2908,22 @@ class SvgExportTask(ExportTask):
             context.kicad_cli, "pcb", "export", "svg",
             "-l", "F.Cu,Edge.Cuts", "-n", "--drill-shape-opt", "2",
             "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+            "--page-size-mode", "2", "--mode-single",
             "--output", front_svg,
             "--black-and-white", context.pcb_file
         ]
         ok_front = self._run_subprocess(cmd_front, context)
         if not ok_front:
-            context.logger.warning("Front SVG export failed; attempting back layer export anyway.")
+            cmd_front_fallback = [
+                context.kicad_cli, "pcb", "export", "svg",
+                "-l", "F.Cu,Edge.Cuts", "-n", "--drill-shape-opt", "2",
+                "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+                "--output", front_svg,
+                "--black-and-white", context.pcb_file
+            ]
+            ok_front = self._run_subprocess(cmd_front_fallback, context)
+            if not ok_front:
+                context.logger.warning("Front SVG export failed; attempting back layer export anyway.")
 
         # Back SVG
         back_svg = os.path.join(context.output_dir, f"{context.pcb_name}_back.svg")
@@ -2369,11 +2931,142 @@ class SvgExportTask(ExportTask):
             context.kicad_cli, "pcb", "export", "svg",
             "-l", "B.Cu,Edge.Cuts", "-m", "-n", "--drill-shape-opt", "2",
             "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+            "--page-size-mode", "2", "--mode-single",
             "--output", back_svg,
             "--black-and-white", context.pcb_file
         ]
         ok_back = self._run_subprocess(cmd_back, context)
+        if not ok_back:
+            cmd_back_fallback = [
+                context.kicad_cli, "pcb", "export", "svg",
+                "-l", "B.Cu,Edge.Cuts", "-m", "-n", "--drill-shape-opt", "2",
+                "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+                "--output", back_svg,
+                "--black-and-white", context.pcb_file
+            ]
+            ok_back = self._run_subprocess(cmd_back_fallback, context)
+
+        if ok_front or ok_back:
+            homebrew_svg = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.svg")
+            front_path = front_svg if (ok_front and os.path.isfile(front_svg)) else None
+            back_path = back_svg if (ok_back and os.path.isfile(back_svg)) else None
+
+            merged_ok = generate_a4_merged_svg(
+                front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger
+            )
+            if not merged_ok:
+                context.logger.info("Single-page A4 homebrew SVG skipped for oversized board; layer SVGs preserved.")
+
         return ok_front or ok_back
+
+
+class PrintPdfExportTask(ExportTask):
+    """Export 1200 DPI homebrew etching & mask PDF (``{pcb_name}_homebrew.pdf``)."""
+
+    def __init__(self):
+        super().__init__("Exporting Homebrew PDF")
+
+    def is_applicable(self, context: ExportContext) -> bool:
+        return context.options.get("export_print_pdf", True) and bool(context.pcb_file)
+
+    def run(self, context: ExportContext) -> bool:
+        homebrew_svg = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.svg")
+        homebrew_pdf = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.pdf")
+        temp_dir = None
+
+        front_svg = os.path.join(context.output_dir, f"{context.pcb_name}_front.svg")
+        back_svg = os.path.join(context.output_dir, f"{context.pcb_name}_back.svg")
+
+        # If individual SVGs do not exist yet, generate them into a temporary workspace
+        if not os.path.isfile(front_svg) and not os.path.isfile(back_svg):
+            temp_dir = tempfile.mkdtemp(prefix="kiforge_homebrew_")
+            front_svg = os.path.join(temp_dir, f"{context.pcb_name}_front.svg")
+            back_svg = os.path.join(temp_dir, f"{context.pcb_name}_back.svg")
+            homebrew_svg = os.path.join(temp_dir, f"{context.pcb_name}_homebrew.svg")
+
+            cmd_front = [
+                context.kicad_cli, "pcb", "export", "svg",
+                "-l", "F.Cu,Edge.Cuts", "-n", "--drill-shape-opt", "2",
+                "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+                "--page-size-mode", "2", "--mode-single",
+                "--output", front_svg,
+                "--black-and-white", context.pcb_file
+            ]
+            ok_front = self._run_subprocess(cmd_front, context)
+            if not ok_front:
+                cmd_front_fb = [
+                    context.kicad_cli, "pcb", "export", "svg",
+                    "-l", "F.Cu,Edge.Cuts", "-n", "--drill-shape-opt", "2",
+                    "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+                    "--output", front_svg,
+                    "--black-and-white", context.pcb_file
+                ]
+                ok_front = self._run_subprocess(cmd_front_fb, context)
+
+            cmd_back = [
+                context.kicad_cli, "pcb", "export", "svg",
+                "-l", "B.Cu,Edge.Cuts", "-m", "-n", "--drill-shape-opt", "2",
+                "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+                "--page-size-mode", "2", "--mode-single",
+                "--output", back_svg,
+                "--black-and-white", context.pcb_file
+            ]
+            ok_back = self._run_subprocess(cmd_back, context)
+            if not ok_back:
+                cmd_back_fb = [
+                    context.kicad_cli, "pcb", "export", "svg",
+                    "-l", "B.Cu,Edge.Cuts", "-m", "-n", "--drill-shape-opt", "2",
+                    "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+                    "--output", back_svg,
+                    "--black-and-white", context.pcb_file
+                ]
+                ok_back = self._run_subprocess(cmd_back_fb, context)
+
+        front_path = front_svg if os.path.isfile(front_svg) else None
+        back_path = back_svg if os.path.isfile(back_svg) else None
+
+        merged_ok = False
+        if os.path.isfile(homebrew_svg):
+            merged_ok = True
+        elif front_path or back_path:
+            merged_ok = generate_a4_merged_svg(front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger)
+
+        try:
+            if merged_ok and os.path.isfile(homebrew_svg):
+                _, _, bw, bh = parse_svg_dimensions(homebrew_svg)
+                single = not (front_path and back_path)
+                layout = calculate_a4_layout(bw, bh, single_layer=single)
+                is_landscape = layout.get("page_orientation") == "landscape"
+                pdf_ok = export_svg_to_1200dpi_pdf(
+                    homebrew_svg, homebrew_pdf, is_landscape=is_landscape, logger=context.logger
+                )
+            else:
+                # Oversized board fallback: Generate 2-page 1200 DPI PDF (Page 1 Front, Page 2 Back)
+                context.logger.info("Board cannot fit on a single A4 page; generating multi-page Homebrew PDF.")
+                page_svgs = []
+                temp_pages_dir = temp_dir or tempfile.mkdtemp(prefix="kiforge_pages_")
+                if front_path:
+                    p1_svg = os.path.join(temp_pages_dir, "page1_front.svg")
+                    if generate_single_a4_sheet_svg(front_path, p1_svg, mark="F.Cu", logger=context.logger):
+                        page_svgs.append(p1_svg)
+                if back_path:
+                    p2_svg = os.path.join(temp_pages_dir, "page2_back.svg")
+                    if generate_single_a4_sheet_svg(back_path, p2_svg, mark="B.Cu (Mirrored)", logger=context.logger):
+                        page_svgs.append(p2_svg)
+
+                pdf_ok = export_svg_to_1200dpi_pdf(
+                    page_svgs, homebrew_pdf, is_landscape=False, logger=context.logger
+                )
+                if not temp_dir and temp_pages_dir:
+                    shutil.rmtree(temp_pages_dir, ignore_errors=True)
+
+            if not pdf_ok:
+                context.logger.warning("Failed to render 1200 DPI homebrew PDF.")
+                return False
+            return True
+        finally:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class InteractiveBomTask(ExportTask):
@@ -2679,6 +3372,7 @@ class ExportRunner:
         self.tasks.append(Step3dExportTask())
         self.tasks.append(Render3dExportTask())
         self.tasks.append(SvgExportTask())
+        self.tasks.append(PrintPdfExportTask())
         self.tasks.append(InteractiveBomTask())
         
         # 2. Post-processing: version KiCad BOM/POS; optional JLC copies
@@ -2831,7 +3525,7 @@ def generate_cd_files(project_dir: str, output_dir_name: str, options: dict) -> 
 generate_ci_files = generate_cd_files
 
 
-def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=True, export_bom=True, export_sch_pdf=True, export_pos=True, export_step=True, export_gerbers=True, export_drills=True, export_ibom=True, progress_callback=None, context=None):
+def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=True, export_print_pdf=True, export_bom=True, export_sch_pdf=True, export_pos=True, export_step=True, export_gerbers=True, export_drills=True, export_ibom=True, progress_callback=None, context=None):
     """
     Main library entry point for CLI, Studio, and CD workflows.
 
@@ -2845,6 +3539,7 @@ def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=Tr
         options = apply_export_runtime_options(apply_export_params_to_options({
             "export_3d": export_3d,
             "export_svg": export_svg,
+            "export_print_pdf": export_print_pdf,
             "export_bom": export_bom,
             "export_sch_pdf": export_sch_pdf,
             "export_pos": export_pos,
