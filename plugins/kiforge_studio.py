@@ -537,6 +537,12 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     def _style_choice(self, ctrl: wx.CheckBox | wx.RadioButton) -> None:
         ctrl.SetBackgroundColour(_COLORS["app_bg"])
         ctrl.SetForegroundColour(_COLORS["text"])
+        def _on_focus(evt):
+            parent = ctrl.GetParent()
+            if parent and parent != ctrl:
+                wx.CallAfter(parent.SetFocus)
+            evt.Skip()
+        ctrl.Bind(wx.EVT_SET_FOCUS, _on_focus)
 
     def _section_label(self, parent, text: str) -> wx.StaticText:
         lbl = wx.StaticText(parent, label=text)
@@ -1112,7 +1118,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             wx.MessageBox("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
             return
         try:
-            target = kiforge.save_settings(self._current_settings(), project_dir=project_dir, scope="project")
+            curr = self._current_settings()
+            target = kiforge.save_settings(curr, project_dir=project_dir, scope="project")
+            self.settings = curr
             wx.MessageBox(f"Project defaults saved.", "Config Saved", wx.OK | wx.ICON_INFORMATION)
         except Exception as e:
             wx.MessageBox(f"Failed to save project settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
@@ -1120,7 +1128,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     def on_save_global_defaults(self, event):
         """Save current selections to the user-wide KiForge settings file."""
         try:
-            kiforge.save_settings(self._current_settings(), scope="global")
+            curr = self._current_settings()
+            kiforge.save_settings(curr, scope="global")
+            self.settings = curr
             wx.MessageBox("Global defaults saved.", "Config Saved", wx.OK | wx.ICON_INFORMATION)
         except Exception as e:
             wx.MessageBox(f"Failed to save global settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
@@ -1325,10 +1335,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             return
 
         if state['success']:
-            try:
-                kiforge.save_settings(self._current_settings(), project_dir=project_dir, scope="project")
-            except Exception as exc:
-                logger.warning(f"Could not save project config after export: {exc}")
             if context.warnings:
                 wx.MessageBox(
                     "Export completed with warnings:\n\n"

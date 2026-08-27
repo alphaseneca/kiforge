@@ -1332,8 +1332,9 @@ class TestKiForgeCLI(unittest.TestCase):
             with open(out_svg, "r", encoding="utf-8") as f:
                 svg_content = f.read()
             self.assertIn("class=\"layer-mark\">F.Cu</text>", svg_content)
-            self.assertIn("class=\"layer-mark\">B.Cu (Mirrored)</text>", svg_content)
+            self.assertIn("class=\"layer-mark\">B.Cu</text>", svg_content)
             self.assertIn("class=\"fiducial\"", svg_content)
+            self.assertIn("id=\"cut_guide\"", svg_content)
             self.assertIn("clip-path=\"url(#clip_front_copper)\"", svg_content)
 
             res_pdf = kiforge.export_svg_to_1200dpi_pdf(out_svg, out_pdf)

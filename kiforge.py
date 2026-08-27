@@ -2524,10 +2524,10 @@ def _build_crosshairs_svg(pos_x: float, pos_y: float, width: float, height: floa
     elements = []
     for cx, cy in corners:
         elements.append(
-            f'<g class="fiducial">'
-            f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="1.2" />'
-            f'<line x1="{cx - 2.5:.3f}" y1="{cy:.3f}" x2="{cx + 2.5:.3f}" y2="{cy:.3f}" />'
-            f'<line x1="{cx:.3f}" y1="{cy - 2.5:.3f}" x2="{cx:.3f}" y2="{cy + 2.5:.3f}" />'
+            f'<g class="fiducial" stroke="#000000" stroke-width="0.15" fill="none">\n'
+            f'  <circle cx="{cx:.3f}" cy="{cy:.3f}" r="1.2" stroke="#000000" stroke-width="0.15" fill="none" />\n'
+            f'  <line x1="{cx - 2.5:.3f}" y1="{cy:.3f}" x2="{cx + 2.5:.3f}" y2="{cy:.3f}" stroke="#000000" stroke-width="0.15" />\n'
+            f'  <line x1="{cx:.3f}" y1="{cy - 2.5:.3f}" x2="{cx:.3f}" y2="{cy + 2.5:.3f}" stroke="#000000" stroke-width="0.15" />\n'
             f'</g>'
         )
     return "\n".join(elements)
@@ -2615,7 +2615,7 @@ def generate_a4_merged_svg(
             f'  </g>'
         )
         crosshairs_f = _build_crosshairs_svg(fx, fy, bw, bh)
-        mark_f = f'  <text x="{fx + bw / 2.0:.2f}" y="{fy - 2.5:.2f}" class="layer-mark">F.Cu</text>'
+        mark_f = f'  <text x="{fx + bw / 2.0:.2f}" y="{fy - 2.5:.2f}" font-family="-apple-system, BlinkMacSystemFont, Arial, sans-serif" font-size="2.2" font-weight="bold" fill="#000000" text-anchor="middle" class="layer-mark">F.Cu</text>'
         layers_svg.append(f"  <!-- FRONT COPPER LAYER (F.Cu) -->\n{content_f}\n{crosshairs_f}\n{mark_f}")
 
     # Back Board
@@ -2643,14 +2643,14 @@ def generate_a4_merged_svg(
             f'  </g>'
         )
         crosshairs_b = _build_crosshairs_svg(bx, by, bw, bh)
-        mark_b = f'  <text x="{bx + bw / 2.0:.2f}" y="{by - 2.5:.2f}" class="layer-mark">B.Cu (Mirrored)</text>'
-        layers_svg.append(f"  <!-- BACK COPPER LAYER (B.Cu Mirrored) -->\n{content_b}\n{crosshairs_b}\n{mark_b}")
+        mark_b = f'  <text x="{bx + bw / 2.0:.2f}" y="{by - 2.5:.2f}" font-family="-apple-system, BlinkMacSystemFont, Arial, sans-serif" font-size="2.2" font-weight="bold" fill="#000000" text-anchor="middle" class="layer-mark">B.Cu</text>'
+        layers_svg.append(f"  <!-- BACK COPPER LAYER (B.Cu) -->\n{content_b}\n{crosshairs_b}\n{mark_b}")
 
-    # Cut/fold line
+    # Cut/fold separator line
     cut_line_svg = ""
-    if "cut_line" in layout:
+    if "cut_line" in layout and has_front and has_back:
         (x1, y1), (x2, y2) = layout["cut_line"]
-        cut_line_svg = f'  <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" class="guide" id="cut_guide" />'
+        cut_line_svg = f'  <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" stroke="#000000" stroke-width="0.2" stroke-dasharray="2, 2" class="guide" id="cut_guide" />'
 
     # Conditional calibration scale bar (only placed if ample bottom margin >= 22mm exists)
     calibration_svg = ""
@@ -2661,16 +2661,15 @@ def generate_a4_merged_svg(
     if (ph - lowest_y) >= 22.0:
         ruler_x = (pw - 50.0) / 2.0
         ruler_y = ph - 12.0
-        calibration_svg = f"""  <!-- 50.0 mm Calibration Scale Bar -->
+        calibration_svg = f"""  <!-- 50 mm Scale Bar -->
   <g id="calibration_ruler" transform="translate({ruler_x:.2f}, {ruler_y:.2f})">
-    <rect x="0" y="0" width="50" height="1.0" class="ruler-bar" />
+    <rect x="0" y="0" width="50" height="1.0" fill="#000000" />
     <line x1="0" y1="-2.0" x2="0" y2="3.0" stroke="#000000" stroke-width="0.3" />
     <line x1="10" y1="-1.2" x2="10" y2="2.2" stroke="#000000" stroke-width="0.2" />
     <line x1="20" y1="-1.2" x2="20" y2="2.2" stroke="#000000" stroke-width="0.2" />
     <line x1="30" y1="-1.2" x2="30" y2="2.2" stroke="#000000" stroke-width="0.2" />
     <line x1="40" y1="-1.2" x2="40" y2="2.2" stroke="#000000" stroke-width="0.2" />
     <line x1="50" y1="-2.0" x2="50" y2="3.0" stroke="#000000" stroke-width="0.3" />
-    <text x="25" y="6.5" class="ruler-text" text-anchor="middle">50 mm CALIBRATION</text>
   </g>"""
 
     all_defs_str = "\n".join(clip_defs)
@@ -2681,10 +2680,9 @@ def generate_a4_merged_svg(
      width="{pw:.1f}mm" height="{ph:.1f}mm" viewBox="0 0 {pw:.1f} {ph:.1f}">
   <style>
     .layer-mark {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 2.2mm; font-weight: bold; fill: #000000; text-anchor: middle; }}
-    .guide {{ stroke: #888888; stroke-width: 0.2; stroke-dasharray: 2, 2; }}
+    .guide {{ stroke: #000000; stroke-width: 0.2; stroke-dasharray: 2, 2; }}
     .fiducial {{ stroke: #000000; stroke-width: 0.15; fill: none; }}
     .ruler-bar {{ fill: #000000; }}
-    .ruler-text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 1.6mm; fill: #000000; }}
   </style>
 
   <defs>
@@ -2757,7 +2755,6 @@ def generate_single_a4_sheet_svg(
     .layer-mark {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 2.5mm; font-weight: bold; fill: #000000; text-anchor: middle; }}
     .fiducial {{ stroke: #000000; stroke-width: 0.15; fill: none; }}
     .ruler-bar {{ fill: #000000; }}
-    .ruler-text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 1.6mm; fill: #000000; }}
   </style>
   <defs>
     <clipPath id="{clip_id}">
@@ -2771,17 +2768,16 @@ def generate_single_a4_sheet_svg(
     </g>
   </g>
 {crosshairs}
-  <text x="{x + w / 2.0:.2f}" y="{y - 3.0:.2f}" class="layer-mark">{mark}</text>
-  <!-- 50.0 mm Calibration Scale Bar -->
+  <text x="{x + w / 2.0:.2f}" y="{y - 3.0:.2f}" font-family="-apple-system, BlinkMacSystemFont, Arial, sans-serif" font-size="2.5" font-weight="bold" fill="#000000" text-anchor="middle" class="layer-mark">{mark}</text>
+  <!-- 50 mm Scale Bar -->
   <g id="calibration_ruler" transform="translate({(pw - 50.0) / 2.0:.2f}, {ph - 12.0:.2f})">
-    <rect x="0" y="0" width="50" height="1.0" class="ruler-bar" />
+    <rect x="0" y="0" width="50" height="1.0" fill="#000000" />
     <line x1="0" y1="-2.0" x2="0" y2="3.0" stroke="#000000" stroke-width="0.3" />
     <line x1="10" y1="-1.2" x2="10" y2="2.2" stroke="#000000" stroke-width="0.2" />
     <line x1="20" y1="-1.2" x2="20" y2="2.2" stroke="#000000" stroke-width="0.2" />
     <line x1="30" y1="-1.2" x2="30" y2="2.2" stroke="#000000" stroke-width="0.2" />
     <line x1="40" y1="-1.2" x2="40" y2="2.2" stroke="#000000" stroke-width="0.2" />
     <line x1="50" y1="-2.0" x2="50" y2="3.0" stroke="#000000" stroke-width="0.3" />
-    <text x="25" y="6.5" class="ruler-text" text-anchor="middle">50 mm CALIBRATION</text>
   </g>
 </svg>"""
         os.makedirs(os.path.dirname(os.path.abspath(output_svg_path)), exist_ok=True)
@@ -3026,10 +3022,10 @@ class PrintPdfExportTask(ExportTask):
         back_path = back_svg if os.path.isfile(back_svg) else None
 
         merged_ok = False
-        if os.path.isfile(homebrew_svg):
-            merged_ok = True
-        elif front_path or back_path:
-            merged_ok = generate_a4_merged_svg(front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger)
+        if front_path or back_path:
+            merged_ok = generate_a4_merged_svg(
+                front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger
+            )
 
         try:
             if merged_ok and os.path.isfile(homebrew_svg):
@@ -3051,7 +3047,7 @@ class PrintPdfExportTask(ExportTask):
                         page_svgs.append(p1_svg)
                 if back_path:
                     p2_svg = os.path.join(temp_pages_dir, "page2_back.svg")
-                    if generate_single_a4_sheet_svg(back_path, p2_svg, mark="B.Cu (Mirrored)", logger=context.logger):
+                    if generate_single_a4_sheet_svg(back_path, p2_svg, mark="B.Cu", logger=context.logger):
                         page_svgs.append(p2_svg)
 
                 pdf_ok = export_svg_to_1200dpi_pdf(
