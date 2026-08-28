@@ -2346,8 +2346,15 @@ def parse_svg_dimensions(svg_path: str) -> tuple[float, float, float, float]:
     """
     Parse the bounding dimensions of an SVG in millimeters.
 
+    KiCad emits SVG user units that are already millimetres (for example
+    ``width="30mm" ... viewBox="0 0 30 20"``), which is what the A4 sheet
+    builders below rely on when they translate a layer body into page space.
+
     Returns:
-        tuple[float, float, float, float]: (min_x, min_y, width_mm, height_mm)
+        tuple[float, float, float, float]: ``(min_x, min_y, width_mm, height_mm)``.
+        Width/height are ``0.0`` when the file cannot be parsed or carries no
+        usable size, so callers must treat a non-positive size as a failure
+        rather than silently laying out a wrongly scaled sheet.
     """
     try:
         tree = ET.parse(svg_path)
@@ -2389,9 +2396,11 @@ def parse_svg_dimensions(svg_path: str) -> tuple[float, float, float, float]:
                 if h_mm is None:
                     h_mm = vb_h
 
-        return (min_x, min_y, w_mm or 100.0, h_mm or 80.0)
+        if not w_mm or not h_mm or w_mm <= 0 or h_mm <= 0:
+            return (0.0, 0.0, 0.0, 0.0)
+        return (min_x, min_y, w_mm, h_mm)
     except Exception:
-        return (0.0, 0.0, 100.0, 80.0)
+        return (0.0, 0.0, 0.0, 0.0)
 
 
 def calculate_a4_layout(
@@ -2533,6 +2542,28 @@ def _build_crosshairs_svg(pos_x: float, pos_y: float, width: float, height: floa
     return "\n".join(elements)
 
 
+def _build_calibration_ruler_svg(page_w: float, page_h: float, lowest_used_y: float) -> str:
+    """
+    Build the 50 mm calibration bar used to verify a printer did not rescale the sheet.
+
+    Returns an empty string when the bottom margin cannot hold the bar clear of
+    the artwork (it needs ~22 mm below the lowest printed element).
+    """
+    if (page_h - lowest_used_y) < 22.0:
+        return ""
+    ticks = "\n".join(
+        f'    <line x1="{mm}" y1="-1.2" x2="{mm}" y2="2.2" stroke="#000000" stroke-width="0.2" />'
+        for mm in (10, 20, 30, 40)
+    )
+    return f"""  <!-- 50 mm Scale Bar -->
+  <g id="calibration_ruler" transform="translate({(page_w - 50.0) / 2.0:.2f}, {page_h - 12.0:.2f})">
+    <rect x="0" y="0" width="50" height="1.0" fill="#000000" />
+    <line x1="0" y1="-2.0" x2="0" y2="3.0" stroke="#000000" stroke-width="0.3" />
+{ticks}
+    <line x1="50" y1="-2.0" x2="50" y2="3.0" stroke="#000000" stroke-width="0.3" />
+  </g>"""
+
+
 def _extract_svg_body(svg_path: str) -> str:
     """Extract graphic elements from an SVG file, preserving exact SVG syntax without namespace prefixes."""
     if not os.path.isfile(svg_path):
@@ -2573,6 +2604,10 @@ def generate_a4_merged_svg(
 
     ref_svg = front_svg_path if has_front else back_svg_path
     _, _, board_w, board_h = parse_svg_dimensions(ref_svg)
+    if board_w <= 0 or board_h <= 0:
+        if logger:
+            logger.warning("Could not determine board size from '%s'; skipping A4 homebrew sheet.", ref_svg)
+        return False
 
     single_layer = not (has_front and has_back)
     layout = calculate_a4_layout(board_w, board_h, gap_mm=15.0, margin_mm=8.0, single_layer=single_layer)
@@ -2652,25 +2687,12 @@ def generate_a4_merged_svg(
         (x1, y1), (x2, y2) = layout["cut_line"]
         cut_line_svg = f'  <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" stroke="#000000" stroke-width="0.2" stroke-dasharray="2, 2" class="guide" id="cut_guide" />'
 
-    # Conditional calibration scale bar (only placed if ample bottom margin >= 22mm exists)
-    calibration_svg = ""
+    # Calibration scale bar (skipped when the bottom margin is too tight)
     lowest_y = max(
         (layout["front_pos"][1] + bh) if layout.get("front_pos") else 0,
         (layout["back_pos"][1] + bh) if layout.get("back_pos") else 0,
     )
-    if (ph - lowest_y) >= 22.0:
-        ruler_x = (pw - 50.0) / 2.0
-        ruler_y = ph - 12.0
-        calibration_svg = f"""  <!-- 50 mm Scale Bar -->
-  <g id="calibration_ruler" transform="translate({ruler_x:.2f}, {ruler_y:.2f})">
-    <rect x="0" y="0" width="50" height="1.0" fill="#000000" />
-    <line x1="0" y1="-2.0" x2="0" y2="3.0" stroke="#000000" stroke-width="0.3" />
-    <line x1="10" y1="-1.2" x2="10" y2="2.2" stroke="#000000" stroke-width="0.2" />
-    <line x1="20" y1="-1.2" x2="20" y2="2.2" stroke="#000000" stroke-width="0.2" />
-    <line x1="30" y1="-1.2" x2="30" y2="2.2" stroke="#000000" stroke-width="0.2" />
-    <line x1="40" y1="-1.2" x2="40" y2="2.2" stroke="#000000" stroke-width="0.2" />
-    <line x1="50" y1="-2.0" x2="50" y2="3.0" stroke="#000000" stroke-width="0.3" />
-  </g>"""
+    calibration_svg = _build_calibration_ruler_svg(pw, ph, lowest_y)
 
     all_defs_str = "\n".join(clip_defs)
     all_layers_str = "\n\n".join(layers_svg)
@@ -2713,6 +2735,40 @@ def generate_a4_merged_svg(
         return False
 
 
+def fit_board_on_a4_page(
+    board_w_mm: float,
+    board_h_mm: float,
+    margin_mm: float = 8.0,
+) -> dict | None:
+    """
+    Find a 1:1 placement for one board on a single A4 page.
+
+    Portrait is preferred, then portrait rotated 90 deg, then landscape, then
+    landscape rotated. Returns ``None`` when the board does not fit any of them
+    at true scale — callers must not fall back to cropping, because a scaled or
+    clipped etching sheet is worse than no sheet at all.
+    """
+    if board_w_mm <= 0 or board_h_mm <= 0:
+        return None
+    for page_orientation, (pw, ph) in (("portrait", (210.0, 297.0)), ("landscape", (297.0, 210.0))):
+        for rotated in (False, True):
+            w = board_h_mm if rotated else board_w_mm
+            h = board_w_mm if rotated else board_h_mm
+            if w <= pw - 2 * margin_mm and h <= ph - 2 * margin_mm:
+                return {
+                    "page_orientation": page_orientation,
+                    "page_w": pw,
+                    "page_h": ph,
+                    "rotated": rotated,
+                    "board_w": w,
+                    "board_h": h,
+                    "orig_w": board_w_mm,
+                    "orig_h": board_h_mm,
+                    "pos": ((pw - w) / 2.0, (ph - h) / 2.0),
+                }
+    return None
+
+
 def generate_single_a4_sheet_svg(
     layer_svg_path: str,
     output_svg_path: str,
@@ -2725,19 +2781,22 @@ def generate_single_a4_sheet_svg(
     try:
         min_x, min_y, bw, bh = parse_svg_dimensions(layer_svg_path)
         body = _extract_svg_body(layer_svg_path)
-        pw, ph = 210.0, 297.0
 
-        rotated = False
-        if bw > (pw - 16.0) or bh > (ph - 16.0):
-            if bh <= (pw - 16.0) and bw <= (ph - 16.0):
-                rotated = True
+        fit = fit_board_on_a4_page(bw, bh)
+        if fit is None:
+            if logger:
+                logger.warning(
+                    "Board (%.1f x %.1f mm) does not fit a single A4 page at 1:1; "
+                    "skipping homebrew sheet for %s rather than cropping it.",
+                    bw, bh, mark,
+                )
+            return False
 
-        orig_w, orig_h = bw, bh
-        w = orig_h if rotated else orig_w
-        h = orig_w if rotated else orig_h
-
-        x = (pw - w) / 2.0
-        y = (ph - h) / 2.0
+        pw, ph = fit["page_w"], fit["page_h"]
+        rotated = fit["rotated"]
+        orig_w, orig_h = fit["orig_w"], fit["orig_h"]
+        w, h = fit["board_w"], fit["board_h"]
+        x, y = fit["pos"]
 
         if rotated:
             transform = f'translate({x + orig_h:.3f}, {y:.3f}) rotate(90) translate({-min_x:.3f}, {-min_y:.3f})'
@@ -2769,16 +2828,7 @@ def generate_single_a4_sheet_svg(
   </g>
 {crosshairs}
   <text x="{x + w / 2.0:.2f}" y="{y - 3.0:.2f}" font-family="-apple-system, BlinkMacSystemFont, Arial, sans-serif" font-size="2.5" font-weight="bold" fill="#000000" text-anchor="middle" class="layer-mark">{mark}</text>
-  <!-- 50 mm Scale Bar -->
-  <g id="calibration_ruler" transform="translate({(pw - 50.0) / 2.0:.2f}, {ph - 12.0:.2f})">
-    <rect x="0" y="0" width="50" height="1.0" fill="#000000" />
-    <line x1="0" y1="-2.0" x2="0" y2="3.0" stroke="#000000" stroke-width="0.3" />
-    <line x1="10" y1="-1.2" x2="10" y2="2.2" stroke="#000000" stroke-width="0.2" />
-    <line x1="20" y1="-1.2" x2="20" y2="2.2" stroke="#000000" stroke-width="0.2" />
-    <line x1="30" y1="-1.2" x2="30" y2="2.2" stroke="#000000" stroke-width="0.2" />
-    <line x1="40" y1="-1.2" x2="40" y2="2.2" stroke="#000000" stroke-width="0.2" />
-    <line x1="50" y1="-2.0" x2="50" y2="3.0" stroke="#000000" stroke-width="0.3" />
-  </g>
+{_build_calibration_ruler_svg(pw, ph, y + h)}
 </svg>"""
         os.makedirs(os.path.dirname(os.path.abspath(output_svg_path)), exist_ok=True)
         with open(output_svg_path, "w", encoding="utf-8") as f:
@@ -2790,6 +2840,220 @@ def generate_single_a4_sheet_svg(
         return False
 
 
+PRINT_PDF_DPI = 1200
+# Raster fallback resolutions, tried in order. A full A4 page at 1200 DPI is
+# ~139 megapixels and needs well over a gigabyte while it is copied through
+# wx.Bitmap -> wx.Image -> bytes -> PIL, so drop to 600 DPI rather than fail.
+PRINT_PDF_RASTER_DPI_LADDER = (1200, 600)
+# External converters tried last, as (executable, argv builder). Each handles a
+# single input SVG only.
+PRINT_PDF_CLI_CONVERTERS = (
+    ("inkscape", lambda exe, svg, pdf: [exe, svg, f"--export-filename={pdf}", f"--export-dpi={PRINT_PDF_DPI}"]),
+    ("rsvg-convert", lambda exe, svg, pdf: [exe, "-f", "pdf", "-d", str(PRINT_PDF_DPI), "-p", str(PRINT_PDF_DPI), "-o", pdf, svg]),
+)
+PRINT_PDF_CLI_TIMEOUT_SEC = 180
+
+
+def _is_headless_session() -> bool:
+    """True when no windowing system is reachable (CI, Docker, plain ssh session)."""
+    if sys.platform in ("win32", "darwin"):
+        return False
+    return not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _discard_file(path: str) -> None:
+    """Remove a partially written output so a failed tier cannot masquerade as success."""
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+# Holds the sole QGuiApplication this process ever creates. PyQt6 owns the
+# wrapped C++ object by refcount: a QGuiApplication built without keeping a
+# reference is garbage-collected almost immediately, which deletes the C++
+# singleton but leaves QGuiApplication::instance() dangling - later Qt calls
+# (QPainter, QSvgRenderer) then read freed memory and crash the whole
+# interpreter with no Python exception to catch. This module-level slot is
+# what keeps that reference alive for the process lifetime.
+_qt_app_ref = None
+
+
+def _export_pdf_via_qt(svg_paths: list[str], output_pdf_path: str, is_landscape: bool, logger) -> bool:
+    """Tier 1 - true vector PDF through PyQt6's QPdfWriter."""
+    global _qt_app_ref
+    # Qt calls qFatal() (which abort()s the process, uncatchable from Python)
+    # when it cannot open a display, so force the offscreen platform plugin
+    # before QGuiApplication is constructed.
+    if _is_headless_session():
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6 import QtCore, QtGui, QtSvg
+
+    app = QtGui.QGuiApplication.instance()
+    if app is None:
+        app = QtGui.QGuiApplication([])
+    _qt_app_ref = app  # see module comment above - must outlive this call
+    writer = QtGui.QPdfWriter(output_pdf_path)
+    writer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.PageSizeId.A4))
+    writer.setPageOrientation(
+        QtGui.QPageLayout.Orientation.Landscape if is_landscape
+        else QtGui.QPageLayout.Orientation.Portrait
+    )
+    writer.setResolution(PRINT_PDF_DPI)
+    writer.setPageMargins(QtCore.QMarginsF(0, 0, 0, 0))
+
+    painter = QtGui.QPainter(writer)
+    try:
+        for idx, sp in enumerate(svg_paths):
+            renderer = QtSvg.QSvgRenderer(sp)
+            # An unparsable SVG makes render() a silent no-op, which would
+            # otherwise ship a blank-but-non-empty PDF as a success.
+            if not renderer.isValid():
+                raise ValueError(f"Qt could not parse SVG: {sp}")
+            if idx > 0:
+                writer.newPage()
+            renderer.render(painter)
+    finally:
+        painter.end()
+
+    if os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
+        if logger:
+            logger.info(
+                "Exported %d DPI vector PDF (%d page(s)) via PyQt6: %s",
+                PRINT_PDF_DPI, len(svg_paths), output_pdf_path,
+            )
+        return True
+    return False
+
+
+def _export_pdf_via_wx(svg_paths: list[str], output_pdf_path: str, is_landscape: bool, logger) -> bool:
+    """Tier 2 - high-resolution 1-bit raster PDF through wxPython's SVG rasterizer."""
+    import wx
+    from PIL import Image
+
+    # wx.App() raises SystemExit (not Exception) when no display is available,
+    # which would tear the whole export process down. Never construct one here;
+    # reuse the running Studio app or defer to the next tier.
+    if wx.GetApp() is None:
+        raise RuntimeError("no wx.App available for SVG rasterization")
+
+    page_mm = (297.0, 210.0) if is_landscape else (210.0, 297.0)
+    last_error = None
+    for dpi in PRINT_PDF_RASTER_DPI_LADDER:
+        size = wx.Size(int(page_mm[0] / 25.4 * dpi), int(page_mm[1] / 25.4 * dpi))
+        frames = []
+        try:
+            for sp in svg_paths:
+                bundle = wx.BitmapBundle.FromSVGFile(sp, size)
+                if not bundle.IsOk():
+                    raise ValueError(f"wx could not rasterize SVG: {sp}")
+                img = bundle.GetBitmap(size).ConvertToImage()
+                pil_img = Image.frombuffer(
+                    "RGB", (img.GetWidth(), img.GetHeight()), img.GetData(), "raw", "RGB", 0, 1
+                )
+                frames.append(pil_img.convert("1", dither=Image.Dither.NONE))
+                del pil_img, img
+            frames[0].save(
+                output_pdf_path, "PDF", resolution=float(dpi),
+                save_all=True, append_images=frames[1:],
+            )
+        except (MemoryError, ValueError, OSError) as exc:
+            last_error = exc
+            _discard_file(output_pdf_path)
+            if logger:
+                logger.debug("wx+Pillow PDF export at %d DPI failed: %s", dpi, exc)
+            continue
+        finally:
+            frames.clear()
+
+        if os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
+            if logger:
+                logger.info(
+                    "Exported %d DPI PDF (%d page(s)) via wx+Pillow: %s",
+                    dpi, len(svg_paths), output_pdf_path,
+                )
+            return True
+    if last_error is not None:
+        raise last_error
+    return False
+
+
+def _export_pdf_via_cli(svg_paths: list[str], output_pdf_path: str, logger) -> bool:
+    """Tier 3 - external single-page converters (Inkscape, rsvg-convert)."""
+    if len(svg_paths) != 1:
+        return False
+    for name, build_argv in PRINT_PDF_CLI_CONVERTERS:
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        try:
+            res = subprocess.run(
+                build_argv(exe, svg_paths[0], output_pdf_path),
+                capture_output=True,
+                timeout=PRINT_PDF_CLI_TIMEOUT_SEC,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            if logger:
+                logger.debug("%s PDF export failed: %s", name, exc)
+            _discard_file(output_pdf_path)
+            continue
+        if res.returncode == 0 and os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
+            if logger:
+                logger.info("Exported PDF via %s: %s", name, output_pdf_path)
+            return True
+        _discard_file(output_pdf_path)
+    return False
+
+
+def _run_on_gui_thread(fn):
+    """
+    Run ``fn()`` on the thread that owns the process's GUI event loop, and
+    return its result.
+
+    Qt and wxPython may only construct or drive their application/window
+    objects from the thread that owns the platform's native event loop -
+    Cocoa enforces this strictly on macOS, so calling ``QGuiApplication([])``
+    or wx's SVG rasterizer from a background thread can abort the whole host
+    process, not just this export. KiForge Studio always runs exports on a
+    background worker thread (to keep the UI responsive), so every call into
+    :func:`export_svg_to_1200dpi_pdf` from there needs marshaling; the CLI and
+    CD/Action entry points call it on the main thread already, so this is a
+    no-op there.
+    """
+    if threading.current_thread() is threading.main_thread():
+        return fn()
+    try:
+        import wx
+        app = wx.GetApp()
+    except Exception:
+        app = None
+    if app is None:
+        # No GUI event loop is running (headless CLI/CD) - safe to call directly.
+        return fn()
+
+    done = threading.Event()
+    outcome = {}
+
+    def _invoke():
+        try:
+            outcome["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    wx.CallAfter(_invoke)
+    # Bounded, not indefinite: if the GUI thread's event loop never picks the
+    # callback up (dialog destroyed, app quitting), the worker must not hang
+    # forever -- it falls through and the caller tries the next tier instead.
+    if not done.wait(timeout=180):
+        raise TimeoutError("GUI thread did not become available to render the PDF within 180s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("result", False)
+
+
 def export_svg_to_1200dpi_pdf(
     svg_path: str | list[str],
     output_pdf_path: str,
@@ -2799,7 +3063,13 @@ def export_svg_to_1200dpi_pdf(
     """
     Render SVG file(s) into a true 1:1 scale 1200 DPI vector / high-res PDF.
 
-    Accepts either a single SVG file path (1-page PDF) or a list of SVG paths (multi-page PDF).
+    Accepts either a single SVG file path (1-page PDF) or a list of SVG paths
+    (multi-page PDF). Tiers are tried in order - PyQt6 vector, wxPython raster,
+    then external CLI converters - and each tier removes its own partial output
+    so a later tier (or the caller) never sees a half-written PDF.
+
+    ``is_landscape`` must describe the sheets being rendered: they are drawn 1:1
+    into the page box, so a mismatch silently rescales the whole artwork.
     """
     svg_paths = [svg_path] if isinstance(svg_path, str) else list(svg_path)
     svg_paths = [p for p in svg_paths if p and os.path.isfile(p)]
@@ -2808,84 +3078,51 @@ def export_svg_to_1200dpi_pdf(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_pdf_path)), exist_ok=True)
 
-    # --- Tier 1: PyQt6 (Vector 1200 DPI PDF) ---
-    try:
-        from PyQt6 import QtCore, QtGui, QtSvg
-        app = QtGui.QGuiApplication.instance()
-        if app is None:
-            app = QtGui.QGuiApplication([])
-        writer = QtGui.QPdfWriter(output_pdf_path)
-        writer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.PageSizeId.A4))
-        if is_landscape:
-            writer.setPageOrientation(QtGui.QPageLayout.Orientation.Landscape)
-        else:
-            writer.setPageOrientation(QtGui.QPageLayout.Orientation.Portrait)
-        writer.setResolution(1200)
-        writer.setPageMargins(QtCore.QMarginsF(0, 0, 0, 0))
-
-        painter = QtGui.QPainter(writer)
-        for idx, sp in enumerate(svg_paths):
-            if idx > 0:
-                writer.newPage()
-            renderer = QtSvg.QSvgRenderer(sp)
-            renderer.render(painter)
-        painter.end()
-
-        if os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
-            if logger:
-                logger.info("Exported 1200 DPI vector PDF (%d page(s)) via PyQt6: %s", len(svg_paths), output_pdf_path)
-            return True
-    except Exception as exc:
-        if logger:
-            logger.debug("PyQt6 PDF export unavailable or failed: %s", exc)
-
-    # --- Tier 2: wxPython + Pillow (1200 DPI High-Resolution Raster PDF) ---
-    try:
-        import wx
-        from PIL import Image
-        app = wx.GetApp()
-        if app is None:
-            app = wx.App()
-        dpi = 1200
-        if is_landscape:
-            pw_px = int(297.0 / 25.4 * dpi)
-            ph_px = int(210.0 / 25.4 * dpi)
-        else:
-            pw_px = int(210.0 / 25.4 * dpi)
-            ph_px = int(297.0 / 25.4 * dpi)
-
-        frames = []
-        for sp in svg_paths:
-            bundle = wx.BitmapBundle.FromSVGFile(sp, wx.Size(pw_px, ph_px))
-            if bundle.IsOk():
-                bmp = bundle.GetBitmap(wx.Size(pw_px, ph_px))
-                img = bmp.ConvertToImage()
-                pil_img = Image.frombuffer("RGB", (img.GetWidth(), img.GetHeight()), img.GetData(), "raw", "RGB", 0, 1)
-                bw_img = pil_img.convert("1", dither=Image.Dither.NONE)
-                frames.append(bw_img)
-        if frames:
-            frames[0].save(output_pdf_path, "PDF", resolution=float(dpi), save_all=True, append_images=frames[1:])
-            if os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
-                if logger:
-                    logger.info("Exported 1200 DPI PDF (%d page(s)) via wx+Pillow: %s", len(frames), output_pdf_path)
-                return True
-    except Exception as exc:
-        if logger:
-            logger.debug("wx+Pillow PDF export failed: %s", exc)
-
-    # --- Tier 3: CLI Tools (Inkscape / rsvg-convert / cairosvg) ---
-    inkscape = shutil.which("inkscape")
-    if inkscape and len(svg_paths) == 1:
+    # The GUI-toolkit tiers construct/drive real Qt or wx application objects
+    # and must run on the GUI thread (see _run_on_gui_thread); the subprocess
+    # tier has no such constraint and stays on the calling thread so it never
+    # blocks Studio's UI while an external converter runs.
+    tiers = (
+        ("PyQt6", lambda: _export_pdf_via_qt(svg_paths, output_pdf_path, is_landscape, logger), True),
+        ("wx+Pillow", lambda: _export_pdf_via_wx(svg_paths, output_pdf_path, is_landscape, logger), True),
+        ("CLI converter", lambda: _export_pdf_via_cli(svg_paths, output_pdf_path, logger), False),
+    )
+    for tier_name, tier, on_gui_thread in tiers:
         try:
-            res = subprocess.run([inkscape, svg_paths[0], f"--export-filename={output_pdf_path}", "--export-dpi=1200"], capture_output=True)
-            if res.returncode == 0 and os.path.isfile(output_pdf_path):
-                if logger:
-                    logger.info("Exported 1200 DPI PDF via Inkscape: %s", output_pdf_path)
+            ok = _run_on_gui_thread(tier) if on_gui_thread else tier()
+            if ok:
                 return True
-        except Exception:
-            pass
+        # SystemExit is deliberate: wxPython raises it (a BaseException) on a
+        # headless host, and it must not terminate the whole export run.
+        except (Exception, SystemExit) as exc:
+            if logger:
+                logger.debug("%s PDF export unavailable or failed: %s", tier_name, exc)
+        _discard_file(output_pdf_path)
 
     return False
+
+
+# kicad-cli flags shared by the copper-layer SVG exports. ``--page-size-mode 2``
+# crops the plot to the board bounding box, which is what makes 1:1 A4 placement
+# possible; older kicad-cli builds reject it, hence the fallback without it.
+_SVG_LAYER_SPECS = {
+    "front": ("F.Cu,Edge.Cuts", ()),
+    "back": ("B.Cu,Edge.Cuts", ("-m",)),
+}
+
+
+def _copper_svg_command(context: "ExportContext", side: str, output_path: str, board_area_only: bool) -> list[str]:
+    """Build the kicad-cli argv that plots one copper layer as a black & white SVG."""
+    layers, extra_flags = _SVG_LAYER_SPECS[side]
+    cmd = [
+        context.kicad_cli, "pcb", "export", "svg",
+        "-l", layers, *extra_flags, "-n", "--drill-shape-opt", "2",
+        "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+    ]
+    if board_area_only:
+        cmd += ["--page-size-mode", "2", "--mode-single"]
+    cmd += ["--output", output_path, "--black-and-white", context.pcb_file]
+    return cmd
 
 
 class SvgExportTask(ExportTask):
@@ -2897,66 +3134,46 @@ class SvgExportTask(ExportTask):
     def is_applicable(self, context: ExportContext) -> bool:
         return context.options.get("export_svg", True) and bool(context.pcb_file)
 
+    def _export_copper_layer(self, context: ExportContext, side: str, output_path: str) -> bool:
+        """Plot one copper layer, retrying without --page-size-mode for older kicad-cli builds."""
+        if self._run_subprocess(_copper_svg_command(context, side, output_path, True), context):
+            return True
+        if context.is_aborted():
+            return False
+        return self._run_subprocess(_copper_svg_command(context, side, output_path, False), context)
+
+    def export_copper_layers(self, context: ExportContext, target_dir: str) -> tuple[str | None, str | None]:
+        """
+        Plot both copper layers into ``target_dir``.
+
+        Returns ``(front_path, back_path)`` with ``None`` for any layer that did
+        not produce a file, so callers never merge a half-written SVG.
+        """
+        paths: dict[str, str | None] = {}
+        for side in ("front", "back"):
+            out = os.path.join(target_dir, f"{context.pcb_name}_{side}.svg")
+            ok = self._export_copper_layer(context, side, out)
+            paths[side] = out if (ok and os.path.isfile(out)) else None
+        if paths["front"] is None and paths["back"] is not None:
+            context.logger.warning("Front SVG export failed; back layer was exported anyway.")
+        return paths["front"], paths["back"]
+
     def run(self, context: ExportContext) -> bool:
-        # Front SVG
-        front_svg = os.path.join(context.output_dir, f"{context.pcb_name}_front.svg")
-        cmd_front = [
-            context.kicad_cli, "pcb", "export", "svg",
-            "-l", "F.Cu,Edge.Cuts", "-n", "--drill-shape-opt", "2",
-            "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
-            "--page-size-mode", "2", "--mode-single",
-            "--output", front_svg,
-            "--black-and-white", context.pcb_file
-        ]
-        ok_front = self._run_subprocess(cmd_front, context)
-        if not ok_front:
-            cmd_front_fallback = [
-                context.kicad_cli, "pcb", "export", "svg",
-                "-l", "F.Cu,Edge.Cuts", "-n", "--drill-shape-opt", "2",
-                "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
-                "--output", front_svg,
-                "--black-and-white", context.pcb_file
-            ]
-            ok_front = self._run_subprocess(cmd_front_fallback, context)
-            if not ok_front:
-                context.logger.warning("Front SVG export failed; attempting back layer export anyway.")
+        front_path, back_path = self.export_copper_layers(context, context.output_dir)
+        if not front_path and not back_path:
+            return False
 
-        # Back SVG
-        back_svg = os.path.join(context.output_dir, f"{context.pcb_name}_back.svg")
-        cmd_back = [
-            context.kicad_cli, "pcb", "export", "svg",
-            "-l", "B.Cu,Edge.Cuts", "-m", "-n", "--drill-shape-opt", "2",
-            "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
-            "--page-size-mode", "2", "--mode-single",
-            "--output", back_svg,
-            "--black-and-white", context.pcb_file
-        ]
-        ok_back = self._run_subprocess(cmd_back, context)
-        if not ok_back:
-            cmd_back_fallback = [
-                context.kicad_cli, "pcb", "export", "svg",
-                "-l", "B.Cu,Edge.Cuts", "-m", "-n", "--drill-shape-opt", "2",
-                "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
-                "--output", back_svg,
-                "--black-and-white", context.pcb_file
-            ]
-            ok_back = self._run_subprocess(cmd_back_fallback, context)
-
-        if ok_front or ok_back:
-            homebrew_svg = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.svg")
-            front_path = front_svg if (ok_front and os.path.isfile(front_svg)) else None
-            back_path = back_svg if (ok_back and os.path.isfile(back_svg)) else None
-
-            merged_ok = generate_a4_merged_svg(
-                front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger
+        homebrew_svg = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.svg")
+        if not generate_a4_merged_svg(
+            front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger
+        ):
+            context.logger.info(
+                "Single-page A4 homebrew SVG skipped (board does not fit A4 at 1:1); layer SVGs preserved."
             )
-            if not merged_ok:
-                context.logger.info("Single-page A4 homebrew SVG skipped for oversized board; layer SVGs preserved.")
-
-        return ok_front or ok_back
+        return True
 
 
-class PrintPdfExportTask(ExportTask):
+class HomebrewPdfExportTask(ExportTask):
     """Export 1200 DPI homebrew etching & mask PDF (``{pcb_name}_homebrew.pdf``)."""
 
     def __init__(self):
@@ -2965,104 +3182,77 @@ class PrintPdfExportTask(ExportTask):
     def is_applicable(self, context: ExportContext) -> bool:
         return context.options.get("export_print_pdf", True) and bool(context.pcb_file)
 
+    def _resolve_layer_svgs(self, context: ExportContext, temp_dir: str) -> tuple[str | None, str | None]:
+        """
+        Locate the copper-layer SVGs, plotting them into ``temp_dir`` when needed.
+
+        Files already written by :class:`SvgExportTask` are reused; otherwise the
+        layers are plotted into the scratch directory so nothing extra lands in
+        the output folder when ``export_svg`` is disabled.
+        """
+        if context.options.get("export_svg", True):
+            front = os.path.join(context.output_dir, f"{context.pcb_name}_front.svg")
+            back = os.path.join(context.output_dir, f"{context.pcb_name}_back.svg")
+            if os.path.isfile(front) or os.path.isfile(back):
+                return (front if os.path.isfile(front) else None,
+                        back if os.path.isfile(back) else None)
+        return SvgExportTask().export_copper_layers(context, temp_dir)
+
     def run(self, context: ExportContext) -> bool:
-        homebrew_svg = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.svg")
         homebrew_pdf = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.pdf")
-        temp_dir = None
+        # The merged sheet only belongs in the output folder when the user asked
+        # for SVGs; otherwise it is a scratch intermediate for the PDF.
+        keep_svg = bool(context.options.get("export_svg", True))
+        temp_dir = tempfile.mkdtemp(prefix="kiforge_homebrew_")
+        try:
+            front_path, back_path = self._resolve_layer_svgs(context, temp_dir)
+            if not front_path and not back_path:
+                context.logger.warning("No copper layer SVG available; homebrew PDF skipped.")
+                return False
 
-        front_svg = os.path.join(context.output_dir, f"{context.pcb_name}_front.svg")
-        back_svg = os.path.join(context.output_dir, f"{context.pcb_name}_back.svg")
-
-        # If individual SVGs do not exist yet, generate them into a temporary workspace
-        if not os.path.isfile(front_svg) and not os.path.isfile(back_svg):
-            temp_dir = tempfile.mkdtemp(prefix="kiforge_homebrew_")
-            front_svg = os.path.join(temp_dir, f"{context.pcb_name}_front.svg")
-            back_svg = os.path.join(temp_dir, f"{context.pcb_name}_back.svg")
-            homebrew_svg = os.path.join(temp_dir, f"{context.pcb_name}_homebrew.svg")
-
-            cmd_front = [
-                context.kicad_cli, "pcb", "export", "svg",
-                "-l", "F.Cu,Edge.Cuts", "-n", "--drill-shape-opt", "2",
-                "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
-                "--page-size-mode", "2", "--mode-single",
-                "--output", front_svg,
-                "--black-and-white", context.pcb_file
-            ]
-            ok_front = self._run_subprocess(cmd_front, context)
-            if not ok_front:
-                cmd_front_fb = [
-                    context.kicad_cli, "pcb", "export", "svg",
-                    "-l", "F.Cu,Edge.Cuts", "-n", "--drill-shape-opt", "2",
-                    "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
-                    "--output", front_svg,
-                    "--black-and-white", context.pcb_file
-                ]
-                ok_front = self._run_subprocess(cmd_front_fb, context)
-
-            cmd_back = [
-                context.kicad_cli, "pcb", "export", "svg",
-                "-l", "B.Cu,Edge.Cuts", "-m", "-n", "--drill-shape-opt", "2",
-                "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
-                "--page-size-mode", "2", "--mode-single",
-                "--output", back_svg,
-                "--black-and-white", context.pcb_file
-            ]
-            ok_back = self._run_subprocess(cmd_back, context)
-            if not ok_back:
-                cmd_back_fb = [
-                    context.kicad_cli, "pcb", "export", "svg",
-                    "-l", "B.Cu,Edge.Cuts", "-m", "-n", "--drill-shape-opt", "2",
-                    "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
-                    "--output", back_svg,
-                    "--black-and-white", context.pcb_file
-                ]
-                ok_back = self._run_subprocess(cmd_back_fb, context)
-
-        front_path = front_svg if os.path.isfile(front_svg) else None
-        back_path = back_svg if os.path.isfile(back_svg) else None
-
-        merged_ok = False
-        if front_path or back_path:
+            homebrew_svg = os.path.join(
+                context.output_dir if keep_svg else temp_dir,
+                f"{context.pcb_name}_homebrew.svg",
+            )
             merged_ok = generate_a4_merged_svg(
                 front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger
             )
 
-        try:
             if merged_ok and os.path.isfile(homebrew_svg):
-                _, _, bw, bh = parse_svg_dimensions(homebrew_svg)
-                single = not (front_path and back_path)
-                layout = calculate_a4_layout(bw, bh, single_layer=single)
-                is_landscape = layout.get("page_orientation") == "landscape"
+                # The sheet is drawn 1:1, so the PDF page must match the sheet's
+                # own orientation - deriving it any other way rescales the plot.
+                _, _, sheet_w, sheet_h = parse_svg_dimensions(homebrew_svg)
                 pdf_ok = export_svg_to_1200dpi_pdf(
-                    homebrew_svg, homebrew_pdf, is_landscape=is_landscape, logger=context.logger
+                    homebrew_svg, homebrew_pdf,
+                    is_landscape=sheet_w > sheet_h, logger=context.logger,
                 )
             else:
-                # Oversized board fallback: Generate 2-page 1200 DPI PDF (Page 1 Front, Page 2 Back)
-                context.logger.info("Board cannot fit on a single A4 page; generating multi-page Homebrew PDF.")
+                # Both layers do not share one A4 sheet: fall back to one board
+                # per page (page 1 front, page 2 back), still at true scale.
+                context.logger.info("Board cannot share a single A4 page; generating multi-page homebrew PDF.")
                 page_svgs = []
-                temp_pages_dir = temp_dir or tempfile.mkdtemp(prefix="kiforge_pages_")
-                if front_path:
-                    p1_svg = os.path.join(temp_pages_dir, "page1_front.svg")
-                    if generate_single_a4_sheet_svg(front_path, p1_svg, mark="F.Cu", logger=context.logger):
-                        page_svgs.append(p1_svg)
-                if back_path:
-                    p2_svg = os.path.join(temp_pages_dir, "page2_back.svg")
-                    if generate_single_a4_sheet_svg(back_path, p2_svg, mark="B.Cu", logger=context.logger):
-                        page_svgs.append(p2_svg)
-
+                for path, mark, page in ((front_path, "F.Cu", "page1_front"), (back_path, "B.Cu", "page2_back")):
+                    if not path:
+                        continue
+                    sheet = os.path.join(temp_dir, f"{page}.svg")
+                    if generate_single_a4_sheet_svg(path, sheet, mark=mark, logger=context.logger):
+                        page_svgs.append(sheet)
+                if not page_svgs:
+                    context.logger.warning(
+                        "Board is too large for an A4 homebrew sheet at 1:1; PDF skipped."
+                    )
+                    return False
+                # generate_single_a4_sheet_svg always emits portrait A4 pages.
                 pdf_ok = export_svg_to_1200dpi_pdf(
                     page_svgs, homebrew_pdf, is_landscape=False, logger=context.logger
                 )
-                if not temp_dir and temp_pages_dir:
-                    shutil.rmtree(temp_pages_dir, ignore_errors=True)
 
             if not pdf_ok:
-                context.logger.warning("Failed to render 1200 DPI homebrew PDF.")
+                context.logger.warning("Failed to render %d DPI homebrew PDF.", PRINT_PDF_DPI)
                 return False
             return True
         finally:
-            if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class InteractiveBomTask(ExportTask):
@@ -3368,7 +3558,7 @@ class ExportRunner:
         self.tasks.append(Step3dExportTask())
         self.tasks.append(Render3dExportTask())
         self.tasks.append(SvgExportTask())
-        self.tasks.append(PrintPdfExportTask())
+        self.tasks.append(HomebrewPdfExportTask())
         self.tasks.append(InteractiveBomTask())
         
         # 2. Post-processing: version KiCad BOM/POS; optional JLC copies

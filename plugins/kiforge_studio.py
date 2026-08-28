@@ -407,6 +407,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_poll_val = -1
         self._export_poll_msg = ""
         self._export_running = False
+        self._export_close_after_finish = False
         self._applying_preset = False
         self._settings_project_dir = project_dir
         
@@ -435,6 +436,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 self._export_state['cancelled'] = True
             if self._export_context:
                 self._export_context.cancel()
+            self._export_close_after_finish = True
             self._finish_export_progress()
         event.Skip()
 
@@ -535,14 +537,12 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return ctrl
 
     def _style_choice(self, ctrl: wx.CheckBox | wx.RadioButton) -> None:
+        # Colours only. Do not redirect EVT_SET_FOCUS to the parent here:
+        # wx.Panel.SetFocus() forwards focus to its first focusable child, so a
+        # redirect leaves every checkbox and radio button unreachable by keyboard
+        # (Tab lands on one control while Space toggles another).
         ctrl.SetBackgroundColour(_COLORS["app_bg"])
         ctrl.SetForegroundColour(_COLORS["text"])
-        def _on_focus(evt):
-            parent = ctrl.GetParent()
-            if parent and parent != ctrl:
-                wx.CallAfter(parent.SetFocus)
-            evt.Skip()
-        ctrl.Bind(wx.EVT_SET_FOCUS, _on_focus)
 
     def _section_label(self, parent, text: str) -> wx.StaticText:
         lbl = wx.StaticText(parent, label=text)
@@ -683,14 +683,10 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_3d = wx.CheckBox(scroll, label="3D renders")
         self.chk_svg = wx.CheckBox(scroll, label="Copper SVG")
         self.chk_print_pdf = wx.CheckBox(scroll, label="Homebrew PDF")
-        for chk in (self.chk_sch_pdf, self.chk_step, self.chk_3d, self.chk_svg):
+        for chk in (self.chk_sch_pdf, self.chk_step, self.chk_3d, self.chk_svg, self.chk_print_pdf):
             self._style_choice(chk)
             doc_col.Add(chk, 0, wx.TOP, 4)
             chk.Bind(wx.EVT_CHECKBOX, self.on_export_checkbox_changed)
-
-        self._style_choice(self.chk_print_pdf)
-        doc_col.Add(self.chk_print_pdf, 0, wx.TOP, 4)
-        self.chk_print_pdf.Bind(wx.EVT_CHECKBOX, self.on_print_pdf_toggled)
 
         columns.Add(mfg_col, 1, wx.EXPAND | wx.RIGHT, 12)
         columns.Add(doc_col, 1, wx.EXPAND)
@@ -821,7 +817,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                     checkbox_map[key].SetValue(value)
             self._set_preset_choice(preset_id)
             self._sync_drill_checkbox_state()
-            self._sync_svg_pdf_checkbox_state()
             self._update_export_summary()
             self._schedule_cd_sync()
         finally:
@@ -961,7 +956,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         )
         self._set_preset_choice(self._detect_active_preset())
         self._sync_drill_checkbox_state()
-        self._sync_svg_pdf_checkbox_state()
         self._update_export_summary()
         self._apply_export_params_to_ui()
 
@@ -1035,26 +1029,11 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         else:
             self.chk_drills.Enable()
 
-    def _sync_svg_pdf_checkbox_state(self):
-        """Copper SVG export is required whenever Print PDF is enabled."""
-        if self.chk_print_pdf.IsChecked():
-            self.chk_svg.SetValue(True)
-            self.chk_svg.Disable()
-        else:
-            self.chk_svg.Enable()
-
     def on_gerbers_toggled(self, event):
         """Keep drill export aligned with Gerber export requirements."""
         if event is not None and hasattr(event, "Skip"):
             event.Skip()
         self._sync_drill_checkbox_state()
-        self.on_export_checkbox_changed(event)
-
-    def on_print_pdf_toggled(self, event):
-        """Keep Copper SVG export aligned with Print PDF requirements."""
-        if event is not None and hasattr(event, "Skip"):
-            event.Skip()
-        self._sync_svg_pdf_checkbox_state()
         self.on_export_checkbox_changed(event)
 
     def on_project_dir_changed(self, event):
@@ -1216,6 +1195,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_poll_val = -1
         self._export_poll_msg = ""
         self._export_running = True
+        self._export_close_after_finish = False
         self.btn_export.Disable()
 
         self._export_progress = _ExportProgressDialog(self)
@@ -1311,8 +1291,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             return
         if state and context:
             self._show_export_result(state, context, project_dir)
-        if self.IsModal():
-            self.EndModal(wx.ID_OK)
+        # Only close the whole Studio window when the user explicitly asked to
+        # close it while an export was running (see on_close). A cancelled,
+        # failed, or even successful export otherwise must leave Studio open
+        # so the user can adjust settings and export again -- closing it here
+        # unconditionally is what made Cancel look like it killed the plugin.
+        if self._export_close_after_finish and self.IsModal():
+            self.EndModal(wx.ID_CANCEL)
 
     def _show_export_result(self, state, context, project_dir):
         """Show the export result after the progress dialog closes."""
@@ -1377,6 +1362,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 self._export_state['cancelled'] = True
             if self._export_context:
                 self._export_context.cancel()
+            self._export_close_after_finish = True
             self._finish_export_progress()
             return
         self.EndModal(wx.ID_CANCEL)
@@ -1399,6 +1385,14 @@ class ExporterPlugin(_PluginBase):
         self.description = "KiForge Studio - Export Gerbers, Drills, BOM, CPL, STEP, 3D renders, SVGs, and PDFs."
         self.show_toolbar_button = True
         self.icon_file_name = os.path.join(os.path.dirname(__file__), "icon.png")
+        # KiCad falls back to icon_file_name when dark_icon_file_name is unset,
+        # but that fallback is not reliable across all KiCad releases/platforms.
+        # macOS defaults to system dark mode far more often than Windows/Linux,
+        # so an unset dark_icon_file_name is the most common way a plugin's
+        # toolbar icon silently fails to render on a Mac. KiForge's icon already
+        # has a fully opaque badge background, so the same file works for both
+        # themes -- no separate dark artwork is needed.
+        self.dark_icon_file_name = self.icon_file_name
 
     def Run(self):
         """

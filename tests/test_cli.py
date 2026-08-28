@@ -1282,6 +1282,47 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertAlmostEqual(w, 127.0, places=1)
             self.assertAlmostEqual(h, 88.9, places=1)
 
+    def test_parse_svg_dimensions_failure_is_not_a_fake_default(self):
+        """An unparsable SVG must report zero size, not a fabricated 100x80mm board."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            svg_file = os.path.join(tmp_dir, "broken.svg")
+            with open(svg_file, "w", encoding="utf-8") as f:
+                f.write("<svg width=\"100mm\" height=\"50mm\"")  # truncated, malformed XML
+            min_x, min_y, w, h = kiforge.parse_svg_dimensions(svg_file)
+            self.assertEqual((min_x, min_y, w, h), (0.0, 0.0, 0.0, 0.0))
+
+            self.assertEqual(kiforge.parse_svg_dimensions("/does/not/exist.svg"), (0.0, 0.0, 0.0, 0.0))
+
+    def test_fit_board_on_a4_page(self):
+        """Boards that cannot share/hold a single true-scale A4 page must be refused, not cropped."""
+        fit = kiforge.fit_board_on_a4_page(190.0, 130.0)
+        self.assertIsNotNone(fit)
+        self.assertEqual(fit["board_w"], 190.0)
+        self.assertEqual(fit["board_h"], 130.0)
+        self.assertFalse(fit["rotated"])
+
+        # Too wide for portrait but fits landscape after rotation.
+        fit_rot = kiforge.fit_board_on_a4_page(280.0, 190.0)
+        self.assertIsNotNone(fit_rot)
+        self.assertTrue(fit_rot["rotated"])
+
+        # Larger than any A4 orientation: must refuse rather than silently crop.
+        self.assertIsNone(kiforge.fit_board_on_a4_page(400.0, 300.0))
+        self.assertIsNone(kiforge.fit_board_on_a4_page(0.0, 0.0))
+
+    def test_generate_single_a4_sheet_svg_refuses_oversized_board(self):
+        """An oversized layer must not produce a silently cropped homebrew page."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            layer_svg = os.path.join(tmp_dir, "oversized.svg")
+            out_svg = os.path.join(tmp_dir, "sheet.svg")
+            with open(layer_svg, "w", encoding="utf-8") as f:
+                f.write(
+                    '<svg width="400mm" height="300mm" viewBox="0 0 400 300">'
+                    '<rect width="400" height="300" fill="black" /></svg>'
+                )
+            self.assertFalse(kiforge.generate_single_a4_sheet_svg(layer_svg, out_svg, mark="F.Cu"))
+            self.assertFalse(os.path.isfile(out_svg))
+
     def test_calculate_a4_layout_solver(self):
         """Verify A4 layout optimization evaluates 8 configurations and selects optimal fit."""
         # 5x3.5 inch board (127 x 88.9 mm) -> fits stacked portrait
@@ -1341,6 +1382,78 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertTrue(res_pdf)
             self.assertTrue(os.path.isfile(out_pdf))
             self.assertGreater(os.path.getsize(out_pdf), 0)
+
+    def test_homebrew_pdf_task_registered_in_pipeline(self):
+        """The homebrew PDF task must be named after the artifact it produces and be wired into ExportRunner."""
+        from unittest.mock import MagicMock
+
+        self.assertTrue(hasattr(kiforge, "HomebrewPdfExportTask"))
+        self.assertFalse(hasattr(kiforge, "PrintPdfExportTask"))
+
+        runner = kiforge.ExportRunner(MagicMock())
+        task_types = [type(t) for t in runner.tasks]
+        self.assertIn(kiforge.HomebrewPdfExportTask, task_types)
+        self.assertIn(kiforge.SvgExportTask, task_types)
+        self.assertLess(
+            task_types.index(kiforge.SvgExportTask), task_types.index(kiforge.HomebrewPdfExportTask)
+        )
+
+    def test_landscape_board_prints_at_true_scale(self):
+        """
+        A wide/short board must yield a landscape A4 sheet, and the PDF must be
+        rendered on a landscape page -- deriving orientation any other way (e.g.
+        re-running the layout solver on the already-merged sheet's own A4
+        dimensions) always resolves to "portrait" and silently rescales the
+        artwork on print.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            front_svg = os.path.join(tmp_dir, "wide_front.svg")
+            back_svg = os.path.join(tmp_dir, "wide_back.svg")
+            out_svg = os.path.join(tmp_dir, "wide_print.svg")
+            out_pdf = os.path.join(tmp_dir, "wide_print.pdf")
+            svg_markup = (
+                '<svg width="250mm" height="50mm" viewBox="0 0 250 50">'
+                '<rect width="250" height="50" fill="black" /></svg>'
+            )
+            for path in (front_svg, back_svg):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(svg_markup)
+
+            self.assertTrue(kiforge.generate_a4_merged_svg(front_svg, back_svg, out_svg, "wide_board"))
+            _, _, sheet_w, sheet_h = kiforge.parse_svg_dimensions(out_svg)
+            self.assertGreater(sheet_w, sheet_h)  # landscape A4: 297 x 210
+
+            res_pdf = kiforge.export_svg_to_1200dpi_pdf(out_svg, out_pdf, is_landscape=sheet_w > sheet_h)
+            self.assertTrue(res_pdf)
+            self.assertGreater(os.path.getsize(out_pdf), 0)
+
+    def test_export_svg_to_1200dpi_pdf_survives_repeated_calls(self):
+        """
+        Regression test: the PyQt6 tier must keep its QGuiApplication instance
+        alive across calls. A QGuiApplication built without a kept Python
+        reference is garbage-collected almost immediately, deleting the C++
+        singleton and leaving QGuiApplication::instance() dangling; a later
+        render then reads freed memory and can crash the whole interpreter with
+        no Python exception raised, so multiple sequential renders are the only
+        way to catch a regression here.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            layer_markup = (
+                '<svg width="30mm" height="20mm" viewBox="0 0 30 20">'
+                '<rect width="30" height="20" fill="black" /></svg>'
+            )
+            front_svg = os.path.join(tmp_dir, "repeat_front.svg")
+            back_svg = os.path.join(tmp_dir, "repeat_back.svg")
+            for path in (front_svg, back_svg):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(layer_markup)
+
+            for i in range(3):
+                merged_svg = os.path.join(tmp_dir, f"repeat_{i}.svg")
+                pdf_path = os.path.join(tmp_dir, f"repeat_{i}.pdf")
+                self.assertTrue(kiforge.generate_a4_merged_svg(front_svg, back_svg, merged_svg, "t"))
+                self.assertTrue(kiforge.export_svg_to_1200dpi_pdf(merged_svg, pdf_path))
+                self.assertGreater(os.path.getsize(pdf_path), 0)
 
 
 if __name__ == '__main__':

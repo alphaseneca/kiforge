@@ -9,6 +9,9 @@ import os
 import tempfile
 import json
 import shutil
+import threading
+import time
+from unittest.mock import MagicMock
 
 # Add root directory to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -277,6 +280,107 @@ class TestKiForgeStudio(unittest.TestCase):
         self.assertFalse(dialog.chk_sch_pdf.IsChecked())
         self.assertTrue(dialog._export_setting("format_jlc"))
         dialog.Destroy()
+
+    def test_export_pdf_marshals_gui_tier_off_main_thread(self):
+        """
+        Regression: Studio always renders the homebrew PDF from its export
+        worker thread. Qt/wx must never construct their application objects
+        off the GUI thread (Cocoa aborts the process for this on macOS), so
+        export_svg_to_1200dpi_pdf must marshal onto the wx main thread via
+        wx.CallAfter and still return the correct result to the caller.
+        """
+        front_svg = os.path.join(self.test_dir, "f.svg")
+        back_svg = os.path.join(self.test_dir, "b.svg")
+        merged_svg = os.path.join(self.test_dir, "m.svg")
+        pdf_path = os.path.join(self.test_dir, "m.pdf")
+        markup = (
+            '<svg width="30mm" height="20mm" viewBox="0 0 30 20">'
+            '<rect width="30" height="20" fill="black" /></svg>'
+        )
+        for path in (front_svg, back_svg):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(markup)
+        self.assertTrue(kiforge.generate_a4_merged_svg(front_svg, back_svg, merged_svg, "t"))
+
+        result = {}
+
+        def worker():
+            result["ran_on_main_thread"] = threading.current_thread() is threading.main_thread()
+            result["ok"] = kiforge.export_svg_to_1200dpi_pdf(merged_svg, pdf_path)
+
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+        # Pump the wx event loop from the main thread so the wx.CallAfter the
+        # worker is blocked on actually gets a chance to run.
+        deadline = time.time() + 15
+        while worker_thread.is_alive() and time.time() < deadline:
+            wx.Yield()
+            time.sleep(0.01)
+        worker_thread.join(timeout=5)
+
+        self.assertFalse(worker_thread.is_alive(), "export worker did not finish; GUI marshaling likely hung")
+        self.assertFalse(result.get("ran_on_main_thread"))
+        self.assertTrue(result.get("ok"))
+        self.assertTrue(os.path.isfile(pdf_path))
+        self.assertGreater(os.path.getsize(pdf_path), 0)
+
+    def test_progress_dialog_cancel_does_not_close_studio(self):
+        """
+        Regression: cancelling from the export progress dialog must only stop
+        the export, not close the whole Studio window. Only an explicit close
+        (title bar / Close button) while exporting should mark the window to
+        close once the export finishes.
+        """
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            dialog._export_running = True
+            dialog._export_close_after_finish = False
+            dialog._export_state = {
+                'running': True, 'success': False, 'error_msg': None,
+                'val': 0, 'msg': '', 'cancelled': False,
+            }
+            dialog._export_context = MagicMock()
+            dialog._export_thread = MagicMock()
+            dialog._export_thread.is_alive.return_value = False
+
+            fake_progress = MagicMock()
+            fake_progress.was_cancelled.return_value = True
+            dialog._export_progress = fake_progress
+
+            dialog._poll_export_progress(None)
+            wx.Yield()
+
+            self.assertTrue(dialog._export_context.cancel.called)
+            self.assertFalse(dialog._export_close_after_finish)
+        finally:
+            dialog.Destroy()
+
+    def test_explicit_close_while_exporting_marks_close_after_finish(self):
+        """The Close button, unlike progress-dialog Cancel, must still close Studio."""
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            dialog._export_running = True
+            dialog._export_close_after_finish = False
+            dialog._export_state = {'cancelled': False}
+            dialog._export_context = MagicMock()
+
+            class FakeEvent:
+                def Skip(self):
+                    pass
+
+            # setUpClass stubs wx.MessageBox to return wx.OK for every prompt;
+            # this handler only proceeds on wx.YES ("confirm close"), so force
+            # that answer for this one call.
+            original_message_box = wx.MessageBox
+            wx.MessageBox = lambda *args, **kwargs: wx.YES
+            try:
+                dialog.on_close(FakeEvent())
+            finally:
+                wx.MessageBox = original_message_box
+
+            self.assertTrue(dialog._export_close_after_finish)
+        finally:
+            dialog.Destroy()
 
 if __name__ == '__main__':
     unittest.main()
