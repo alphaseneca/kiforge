@@ -14,6 +14,18 @@ workspace="${KIFORGE_WORKSPACE:?KIFORGE_WORKSPACE is required}"
 project_path="${INPUT_PROJECT_PATH:-.}"
 output_dir="${INPUT_OUTPUT_DIR:-kiforge}"
 
+# KiForge builds and runs the official kicad/kicad Docker image, so this Action
+# needs a Linux runner with a working Docker daemon (e.g. `runs-on: ubuntu-latest`,
+# or a Linux self-hosted/Gitea runner). GitHub-hosted `macos-*` runners do not
+# ship Docker at all, and Windows runners don't run Linux containers by default
+# -- both fail deep inside `docker build`/`docker run` with a confusing error if
+# this isn't caught up front. Fail fast here instead, with a clear diagnostic
+# that points at the actual cause.
+if ! command -v docker >/dev/null 2>&1; then
+  echo "::error::KiForge requires Docker, which was not found on this runner. This Action must run on a Linux runner with Docker available (e.g. 'runs-on: ubuntu-latest'). GitHub-hosted macOS runners do not provide Docker; the KiCad plugin/Studio GUI is the macOS-native way to run KiForge locally instead." >&2
+  exit 1
+fi
+
 append_bool_toggle() {
   local env_name="$1"
   local flag="$2"
@@ -93,14 +105,21 @@ echo "Building KiForge Docker image..."
 docker build -t kiforge:latest "$action_path"
 
 echo "Running KiForge exporter..."
+# Do NOT pass KICAD10_3DMODEL_DIR / KISYS3DMOD / KIPRJMOD through from the
+# runner host here: `docker run -e VAR="$VAR"` sets VAR to an empty string
+# whenever it is unset on the host (the normal case -- bare GitHub/Gitea
+# runners never have KiCad installed), and an explicit `-e VAR=` empty value
+# overrides the image's own `ENV` default from the Dockerfile rather than
+# leaving it alone. That silently broke 3D model resolution for every CD run:
+# kicad-cli saw KICAD10_3DMODEL_DIR="" instead of the image's real
+# /usr/share/kicad/3dmodels. Let the Dockerfile's ENV defaults stand, and let
+# kiforge.py derive KIPRJMOD itself from the resolved project directory
+# inside the container (which it always does unconditionally, correctly).
 docker_env=(
   -e GITHUB_ACTIONS=true
   -e GITHUB_REF_NAME="${GITHUB_REF_NAME:-}"
   -e GITHUB_REF_TYPE="${GITHUB_REF_TYPE:-}"
   -e VERSION="${VERSION:-}"
-  -e KICAD10_3DMODEL_DIR="${KICAD10_3DMODEL_DIR:-}"
-  -e KISYS3DMOD="${KISYS3DMOD:-}"
-  -e KIPRJMOD="${KIPRJMOD:-}"
 )
 
 if container_id="$(detect_runner_container_id)"; then
@@ -125,6 +144,19 @@ fi
 
 output_path="${project_path%/}/${output_dir}"
 if [[ -d "$output_path" ]]; then
-  echo "Restoring ownership on ${output_path}..."
-  sudo chown -R "$(id -u):$(id -g)" "$output_path"
+  # The container ran --user root, so generated files are root-owned on the
+  # runner's filesystem. This chown is a convenience, not a correctness
+  # requirement -- the export itself already succeeded and its output files
+  # are already on disk. Some self-hosted runners (minimal Docker-based Gitea
+  # runners especially) have no sudo binary or no passwordless sudo configured;
+  # failing here under `set -e` would report a real, successful export as a
+  # failed CI job over an ownership nicety, so this must never abort the script.
+  if command -v sudo >/dev/null 2>&1; then
+    echo "Restoring ownership on ${output_path}..."
+    if ! sudo chown -R "$(id -u):$(id -g)" "$output_path"; then
+      echo "Warning: could not restore ownership on ${output_path} (non-fatal; export already succeeded)." >&2
+    fi
+  else
+    echo "Warning: sudo not available; leaving ${output_path} owned by root (non-fatal; export already succeeded)." >&2
+  fi
 fi

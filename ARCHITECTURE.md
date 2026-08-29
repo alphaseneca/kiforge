@@ -257,7 +257,11 @@ only when it matches `^C\d+$` (e.g. `C125111`).
 
 ### Fixed 3D renders (`RENDER_3D_DEFAULTS`) & Multi-Stage Fallback
 
-Primary render uses Preset 2 (raytracing), floor, perspective, zoom 0.8, quality high, 1920×1080. If raytracing fails (e.g. VRML `.wrl` mesh parse errors, missing 3D models, or headless environment restrictions), `Render3dExportTask` automatically retries with Preset 0 (standard rasterizer) to guarantee complete 3D PNG rendering of all available SMD components. `_build_subprocess_env()` populates `KIPRJMOD` and resolves `KICAD10_3DMODEL_DIR` / `KISYS3DMOD` for embedded and project-local 3D assets (`3dmodels/`, `3d/`, `packages3d/`).
+Primary render uses Preset 2 (raytracing), floor, perspective, zoom 0.8, quality high, 1920×1080. If raytracing fails (e.g. VRML `.wrl` mesh parse errors, missing 3D models, or headless environment restrictions), `Render3dExportTask` automatically retries with Preset 0 (standard rasterizer) to guarantee complete 3D PNG rendering of all available SMD components.
+
+`_build_subprocess_env()` sets two independent things for 3D model resolution, and never conflates them:
+- **`KIPRJMOD`** — always set to the resolved project directory. This is KiCad's own project-relative macro; footprints that bundle custom 3D models with the project should reference them as `${KIPRJMOD}/<relative-path>` for reliable resolution on every OS and in CD/Docker.
+- **`KICAD10_3DMODEL_DIR`** (and the `KISYS3DMOD`/`KICAD{7,8,9}_3DMODEL_DIR` aliases) — resolved to KiCad's *official system* 3D library via `_derive_system_3d_model_dir()`, which derives the path from the resolved `kicad-cli` binary's own install layout first (works for any install location/point release), falling back to a short list of common paths per OS. This variable is never pointed at a project's own folder: standard footprints (resistors, capacitors, connectors, …) resolve their models relative to it, so doing that would silently break them.
 
 ### Fixed Gerber / drill export (`GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`)
 

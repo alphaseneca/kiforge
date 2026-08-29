@@ -17,6 +17,27 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 import kiforge
 
+
+def _has_pdf_render_tier() -> bool:
+    """
+    True if at least one of export_svg_to_1200dpi_pdf's tiers can actually
+    succeed in *this* test process. The wx tier needs an already-running
+    wx.App (this module never creates one -- see test_studio.py for GUI
+    tests), so only PyQt6 or an external CLI converter count here; a bare
+    machine with none of the three (e.g. a barebones Linux CI runner outside
+    the project's own Docker image, which does ship rsvg-convert) has no way
+    to produce a PDF at all, and tests exercising real PDF rendering should
+    skip cleanly there instead of failing in a way indistinguishable from an
+    actual product regression.
+    """
+    try:
+        import PyQt6  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    return bool(shutil.which("rsvg-convert") or shutil.which("inkscape"))
+
+
 def _rmtree_force(path: str) -> None:
     """Remove a directory tree, including read-only git objects on Windows."""
     import stat
@@ -1218,16 +1239,53 @@ class TestKiForgeCLI(unittest.TestCase):
             raise
         kiforge_studio._destroy_progress_dialog(None)
 
-    def test_build_subprocess_env_3d_paths(self):
-        """Verify _build_subprocess_env sets KIPRJMOD and 3D environment variables."""
+    def test_build_subprocess_env_sets_kiprjmod(self):
+        """KIPRJMOD must always be set so ${KIPRJMOD}-relative 3D model paths in footprints resolve."""
+        with tempfile.TemporaryDirectory() as tmp_proj:
+            env = kiforge._build_subprocess_env(None, tmp_proj)
+            self.assertEqual(env.get("KIPRJMOD"), os.path.abspath(tmp_proj))
+
+    def test_build_subprocess_env_never_points_kicad10_3dmodel_dir_at_project(self):
+        """
+        Regression: a project's own local 3D-models folder must never be used
+        as KICAD10_3DMODEL_DIR. That variable names KiCad's official system
+        library specifically -- standard footprints (resistors, caps, ...)
+        resolve their models relative to it, so conflating it with a project
+        folder silently breaks them whenever no real system library is found.
+        """
+        from unittest.mock import patch
+
         with tempfile.TemporaryDirectory() as tmp_proj:
             local_3d = os.path.join(tmp_proj, "3dmodels")
             os.makedirs(local_3d, exist_ok=True)
 
-            env = kiforge._build_subprocess_env(None, tmp_proj)
-            self.assertEqual(env.get("KIPRJMOD"), os.path.abspath(tmp_proj))
-            self.assertTrue(bool(env.get("KICAD10_3DMODEL_DIR")))
-            self.assertEqual(env.get("KISYS3DMOD"), env.get("KICAD10_3DMODEL_DIR"))
+            with patch.object(kiforge, "_derive_system_3d_model_dir", return_value=None):
+                env = kiforge._build_subprocess_env(None, tmp_proj)
+
+            self.assertNotEqual(env.get("KICAD10_3DMODEL_DIR"), local_3d)
+            self.assertIsNone(env.get("KICAD10_3DMODEL_DIR"))
+
+    def test_build_subprocess_env_derives_3d_dir_from_kicad_cli_path(self):
+        """
+        KICAD10_3DMODEL_DIR should be derived from the resolved kicad-cli
+        binary's own install layout (works for any version/install location),
+        not just a hardcoded list of specific version numbers.
+        """
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp_root:
+            bin_dir = os.path.join(tmp_root, "bin")
+            models_dir = os.path.join(tmp_root, "share", "kicad", "3dmodels")
+            os.makedirs(bin_dir, exist_ok=True)
+            os.makedirs(models_dir, exist_ok=True)
+            fake_cli = os.path.join(bin_dir, "kicad-cli")
+            open(fake_cli, "w").close()
+
+            with tempfile.TemporaryDirectory() as tmp_proj:
+                with patch("sys.platform", "linux"):
+                    env = kiforge._build_subprocess_env(fake_cli, tmp_proj)
+            self.assertEqual(env.get("KICAD10_3DMODEL_DIR"), models_dir)
+            self.assertEqual(env.get("KISYS3DMOD"), models_dir)
 
     def test_render_3d_export_task_fallback(self):
         """Verify Render3dExportTask falls back to standard rasterizer (--preset 0) when raytracing fails."""
@@ -1241,6 +1299,9 @@ class TestKiForgeCLI(unittest.TestCase):
                 f.write("(kicad_pcb)")
 
             ctx = MagicMock()
+            # A bare MagicMock returns a truthy Mock from is_aborted(), which
+            # the tasks correctly read as "cancelled" -- say so explicitly.
+            ctx.is_aborted.return_value = False
             ctx.kicad_cli = "kicad-cli"
             ctx.pcb_file = pcb_file
             ctx.output_dir = tmp_dir
@@ -1347,6 +1408,8 @@ class TestKiForgeCLI(unittest.TestCase):
 
     def test_generate_a4_merged_svg_and_pdf(self):
         """Verify merged A4 print SVG and 1200 DPI PDF generation."""
+        if not _has_pdf_render_tier():
+            self.skipTest("No PDF renderer available (PyQt6/rsvg-convert/inkscape all missing)")
         with tempfile.TemporaryDirectory() as tmp_dir:
             front_svg = os.path.join(tmp_dir, "test_front.svg")
             back_svg = os.path.join(tmp_dir, "test_back.svg")
@@ -1398,6 +1461,360 @@ class TestKiForgeCLI(unittest.TestCase):
             task_types.index(kiforge.SvgExportTask), task_types.index(kiforge.HomebrewPdfExportTask)
         )
 
+    @staticmethod
+    def _fake_kicad_cli_svg_export(cmd, context):
+        """Stand in for kicad-cli: write a tiny valid SVG at the requested --output path."""
+        out_path = cmd[cmd.index("--output") + 1]
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(
+                '<svg width="30mm" height="20mm" viewBox="0 0 30 20">'
+                '<rect width="30" height="20" fill="black" /></svg>'
+            )
+        return True
+
+    def _make_export_context(self, tmp_dir):
+        from unittest.mock import MagicMock
+        ctx = MagicMock()
+        # A bare MagicMock returns a truthy Mock from is_aborted(), which the
+        # tasks correctly read as "cancelled" -- say so explicitly.
+        ctx.is_aborted.return_value = False
+        ctx.kicad_cli = "kicad-cli"
+        ctx.pcb_file = os.path.join(tmp_dir, "test.kicad_pcb")
+        ctx.output_dir = tmp_dir
+        ctx.pcb_name = "test"
+        ctx.logger = MagicMock()
+        ctx.warnings = []
+        ctx.add_warning = MagicMock(side_effect=lambda m: ctx.warnings.append(m))
+        ctx.is_aborted.return_value = False
+        ctx.homebrew_layers = None
+        return ctx
+
+    def test_svg_export_task_stashes_context_for_homebrew_reuse(self):
+        """SvgExportTask.run() must record its output on context.homebrew_layers for HomebrewPdfExportTask to reuse."""
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ctx = self._make_export_context(tmp_dir)
+            task = kiforge.SvgExportTask()
+            with patch.object(task, "_run_subprocess", side_effect=self._fake_kicad_cli_svg_export):
+                self.assertTrue(task.run(ctx))
+
+            self.assertIsNotNone(ctx.homebrew_layers)
+            self.assertTrue(ctx.homebrew_layers["cropped"])
+            self.assertTrue(os.path.isfile(ctx.homebrew_layers["front"]))
+            self.assertTrue(os.path.isfile(ctx.homebrew_layers["back"]))
+            homebrew_svg = ctx.homebrew_layers["homebrew_svg"]
+            self.assertTrue(homebrew_svg and os.path.isfile(homebrew_svg))
+
+    def test_homebrew_pdf_task_reuses_svg_export_task_output(self):
+        """HomebrewPdfExportTask must not re-plot layers or re-merge the sheet when SvgExportTask already did."""
+        from unittest.mock import patch
+
+        if not _has_pdf_render_tier():
+            self.skipTest("No PDF renderer available (PyQt6/rsvg-convert/inkscape all missing)")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ctx = self._make_export_context(tmp_dir)
+            svg_task = kiforge.SvgExportTask()
+            with patch.object(svg_task, "_run_subprocess", side_effect=self._fake_kicad_cli_svg_export):
+                self.assertTrue(svg_task.run(ctx))
+
+            pdf_task = kiforge.HomebrewPdfExportTask()
+            with patch.object(pdf_task, "_run_subprocess") as mock_run, \
+                 patch("kiforge.generate_a4_merged_svg") as mock_merge:
+                self.assertTrue(pdf_task.run(ctx))
+                mock_run.assert_not_called()   # no re-plotting of layers
+                mock_merge.assert_not_called()  # no re-merging of the sheet
+
+            homebrew_pdf = os.path.join(tmp_dir, "test_homebrew.pdf")
+            self.assertTrue(os.path.isfile(homebrew_pdf))
+
+    def test_homebrew_pdf_task_retries_only_missing_layer(self):
+        """A partial SvgExportTask result (one layer missing) must be retried, not accepted as final."""
+        from unittest.mock import patch
+
+        if not _has_pdf_render_tier():
+            self.skipTest("No PDF renderer available (PyQt6/rsvg-convert/inkscape all missing)")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ctx = self._make_export_context(tmp_dir)
+            front_svg = os.path.join(tmp_dir, "test_front.svg")
+            with open(front_svg, "w", encoding="utf-8") as f:
+                f.write(
+                    '<svg width="30mm" height="20mm" viewBox="0 0 30 20">'
+                    '<rect width="30" height="20" fill="black" /></svg>'
+                )
+            ctx.homebrew_layers = {
+                "front": front_svg, "back": None, "cropped": True, "homebrew_svg": None,
+            }
+
+            pdf_task = kiforge.HomebrewPdfExportTask()
+            with patch.object(pdf_task, "_run_subprocess", side_effect=self._fake_kicad_cli_svg_export):
+                self.assertTrue(pdf_task.run(ctx))
+
+            homebrew_pdf = os.path.join(tmp_dir, "test_homebrew.pdf")
+            self.assertTrue(os.path.isfile(homebrew_pdf))
+
+    def test_homebrew_pdf_task_adds_warning_not_just_logs(self):
+        """Failures must surface via context.add_warning(), not only context.logger.warning() -- otherwise
+        the export is reported as a full success with the homebrew PDF silently missing."""
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ctx = self._make_export_context(tmp_dir)
+            pdf_task = kiforge.HomebrewPdfExportTask()
+            with patch.object(pdf_task, "_run_subprocess", return_value=False):
+                self.assertFalse(pdf_task.run(ctx))
+            ctx.add_warning.assert_called()
+            self.assertTrue(ctx.warnings)
+
+    def test_export_copper_layer_marks_fallback_as_uncropped(self):
+        """The no-page-size-mode fallback SVG is full-page sized, not board sized, and must be flagged as such."""
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ctx = self._make_export_context(tmp_dir)
+            task = kiforge.SvgExportTask()
+
+            def cropped_fails_then_fallback_succeeds(cmd, context):
+                if "--page-size-mode" in cmd:
+                    return False
+                return self._fake_kicad_cli_svg_export(cmd, context)
+
+            with patch.object(task, "_run_subprocess", side_effect=cropped_fails_then_fallback_succeeds):
+                front, back, cropped = kiforge.export_copper_layers(task, ctx, tmp_dir)
+            self.assertTrue(front and back)
+            self.assertFalse(cropped)
+
+    def test_export_pdf_via_cli_multi_page_uses_rsvg_convert(self):
+        """rsvg-convert accepts multiple SVGs as one multi-page PDF; Inkscape must be skipped for that case."""
+        from unittest.mock import patch, MagicMock
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            svg1 = os.path.join(tmp_dir, "p1.svg")
+            svg2 = os.path.join(tmp_dir, "p2.svg")
+            pdf = os.path.join(tmp_dir, "out.pdf")
+            for p in (svg1, svg2):
+                open(p, "w", encoding="utf-8").write("<svg></svg>")
+
+            def fake_which(name):
+                return f"/usr/bin/{name}" if name == "rsvg-convert" else None
+
+            def fake_run(argv, capture_output, timeout):
+                self.assertIn("p1.svg", argv[-2])
+                self.assertIn("p2.svg", argv[-1])
+                with open(pdf, "wb") as f:
+                    f.write(b"%PDF-1.4 fake")
+                return MagicMock(returncode=0)
+
+            with patch("shutil.which", side_effect=fake_which), \
+                 patch("subprocess.run", side_effect=fake_run):
+                result = kiforge._export_pdf_via_cli([svg1, svg2], pdf, None)
+            self.assertTrue(result)
+            self.assertTrue(os.path.isfile(pdf))
+
+    def test_export_pdf_via_cli_multi_page_rejects_inkscape_only(self):
+        """Inkscape can only render one page per invocation, so multi-page must not be attempted through it."""
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            svg1 = os.path.join(tmp_dir, "p1.svg")
+            svg2 = os.path.join(tmp_dir, "p2.svg")
+            pdf = os.path.join(tmp_dir, "out.pdf")
+            for p in (svg1, svg2):
+                open(p, "w", encoding="utf-8").write("<svg></svg>")
+
+            def fake_which(name):
+                return f"/usr/bin/{name}" if name == "inkscape" else None
+
+            with patch("shutil.which", side_effect=fake_which):
+                result = kiforge._export_pdf_via_cli([svg1, svg2], pdf, None)
+            self.assertFalse(result)
+            self.assertFalse(os.path.isfile(pdf))
+
+    def test_qt_subprocess_tier_renders_and_cancels(self):
+        """The out-of-process Qt tier renders a real PDF without a GUI thread,
+        and a cancellation kills the worker instead of waiting it out."""
+        import subprocess
+        from unittest.mock import patch
+
+        try:
+            import PyQt6  # noqa: F401
+        except Exception:
+            self.skipTest("PyQt6 not available in this interpreter")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            svg = os.path.join(tmp, "sheet.svg")
+            with open(svg, "w", encoding="utf-8") as f:
+                f.write('<svg xmlns="http://www.w3.org/2000/svg" width="210mm" '
+                        'height="297mm" viewBox="0 0 210 297"><rect x="10" y="10" '
+                        'width="80" height="50" fill="none" stroke="#000"/></svg>')
+            pdf = os.path.join(tmp, "out.pdf")
+
+            ok = kiforge._export_pdf_via_subprocess(
+                "_export_pdf_via_qt", [svg], pdf, False, None, sys.executable)
+            self.assertTrue(ok)
+            with open(pdf, "rb") as f:
+                self.assertEqual(f.read(5), b"%PDF-")
+
+            # Cancellation is asserted against a worker that is still running:
+            # racing a real render against a timer is inherently flaky (a small
+            # sheet finishes in well under a second), so the process is stubbed
+            # as "still busy" and the abort path checked deterministically.
+            os.remove(pdf)
+            killed = []
+
+            class _Busy:
+                returncode = -1
+                stdout = None
+                stderr = None
+
+                def wait(self, timeout=None):
+                    raise subprocess.TimeoutExpired(cmd="qt", timeout=timeout)
+
+            with patch.object(kiforge.subprocess, "Popen", lambda *a, **k: _Busy()),                  patch.object(kiforge, "_terminate_subprocess", lambda p: killed.append(p)):
+                cancelled = kiforge._export_pdf_via_subprocess(
+                    "_export_pdf_via_qt", [svg], pdf, False, None, sys.executable,
+                    should_abort=lambda: True)
+
+            self.assertFalse(cancelled)
+            self.assertEqual(len(killed), 1, "the worker process must be terminated on cancel")
+            # a cancelled render must not leave a half-written PDF behind
+            self.assertFalse(os.path.isfile(pdf))
+
+    def test_pdf_export_stops_at_next_tier_when_cancelled(self):
+        """A cancelled export must not keep working through the tier ladder.
+
+        Regression: export_svg_to_1200dpi_pdf had no cancellation awareness,
+        while the pipeline only checks is_aborted() *between tasks* -- so
+        pressing Cancel during the homebrew PDF still ran every remaining
+        tier, each able to hold the GUI thread for up to the
+        _run_on_gui_thread timeout, which read as a frozen/crashed Studio.
+        """
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            svg = os.path.join(tmp, "sheet.svg")
+            with open(svg, "w", encoding="utf-8") as f:
+                f.write('<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm"></svg>')
+            pdf = os.path.join(tmp, "out.pdf")
+
+            calls = []
+
+            def _tier(name):
+                def _run(*args, **kwargs):
+                    calls.append(name)
+                    return False
+                return _run
+
+            with patch.object(kiforge, "_export_pdf_via_subprocess",
+                               lambda fn, *a, **k: _tier("sub:" + fn)()),                  patch.object(kiforge, "_export_pdf_via_qt", _tier("qt")),                  patch.object(kiforge, "_export_pdf_via_wx", _tier("wx")),                  patch.object(kiforge, "_export_pdf_via_cli", _tier("cli")):
+                # not cancelled: the ladder is walked
+                calls.clear()
+                kiforge.export_svg_to_1200dpi_pdf(svg, pdf, should_abort=lambda: False)
+                # wx/Qt out-of-process, wx/Qt in-process, then CLI converters
+                self.assertEqual(len(calls), 5)
+
+                # cancelled: stops before running any tier at all
+                calls.clear()
+                result = kiforge.export_svg_to_1200dpi_pdf(svg, pdf, should_abort=lambda: True)
+                self.assertFalse(result)
+                self.assertEqual(calls, [])
+
+                # cancelled part-way: no further tiers are attempted
+                calls.clear()
+                state = {"n": 0}
+
+                def _abort_after_first():
+                    state["n"] += 1
+                    return state["n"] > 1
+
+                kiforge.export_svg_to_1200dpi_pdf(svg, pdf, should_abort=_abort_after_first)
+                self.assertEqual(len(calls), 1)
+
+    def test_pdf_tier_order_prefers_non_blocking_under_live_gui(self):
+        """With a live GUI event loop on another thread, the tier that does not
+        need the GUI thread runs first -- otherwise the blocking tiers freeze
+        Studio's progress dialog (no timer ticks, no repaint, dead Cancel)."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            svg = os.path.join(tmp, "sheet.svg")
+            with open(svg, "w", encoding="utf-8") as f:
+                f.write('<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm"></svg>')
+            pdf = os.path.join(tmp, "out.pdf")
+
+            calls = []
+
+            def _tier(name):
+                def _run(*args, **kwargs):
+                    calls.append(name)
+                    return False
+                return _run
+
+            with patch.object(kiforge, "_export_pdf_via_subprocess",
+                               lambda fn, *a, **k: _tier("sub:" + fn)()),                  patch.object(kiforge, "_export_pdf_via_qt", _tier("qt")),                  patch.object(kiforge, "_export_pdf_via_wx", _tier("wx")),                  patch.object(kiforge, "_export_pdf_via_cli", _tier("cli")),                  patch.object(kiforge, "_run_on_gui_thread",
+                              lambda fn, **kw: (calls.append("GUI"), fn())[1]):
+
+                # wx is the tier KiCad guarantees on every platform, so it is
+                # tried first whether or not a UI is live.
+                with patch.object(kiforge, "_gui_thread_tier_would_block", return_value=False):
+                    calls.clear()
+                    kiforge.export_svg_to_1200dpi_pdf(svg, pdf)
+                    self.assertEqual(calls[0], "sub:_export_pdf_via_wx")
+
+                with patch.object(kiforge, "_gui_thread_tier_would_block", return_value=True):
+                    calls.clear()
+                    kiforge.export_svg_to_1200dpi_pdf(svg, pdf)
+                    # Every GUI-free tier runs before anything touches the GUI
+                    # thread, so a live UI never freezes while one is available.
+                    self.assertEqual(
+                        calls[:3],
+                        ["sub:_export_pdf_via_wx", "sub:_export_pdf_via_qt", "cli"])
+                    self.assertEqual(calls.index("GUI"), 3,
+                                     "GUI thread must not be touched before the GUI-free tiers")
+
+    def test_run_on_gui_thread_abandoned_callback_does_not_overwrite(self):
+        """A wx.CallAfter callback that fires after the wait already timed out must become a no-op."""
+        import threading
+        import time
+        from unittest.mock import patch
+
+        release = threading.Event()
+        calls = []
+
+        def slow_fn():
+            calls.append("ran")
+            return True
+
+        class _FakeApp:
+            pass
+
+        class _FakeWx:
+            def GetApp(self):
+                return _FakeApp()
+
+            def CallAfter(self, fn):
+                def deferred():
+                    release.wait(timeout=5)
+                    fn()
+                threading.Thread(target=deferred, daemon=True).start()
+
+        with patch.dict("sys.modules", {"wx": _FakeWx()}):
+            worker_result = {}
+
+            def worker():
+                try:
+                    kiforge._run_on_gui_thread(slow_fn, timeout=0.05)
+                except TimeoutError:
+                    worker_result["timed_out"] = True
+
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join(timeout=5)
+            self.assertTrue(worker_result.get("timed_out"))
+            self.assertEqual(calls, [])  # deferred callback hasn't fired yet
+
+            release.set()
+            time.sleep(0.2)  # let the deferred callback run now
+            self.assertEqual(calls, [])  # abandoned: must still be a no-op
+
     def test_landscape_board_prints_at_true_scale(self):
         """
         A wide/short board must yield a landscape A4 sheet, and the PDF must be
@@ -1406,6 +1823,8 @@ class TestKiForgeCLI(unittest.TestCase):
         dimensions) always resolves to "portrait" and silently rescales the
         artwork on print.
         """
+        if not _has_pdf_render_tier():
+            self.skipTest("No PDF renderer available (PyQt6/rsvg-convert/inkscape all missing)")
         with tempfile.TemporaryDirectory() as tmp_dir:
             front_svg = os.path.join(tmp_dir, "wide_front.svg")
             back_svg = os.path.join(tmp_dir, "wide_back.svg")
@@ -1437,6 +1856,10 @@ class TestKiForgeCLI(unittest.TestCase):
         no Python exception raised, so multiple sequential renders are the only
         way to catch a regression here.
         """
+        try:
+            import PyQt6  # noqa: F401
+        except ImportError:
+            self.skipTest("PyQt6 not installed -- this test targets its QGuiApplication lifetime specifically")
         with tempfile.TemporaryDirectory() as tmp_dir:
             layer_markup = (
                 '<svg width="30mm" height="20mm" viewBox="0 0 30 20">'

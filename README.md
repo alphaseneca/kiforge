@@ -82,6 +82,8 @@ Studio uses a tabbed layout with Material Symbols icons (cached from Google CDN 
 
 Add one step to your workflow and every Git tag push automatically generates a GitHub Release with all manufacturing files attached as downloadable assets. **Nothing is ever committed to your repository.**
 
+> **Runner requirement:** KiForge builds and runs the official `kicad/kicad` Docker image, so this Action needs a **Linux runner with Docker** — `runs-on: ubuntu-latest` (shown below), a Linux self-hosted runner, or a Linux Gitea Actions runner. GitHub-hosted `macos-*` runners do not provide Docker and are not supported for this step; run KiForge locally via the **KiCad Plugin (GUI)** (section 1 above) on macOS instead.
+
 #### Quickstart
 
 Create `.github/workflows/release.yml` in your KiCad project:

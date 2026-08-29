@@ -19,6 +19,38 @@ import package_plugin
 
 
 class TestPackagePlugin(unittest.TestCase):
+    """
+    Every test here calls package_plugin.package_plugin(), which copies the
+    root kiforge.py to plugins/kiforge.py (and templates/ to plugins/templates/)
+    as part of building the zip -- exactly what happens for a real release, but
+    those paths are gitignored build artifacts, never meant to persist in a dev
+    checkout. Left behind after this test module runs, they silently change
+    which module `plugins/kiforge_studio.py` binds to: its own
+    ``from . import kiforge`` prefers that sibling copy over the root module
+    the rest of the test suite imports and patches, so any *other* test that
+    exercises Studio (tests/test_studio.py) ends up running against a stale,
+    unpatched, possibly out-of-date copy -- with no error, just silently wrong
+    behavior (e.g. mock/patch calls on the root `kiforge` module having no
+    effect on what Studio actually reads). setUpClass/tearDownClass restore
+    the pre-test state so this test module can't leak that kind of cross-test,
+    cross-module contamination into any test that runs after it.
+    """
+
+    _PLUGINS_KIFORGE_PY = os.path.join(os.path.dirname(__file__), "..", "plugins", "kiforge.py")
+    _PLUGINS_TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "..", "plugins", "templates")
+
+    @classmethod
+    def setUpClass(cls):
+        cls._had_plugins_kiforge_py = os.path.isfile(cls._PLUGINS_KIFORGE_PY)
+        cls._had_plugins_templates_dir = os.path.isdir(cls._PLUGINS_TEMPLATES_DIR)
+
+    @classmethod
+    def tearDownClass(cls):
+        if not cls._had_plugins_kiforge_py and os.path.isfile(cls._PLUGINS_KIFORGE_PY):
+            os.remove(cls._PLUGINS_KIFORGE_PY)
+        if not cls._had_plugins_templates_dir and os.path.isdir(cls._PLUGINS_TEMPLATES_DIR):
+            shutil.rmtree(cls._PLUGINS_TEMPLATES_DIR, ignore_errors=True)
+
     def test_package_contains_required_pcm_entries(self):
         """Verify the plugin zip includes every file KiCad PCM needs."""
         zip_path = package_plugin.package_plugin()

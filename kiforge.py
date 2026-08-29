@@ -112,6 +112,7 @@ import re
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 
 # Ensure the user's local site-packages folder is in sys.path
 # This is critical for KiCad's isolated Python environment to recognize --user pip packages.
@@ -183,6 +184,19 @@ KIFORGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 # Default composite-action ref for CD workflows generated from a dev/git checkout.
 # Release plugin zips pin this to alphaseneca/kiforge@<tag> at package time (see package_plugin.py).
 KIFORGE_ACTION_REF = "alphaseneca/kiforge@main"
+
+# InteractiveHtmlBom is a third-party package, not maintained by KiForge, with two
+# unrelated install sites that must both stay pinned to this same version:
+#   - Dockerfile: a mandatory, deterministic build-time dependency for the CD Action
+#     image -- always installed, every build, never conditional.
+#   - InteractiveBomTask (below): a local-machine-only convenience install, run just
+#     once if a user's own KiCad Python environment doesn't already have it. This
+#     path is not expected to run at all in the CD Action -- the Docker image has it
+#     baked in already.
+# Unpinned, a breaking or compromised upstream release would silently change or break
+# both. Bump deliberately after testing a newer version; keep the Dockerfile's own
+# pin (InteractiveHtmlBom==...) in sync by hand -- it can't import this constant.
+INTERACTIVE_HTML_BOM_PINNED_VERSION = "2.11.2"
 
 # ---------------------------------------------------------------------------
 # Defaults & persisted settings
@@ -835,6 +849,15 @@ TAB_ICON_CDN = {
     "export": "file_download",
     "advanced": "tune",
     "releases": "label",
+    # Message-dialog severity icons (see plugins/kiforge_studio.py's
+    # _KiForgeMessageDialog). Shares this same fetch/cache/tint pipeline —
+    # keyed with a "msg_" prefix so they never collide with the tab names above.
+    "msg_success": "check_circle",
+    "msg_error": "error",
+    "msg_warning": "warning",
+    "msg_cancelled": "cancel",
+    "msg_info": "info",
+    "msg_question": "help",
 }
 TAB_ICON_CDN_URL = (
     "https://fonts.gstatic.com/s/i/short-term/release/"
@@ -901,17 +924,18 @@ def fetch_tab_icon_svg(tab_name: str) -> bytes | None:
     return download_tab_icon_svg(tab_name)
 
 
-def prepare_tab_icon_svg(svg_data: bytes) -> bytes:
+def prepare_tab_icon_svg(svg_data: bytes, colour: str = TAB_ICON_TINT_COLOUR) -> bytes:
     """
-    Tint Material Symbol SVGs for dark notebook tabs.
+    Tint a Material Symbol SVG with an explicit fill colour.
 
     CDN SVGs omit ``fill``; wx rasterizes them as black on dark backgrounds.
+    Defaults to the tab-icon tint; callers with their own colour (e.g. the
+    themed message dialog's per-severity icon colours) pass it explicitly.
     """
     try:
         text = svg_data.decode("utf-8")
     except UnicodeDecodeError:
         return svg_data
-    colour = TAB_ICON_TINT_COLOUR
     text = text.replace("currentColor", colour)
     if re.search(r"<path[^>]*\sfill=", text, re.I):
         text = re.sub(
@@ -1413,46 +1437,23 @@ def _build_subprocess_env(kicad_cli: str | None, project_dir: str | None = None)
 
     if project_dir and os.path.isdir(project_dir):
         abs_proj = os.path.abspath(project_dir)
+        # KIPRJMOD is KiCad's own project-relative macro. It is the supported,
+        # portable way for a project's footprints to reference 3D models it
+        # ships itself (e.g. a model at "${KIPRJMOD}/3dmodels/part.step") and
+        # works identically on every OS and CI environment.
         env["KIPRJMOD"] = abs_proj
 
-        local_3d_dir = None
-        for candidate in ("3dmodels", "3d", "packages3d", ".3dshapes", "shapes"):
-            cand_path = os.path.join(abs_proj, candidate)
-            if os.path.isdir(cand_path):
-                local_3d_dir = cand_path
-                break
-
         if "KICAD10_3DMODEL_DIR" not in env:
-            system_3d_dir = None
-            if sys.platform == "win32":
-                for win_path in (
-                    r"C:\Program Files\KiCad\10.0\share\kicad\3dmodels",
-                    r"C:\Program Files\KiCad\9.0\share\kicad\3dmodels",
-                    r"C:\Program Files\KiCad\8.0\share\kicad\3dmodels",
-                ):
-                    if os.path.isdir(win_path):
-                        system_3d_dir = win_path
-                        break
-            elif sys.platform == "darwin":
-                for mac_path in (
-                    "/Library/Application Support/kicad/3dmodels",
-                    "/Applications/KiCad/KiCad.app/Contents/SharedSupport/3dmodels",
-                ):
-                    if os.path.isdir(mac_path):
-                        system_3d_dir = mac_path
-                        break
-            else:
-                for linux_path in (
-                    "/usr/share/kicad/3dmodels",
-                    "/usr/share/kicad/modules/packages3d",
-                ):
-                    if os.path.isdir(linux_path):
-                        system_3d_dir = linux_path
-                        break
-
-            chosen_3d_dir = system_3d_dir or local_3d_dir
-            if chosen_3d_dir:
-                env["KICAD10_3DMODEL_DIR"] = chosen_3d_dir
+            # KICAD10_3DMODEL_DIR names KiCad's own official 3D library and
+            # must never be pointed at a project's own folder instead:
+            # standard footprints (resistors, caps, connectors, ...) resolve
+            # their models relative to exactly this variable, so conflating
+            # it with a project-local models directory silently breaks them
+            # whenever no real system library is found. Project-bundled
+            # models should use ${KIPRJMOD}-relative paths instead (above).
+            system_3d_dir = _derive_system_3d_model_dir(kicad_cli)
+            if system_3d_dir:
+                env["KICAD10_3DMODEL_DIR"] = system_3d_dir
 
         resolved_3d = env.get("KICAD10_3DMODEL_DIR", "")
         if resolved_3d:
@@ -1461,6 +1462,58 @@ def _build_subprocess_env(kicad_cli: str | None, project_dir: str | None = None)
                     env[alias] = resolved_3d
 
     return env
+
+
+def _derive_system_3d_model_dir(kicad_cli: str | None) -> str | None:
+    """
+    Locate KiCad's official 3D model library.
+
+    Derives the path from the resolved ``kicad_cli`` binary's own install
+    layout first, so it works for any install location or KiCad point release
+    -- not just the version numbers hardcoded in the fallback list below,
+    which only apply when ``kicad_cli`` has no usable directory to derive from
+    (e.g. resolved purely from PATH).
+    """
+    candidates: list[str] = []
+    if kicad_cli and os.path.isabs(kicad_cli):
+        bin_dir = os.path.dirname(kicad_cli)
+        if sys.platform == "darwin":
+            # .../KiCad.app/Contents/MacOS/kicad-cli -> .../Contents/SharedSupport/3dmodels
+            candidates.append(os.path.normpath(os.path.join(bin_dir, "..", "SharedSupport", "3dmodels")))
+        else:
+            # .../<prefix>/bin/kicad-cli[.exe] -> .../<prefix>/share/kicad/3dmodels
+            candidates.append(os.path.normpath(os.path.join(bin_dir, "..", "share", "kicad", "3dmodels")))
+
+    if sys.platform == "win32":
+        candidates += [
+            r"C:\Program Files\KiCad\10.0\share\kicad\3dmodels",
+            r"C:\Program Files\KiCad\9.0\share\kicad\3dmodels",
+            r"C:\Program Files\KiCad\8.0\share\kicad\3dmodels",
+        ]
+    elif sys.platform == "darwin":
+        # KiCad's own documented default search paths on macOS (see the
+        # KICAD*_3DMODEL_DIR default-path threads on forum.kicad.info): a
+        # system-wide supplementary directory under Application Support, and
+        # the library bundled inside the app itself. The official .dmg
+        # installs the app bundle at this fixed path (not directly under
+        # /Applications like most macOS apps); the SharedSupport candidate
+        # mirrors the bin_dir-relative one derived above from kicad-cli's own
+        # resolved location.
+        candidates += [
+            "/Library/Application Support/kicad/3dmodels",
+            "/Applications/KiCad/KiCad.app/Contents/SharedSupport/3dmodels",
+        ]
+    else:
+        candidates += [
+            "/usr/share/kicad/3dmodels",
+            "/usr/local/share/kicad/3dmodels",
+            "/usr/share/kicad/modules/packages3d",
+        ]
+
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1613,6 +1666,39 @@ class ExportContext:
         self.rotation_offsets = {}
         self.version_str = None
         self.warnings: list[str] = []
+        # Populated by SvgExportTask.run() when it plots the copper layers, so
+        # HomebrewPdfExportTask can reuse that work instead of re-plotting and
+        # re-merging the same sheet a second time. See export_copper_layers().
+        self.homebrew_layers: dict | None = None
+        self._step_index = 0
+        self._step_total = 1
+
+    def begin_step(self, index: int, total: int) -> None:
+        """Record which pipeline step is running, for :meth:`report_progress`."""
+        self._step_index = index
+        self._step_total = max(1, total)
+
+    def report_progress(self, fraction: float, message: str | None = None) -> None:
+        """
+        Report progress *within* the running task.
+
+        The runner only reports once per task, so a task that takes a long
+        time (the 1200 DPI homebrew PDF above all) leaves the bar parked on
+        one value for its whole duration and reads as hung. ``fraction`` is
+        0.0-1.0 through this task; it is mapped into that task's own slice of
+        the overall bar, so sub-progress can never run backwards or overtake
+        the next task.
+
+        ``message`` is optional and usually omitted: the dialog is already
+        showing this task's name, so most sub-steps only need to move the bar.
+        Pass one only when it tells the user something the task name does not
+        -- never to restate the step or to quote internals like DPI or which
+        renderer was picked.
+        """
+        if not self.progress_callback:
+            return
+        fraction = max(0.0, min(1.0, float(fraction)))
+        self.progress_callback(self._step_index + fraction, self._step_total, message)
 
     def add_warning(self, message: str) -> None:
         """Record a non-fatal export issue to surface in the GUI after completion."""
@@ -2299,6 +2385,13 @@ class Render3dExportTask(ExportTask):
             if os.path.isfile(output_png) and os.path.getsize(output_png) > 0:
                 return True
 
+        # A render that stopped because the user cancelled is not a failure
+        # worth retrying -- the fallback below is another full render, and
+        # run_command already returns False once the subprocess is terminated,
+        # so without this the cancel silently bought a second long render.
+        if context.is_aborted():
+            return False
+
         context.logger.warning(
             "%s 3D raytracing render failed; attempting standard rasterizer fallback mode (--preset 0)...",
             view_label,
@@ -2336,6 +2429,11 @@ class Render3dExportTask(ExportTask):
         ok_front = self._render_view(context, front_png, "0,0,0", "Front")
         if not ok_front:
             context.logger.warning("Front 3D render failed; attempting back view anyway.")
+
+        # Front failing is explicitly not a reason to skip the back view, but
+        # the user cancelling is: the back render is just as long as the front.
+        if context.is_aborted():
+            return ok_front
 
         back_png = os.path.join(context.output_dir, f"{context.pcb_name}_3d_back.png")
         ok_back = self._render_view(context, back_png, "0,180,0", "Back")
@@ -2845,11 +2943,15 @@ PRINT_PDF_DPI = 1200
 # ~139 megapixels and needs well over a gigabyte while it is copied through
 # wx.Bitmap -> wx.Image -> bytes -> PIL, so drop to 600 DPI rather than fail.
 PRINT_PDF_RASTER_DPI_LADDER = (1200, 600)
-# External converters tried last, as (executable, argv builder). Each handles a
-# single input SVG only.
+# External converters tried last, as (executable, argv builder, supports_multi_page).
+# rsvg-convert accepts multiple input files and emits one page per file when the
+# output is PDF, so it is the only converter usable for the oversized-board
+# multi-page fallback; Inkscape's CLI only ever produces one page per invocation.
+# This is also the only PDF tier that actually works inside the shipped Docker
+# Action image (no PyQt6, no wx.App there) -- see the Dockerfile's librsvg2-bin.
 PRINT_PDF_CLI_CONVERTERS = (
-    ("inkscape", lambda exe, svg, pdf: [exe, svg, f"--export-filename={pdf}", f"--export-dpi={PRINT_PDF_DPI}"]),
-    ("rsvg-convert", lambda exe, svg, pdf: [exe, "-f", "pdf", "-d", str(PRINT_PDF_DPI), "-p", str(PRINT_PDF_DPI), "-o", pdf, svg]),
+    ("inkscape", lambda exe, svgs, pdf: [exe, svgs[0], f"--export-filename={pdf}", f"--export-dpi={PRINT_PDF_DPI}"], False),
+    ("rsvg-convert", lambda exe, svgs, pdf: [exe, "-f", "pdf", "-d", str(PRINT_PDF_DPI), "-p", str(PRINT_PDF_DPI), "-o", pdf, *svgs], True),
 )
 PRINT_PDF_CLI_TIMEOUT_SEC = 180
 
@@ -2979,17 +3081,169 @@ def _export_pdf_via_wx(svg_paths: list[str], output_pdf_path: str, is_landscape:
     return False
 
 
-def _export_pdf_via_cli(svg_paths: list[str], output_pdf_path: str, logger) -> bool:
-    """Tier 3 - external single-page converters (Inkscape, rsvg-convert)."""
-    if len(svg_paths) != 1:
+# Worker run by _export_pdf_via_subprocess. It imports this very module in a
+# fresh interpreter and calls the in-process Qt tier from that process's own
+# main thread -- the only thread Qt allows a QGuiApplication to be built on --
+# so the rendering code has exactly one implementation rather than a duplicate
+# maintained for out-of-process use.
+# Holds the worker process's wx.App. wx tracks the "current" app weakly, so an
+# App that nothing references is collected straight after construction and
+# wx.GetApp() goes back to None -- keep it alive for the process's lifetime.
+_pdf_worker_wx_app = None
+
+
+def _pdf_worker_main(fn_name: str, svg_paths: list[str], output_pdf_path: str,
+                     is_landscape: bool) -> bool:
+    """
+    Entry point executed inside a rendering worker process.
+
+    Establishes whatever application object the chosen tier needs before
+    handing off to it. :func:`_export_pdf_via_wx` deliberately refuses to
+    construct a ``wx.App`` itself -- in-process that would either collide with
+    Studio's own app or, on a headless host, raise SystemExit and tear the
+    whole export down. Here the process exists solely to render, this is its
+    main thread, and a failure kills only the worker, which the parent simply
+    reports as that tier being unavailable.
+    """
+    if fn_name == "_export_pdf_via_wx":
+        import wx
+        if wx.GetApp() is None:
+            global _pdf_worker_wx_app
+            _pdf_worker_wx_app = wx.App(False)
+    return bool(globals()[fn_name](svg_paths, output_pdf_path, is_landscape, None))
+
+
+_PDF_WORKER_SRC = (
+    "import json, sys;"
+    "sys.path.insert(0, sys.argv[1]);"
+    "import kiforge;"
+    "a = json.loads(sys.argv[2]);"
+    "sys.exit(0 if kiforge._pdf_worker_main("
+    "a['fn'], a['svgs'], a['out'], a['landscape']) else 1)"
+)
+
+# How often the parent looks at should_abort() while the worker renders. Small
+# enough that Cancel feels immediate, large enough not to spin a core.
+_QT_PDF_POLL_SEC = 0.2
+
+
+def _export_pdf_via_subprocess(
+    tier_func: str,
+    svg_paths: list[str],
+    output_pdf_path: str,
+    is_landscape: bool,
+    logger,
+    python_exe: str | None = None,
+    should_abort: Callable[[], bool] | None = None,
+) -> bool:
+    """
+    Run one of the GUI-toolkit PDF tiers out-of-process.
+
+    ``tier_func`` names the in-process tier to run (``_export_pdf_via_qt`` or
+    ``_export_pdf_via_wx``); the worker imports this module and calls it, so
+    each renderer keeps exactly one implementation.
+
+    Both toolkits insist on building their application object on the
+    process's main thread. In-process that means hijacking the *GUI* thread:
+    the UI freezes for the whole render and a render already under way cannot
+    be interrupted. A separate interpreter has its own main thread, so nothing
+    is marshalled onto the GUI thread at all, and the render is a plain child
+    process -- which means it can simply be killed when the user cancels.
+    """
+    exe = python_exe or sys.executable
+    if not exe or not os.path.isfile(exe):
         return False
-    for name, build_argv in PRINT_PDF_CLI_CONVERTERS:
+    payload = json.dumps({
+        "fn": tier_func,
+        "svgs": list(svg_paths),
+        "out": output_pdf_path,
+        "landscape": bool(is_landscape),
+    })
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        proc = subprocess.Popen(
+            [exe, "-c", _PDF_WORKER_SRC, module_dir, payload],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            startupinfo=_subprocess_startupinfo(),
+        )
+    except (OSError, ValueError) as exc:
+        if logger:
+            logger.debug("%s subprocess PDF export could not start: %s", tier_func, exc)
+        return False
+
+    try:
+        polls_left = int(PRINT_PDF_CLI_TIMEOUT_SEC / _QT_PDF_POLL_SEC)
+        while True:
+            try:
+                proc.wait(timeout=_QT_PDF_POLL_SEC)
+                break
+            except subprocess.TimeoutExpired:
+                if should_abort is not None and should_abort():
+                    _terminate_subprocess(proc)
+                    _discard_file(output_pdf_path)
+                    if logger:
+                        logger.info("%s subprocess PDF export cancelled.", tier_func)
+                    return False
+                polls_left -= 1
+                if polls_left <= 0:
+                    _terminate_subprocess(proc)
+                    _discard_file(output_pdf_path)
+                    if logger:
+                        logger.debug("%s subprocess PDF export timed out.", tier_func)
+                    return False
+
+        if proc.returncode == 0 and os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
+            if logger:
+                logger.info("Exported PDF via %s subprocess: %s", tier_func, output_pdf_path)
+            return True
+        if logger:
+            err = ""
+            if proc.stderr is not None:
+                err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
+            logger.debug(
+                "%s subprocess PDF export unavailable or failed: %s" % tier_func,
+                err.splitlines()[-1] if err else proc.returncode,
+            )
+        _discard_file(output_pdf_path)
+        return False
+    finally:
+        # Popen(stdout=PIPE, stderr=PIPE) opens two pipes that nothing else
+        # closes on these paths -- without this each render leaks two file
+        # descriptors, and an export renders several PDFs.
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+def _export_pdf_via_cli(
+    svg_paths: list[str],
+    output_pdf_path: str,
+    logger,
+    should_abort: Callable[[], bool] | None = None,
+) -> bool:
+    """
+    Tier 3 - external converters (Inkscape: single page only; rsvg-convert: any page count).
+
+    ``should_abort`` is checked before each converter for the same reason the
+    tier ladder checks it: a cancelled export must not start the next
+    converter and sit through another full conversion.
+    """
+    for name, build_argv, supports_multi in PRINT_PDF_CLI_CONVERTERS:
+        if should_abort is not None and should_abort():
+            _discard_file(output_pdf_path)
+            return False
+        if len(svg_paths) != 1 and not supports_multi:
+            continue
         exe = shutil.which(name)
         if not exe:
             continue
         try:
             res = subprocess.run(
-                build_argv(exe, svg_paths[0], output_pdf_path),
+                build_argv(exe, svg_paths, output_pdf_path),
                 capture_output=True,
                 timeout=PRINT_PDF_CLI_TIMEOUT_SEC,
             )
@@ -3006,7 +3260,28 @@ def _export_pdf_via_cli(svg_paths: list[str], output_pdf_path: str, logger) -> b
     return False
 
 
-def _run_on_gui_thread(fn):
+def _gui_thread_tier_would_block() -> bool:
+    """
+    True when running a GUI-thread tier would freeze a live UI.
+
+    Marshalling work onto the GUI thread (see :func:`_run_on_gui_thread`) runs
+    it *inside* that thread's event loop, so for however long the render takes
+    the loop dispatches nothing else: timers stop firing, windows stop
+    repainting and clicks queue up unhandled -- which is what made Studio's
+    progress dialog freeze mid-export and the OS mark it "Not Responding".
+    Only true when a GUI loop actually exists and we are not already on it;
+    the CLI and CD/Action entry points have no loop to block.
+    """
+    if threading.current_thread() is threading.main_thread():
+        return False
+    try:
+        import wx
+        return wx.GetApp() is not None
+    except Exception:
+        return False
+
+
+def _run_on_gui_thread(fn, timeout: float = 180.0):
     """
     Run ``fn()`` on the thread that owns the process's GUI event loop, and
     return its result.
@@ -3033,9 +3308,17 @@ def _run_on_gui_thread(fn):
         return fn()
 
     done = threading.Event()
+    abandoned = threading.Event()
     outcome = {}
 
     def _invoke():
+        # If the wait below already timed out, the caller has moved on to the
+        # next tier (or given up) and may already be reading/deleting
+        # output_pdf_path. Running fn() now would write to that same path
+        # behind the caller's back, silently clobbering whatever a later tier
+        # produced - so skip it entirely once abandoned.
+        if abandoned.is_set():
+            return
         try:
             outcome["result"] = fn()
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
@@ -3047,8 +3330,9 @@ def _run_on_gui_thread(fn):
     # Bounded, not indefinite: if the GUI thread's event loop never picks the
     # callback up (dialog destroyed, app quitting), the worker must not hang
     # forever -- it falls through and the caller tries the next tier instead.
-    if not done.wait(timeout=180):
-        raise TimeoutError("GUI thread did not become available to render the PDF within 180s")
+    if not done.wait(timeout=timeout):
+        abandoned.set()
+        raise TimeoutError(f"GUI thread did not become available to render the PDF within {timeout:.0f}s")
     if "error" in outcome:
         raise outcome["error"]
     return outcome.get("result", False)
@@ -3059,6 +3343,8 @@ def export_svg_to_1200dpi_pdf(
     output_pdf_path: str,
     is_landscape: bool = False,
     logger: logging.Logger | None = None,
+    should_abort: Callable[[], bool] | None = None,
+    python_exe: str | None = None,
 ) -> bool:
     """
     Render SVG file(s) into a true 1:1 scale 1200 DPI vector / high-res PDF.
@@ -3070,6 +3356,12 @@ def export_svg_to_1200dpi_pdf(
 
     ``is_landscape`` must describe the sheets being rendered: they are drawn 1:1
     into the page box, so a mismatch silently rescales the whole artwork.
+
+    ``should_abort`` is consulted between tiers (pass ``context.is_aborted``)
+    so a cancelled export stops here instead of working through every
+    remaining tier first -- each of which can occupy the GUI thread for up to
+    the :func:`_run_on_gui_thread` timeout before the pipeline gets its next
+    chance to notice the cancellation.
     """
     svg_paths = [svg_path] if isinstance(svg_path, str) else list(svg_path)
     svg_paths = [p for p in svg_paths if p and os.path.isfile(p)]
@@ -3082,12 +3374,52 @@ def export_svg_to_1200dpi_pdf(
     # and must run on the GUI thread (see _run_on_gui_thread); the subprocess
     # tier has no such constraint and stays on the calling thread so it never
     # blocks Studio's UI while an external converter runs.
+    def _sub(fn_name):
+        return lambda: _export_pdf_via_subprocess(
+            fn_name, svg_paths, output_pdf_path, is_landscape, logger, python_exe, should_abort)
+
+    # Ordered by what is actually guaranteed to be there, not by what is
+    # nicest when it happens to be installed:
+    #
+    #   wx   KiCad ships wxPython for its own GUI on Windows, Linux and macOS
+    #        alike, so this tier is available wherever the plugin can run at
+    #        all. It rasterizes, which is the right trade here: the output is
+    #        a 1200 DPI sheet meant to be printed for etching, and every
+    #        machine producing byte-comparable artwork matters more for a
+    #        manufacturing file than an occasional vector upgrade that only
+    #        some installs would get.
+    #   CLI  rsvg-convert / Inkscape are common on Linux, absent as often as
+    #        not elsewhere -- an upgrade when present, never depended on.
+    #   Qt   PyQt6 is not part of KiCad on any platform; it only exists when
+    #        running under a system Python that happens to have it (CLI/CD).
+    #
+    # Every GUI-toolkit renderer is offered out-of-process first; the
+    # in-process variants stay as a last resort for hosts where spawning the
+    # worker is impossible (no usable interpreter, restricted environment),
+    # and are the only tiers that can block the GUI thread.
     tiers = (
-        ("PyQt6", lambda: _export_pdf_via_qt(svg_paths, output_pdf_path, is_landscape, logger), True),
+        ("wx+Pillow (subprocess)", _sub("_export_pdf_via_wx"), False),
+        ("PyQt6 (subprocess)", _sub("_export_pdf_via_qt"), False),
         ("wx+Pillow", lambda: _export_pdf_via_wx(svg_paths, output_pdf_path, is_landscape, logger), True),
-        ("CLI converter", lambda: _export_pdf_via_cli(svg_paths, output_pdf_path, logger), False),
+        ("PyQt6", lambda: _export_pdf_via_qt(svg_paths, output_pdf_path, is_landscape, logger), True),
+        ("CLI converter",
+         lambda: _export_pdf_via_cli(svg_paths, output_pdf_path, logger, should_abort), False),
     )
+    # Quality order above (vector Qt first) is the right default, but it is
+    # only a preference: when a GUI-thread tier would freeze a live UI, the
+    # subprocess tier -- which renders just as well and needs no GUI thread --
+    # is tried first instead, so Studio keeps animating and stays clickable.
+    # Sorting on the tier's own "needs the GUI thread" flag keeps this a
+    # property of the tiers rather than a second hand-maintained order.
+    if _gui_thread_tier_would_block():
+        tiers = tuple(sorted(tiers, key=lambda t: t[2]))
+
     for tier_name, tier, on_gui_thread in tiers:
+        if should_abort is not None and should_abort():
+            if logger:
+                logger.info("PDF export cancelled before the %s tier.", tier_name)
+            _discard_file(output_pdf_path)
+            return False
         try:
             ok = _run_on_gui_thread(tier) if on_gui_thread else tier()
             if ok:
@@ -3125,6 +3457,57 @@ def _copper_svg_command(context: "ExportContext", side: str, output_path: str, b
     return cmd
 
 
+def _export_copper_layer(task: "ExportTask", context: ExportContext, side: str, output_path: str) -> tuple[bool, bool]:
+    """
+    Plot one copper layer, retrying without --page-size-mode for older kicad-cli builds.
+
+    A free function (not a method) so both :class:`SvgExportTask` and
+    :class:`HomebrewPdfExportTask` can call it as themselves via ``task`` --
+    subprocess failures then log under the caller's own task name instead of a
+    borrowed one.
+
+    Returns ``(ok, board_area_cropped)``. ``board_area_cropped`` is False on
+    the fallback path: that SVG's page is the project's full drawing sheet,
+    not the board's bounding box, so its dimensions must never be fed into
+    the A4 homebrew layout math (which needs the true board size).
+    """
+    if task._run_subprocess(_copper_svg_command(context, side, output_path, True), context):
+        return True, True
+    if context.is_aborted():
+        return False, False
+    ok = task._run_subprocess(_copper_svg_command(context, side, output_path, False), context)
+    return ok, False
+
+
+def export_copper_layers(task: "ExportTask", context: ExportContext, target_dir: str) -> tuple[str | None, str | None, bool]:
+    """
+    Plot both copper layers into ``target_dir`` on behalf of ``task``.
+
+    Returns ``(front_path, back_path, board_area_cropped)``: paths are
+    ``None`` for any layer that did not produce a file, so callers never
+    merge a half-written SVG; ``board_area_cropped`` is True only when every
+    produced layer used the board-area-cropped export (see
+    :func:`_export_copper_layer`).
+    """
+    paths: dict[str, str | None] = {}
+    cropped_all = True
+    for side in ("front", "back"):
+        if context.is_aborted():
+            # Same rule as the retry inside _export_copper_layer: a cancelled
+            # run must not start plotting the next layer.
+            break
+        out = os.path.join(target_dir, f"{context.pcb_name}_{side}.svg")
+        ok, cropped = _export_copper_layer(task, context, side, out)
+        paths[side] = out if (ok and os.path.isfile(out)) else None
+        if paths[side] is not None and not cropped:
+            cropped_all = False
+    if paths["front"] is None and paths["back"] is not None:
+        context.logger.warning("Front SVG export failed; back layer was exported anyway.")
+    elif paths["back"] is None and paths["front"] is not None:
+        context.logger.warning("Back SVG export failed; front layer was exported anyway.")
+    return paths["front"], paths["back"], cropped_all
+
+
 class SvgExportTask(ExportTask):
     """Export front/back copper SVGs and merged A4 homebrew sheet (``{pcb_name}_front.svg``, ``{pcb_name}_back.svg``, ``{pcb_name}_homebrew.svg``)."""
 
@@ -3134,42 +3517,35 @@ class SvgExportTask(ExportTask):
     def is_applicable(self, context: ExportContext) -> bool:
         return context.options.get("export_svg", True) and bool(context.pcb_file)
 
-    def _export_copper_layer(self, context: ExportContext, side: str, output_path: str) -> bool:
-        """Plot one copper layer, retrying without --page-size-mode for older kicad-cli builds."""
-        if self._run_subprocess(_copper_svg_command(context, side, output_path, True), context):
-            return True
-        if context.is_aborted():
-            return False
-        return self._run_subprocess(_copper_svg_command(context, side, output_path, False), context)
-
-    def export_copper_layers(self, context: ExportContext, target_dir: str) -> tuple[str | None, str | None]:
-        """
-        Plot both copper layers into ``target_dir``.
-
-        Returns ``(front_path, back_path)`` with ``None`` for any layer that did
-        not produce a file, so callers never merge a half-written SVG.
-        """
-        paths: dict[str, str | None] = {}
-        for side in ("front", "back"):
-            out = os.path.join(target_dir, f"{context.pcb_name}_{side}.svg")
-            ok = self._export_copper_layer(context, side, out)
-            paths[side] = out if (ok and os.path.isfile(out)) else None
-        if paths["front"] is None and paths["back"] is not None:
-            context.logger.warning("Front SVG export failed; back layer was exported anyway.")
-        return paths["front"], paths["back"]
-
     def run(self, context: ExportContext) -> bool:
-        front_path, back_path = self.export_copper_layers(context, context.output_dir)
+        front_path, back_path, cropped = export_copper_layers(self, context, context.output_dir)
         if not front_path and not back_path:
             return False
 
-        homebrew_svg = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.svg")
-        if not generate_a4_merged_svg(
-            front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger
-        ):
+        homebrew_svg = None
+        if cropped:
+            homebrew_svg = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.svg")
+            if not generate_a4_merged_svg(
+                front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger
+            ):
+                homebrew_svg = None
+                context.logger.info(
+                    "Single-page A4 homebrew SVG skipped (board does not fit A4 at 1:1); layer SVGs preserved."
+                )
+        else:
             context.logger.info(
-                "Single-page A4 homebrew SVG skipped (board does not fit A4 at 1:1); layer SVGs preserved."
+                "Copper SVGs plotted without board-area cropping (older kicad-cli build); "
+                "homebrew A4 sheet skipped since the layer size can't be trusted for 1:1 placement."
             )
+
+        # Let HomebrewPdfExportTask reuse this work instead of re-plotting and
+        # re-merging the same sheet from scratch.
+        context.homebrew_layers = {
+            "front": front_path,
+            "back": back_path,
+            "cropped": cropped,
+            "homebrew_svg": homebrew_svg,
+        }
         return True
 
 
@@ -3182,21 +3558,38 @@ class HomebrewPdfExportTask(ExportTask):
     def is_applicable(self, context: ExportContext) -> bool:
         return context.options.get("export_print_pdf", True) and bool(context.pcb_file)
 
-    def _resolve_layer_svgs(self, context: ExportContext, temp_dir: str) -> tuple[str | None, str | None]:
+    def _resolve_layers(self, context: ExportContext, temp_dir: str) -> tuple[str | None, str | None, bool]:
         """
-        Locate the copper-layer SVGs, plotting them into ``temp_dir`` when needed.
+        Get the copper-layer SVGs and whether they are safe for 1:1 A4 placement.
 
-        Files already written by :class:`SvgExportTask` are reused; otherwise the
-        layers are plotted into the scratch directory so nothing extra lands in
-        the output folder when ``export_svg`` is disabled.
+        Reuses :class:`SvgExportTask`'s work (stashed on ``context.homebrew_layers``)
+        when it already ran this pipeline pass, retrying only a layer that is
+        still missing rather than accepting a partial result as final. Falls
+        back to plotting both layers from scratch when ``export_svg`` is
+        disabled (nothing lands in ``context.output_dir`` in that case).
+
+        Layer plotting is always run via ``self`` (this task's own
+        ``_run_subprocess``), so a failure is attributed to "Exporting Homebrew
+        PDF" and not misreported under a borrowed "Exporting Copper SVGs" name.
         """
-        if context.options.get("export_svg", True):
-            front = os.path.join(context.output_dir, f"{context.pcb_name}_front.svg")
-            back = os.path.join(context.output_dir, f"{context.pcb_name}_back.svg")
-            if os.path.isfile(front) or os.path.isfile(back):
-                return (front if os.path.isfile(front) else None,
-                        back if os.path.isfile(back) else None)
-        return SvgExportTask().export_copper_layers(context, temp_dir)
+        cached = context.homebrew_layers
+        if cached and (cached["front"] or cached["back"]):
+            front, back, cropped = cached["front"], cached["back"], cached["cropped"]
+            for side, existing in (("front", front), ("back", back)):
+                if existing or context.is_aborted():
+                    continue
+                # SvgExportTask produced only one side; retry the missing one
+                # rather than silently shipping a single-sided homebrew PDF.
+                out = os.path.join(temp_dir, f"{context.pcb_name}_{side}.svg")
+                ok, side_cropped = _export_copper_layer(self, context, side, out)
+                if ok and os.path.isfile(out):
+                    if side == "front":
+                        front = out
+                    else:
+                        back = out
+                    cropped = cropped and side_cropped
+            return front, back, cropped
+        return export_copper_layers(self, context, temp_dir)
 
     def run(self, context: ExportContext) -> bool:
         homebrew_pdf = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.pdf")
@@ -3205,51 +3598,71 @@ class HomebrewPdfExportTask(ExportTask):
         keep_svg = bool(context.options.get("export_svg", True))
         temp_dir = tempfile.mkdtemp(prefix="kiforge_homebrew_")
         try:
-            front_path, back_path = self._resolve_layer_svgs(context, temp_dir)
+            context.report_progress(0.05)
+            front_path, back_path, cropped = self._resolve_layers(context, temp_dir)
             if not front_path and not back_path:
-                context.logger.warning("No copper layer SVG available; homebrew PDF skipped.")
+                context.add_warning("No copper layer SVG available; homebrew PDF skipped.")
+                return False
+            if not cropped:
+                context.add_warning(
+                    "Homebrew PDF skipped: copper layers were plotted without board-area "
+                    "cropping (older kicad-cli build), so their size can't be trusted for 1:1 A4 placement."
+                )
                 return False
 
-            homebrew_svg = os.path.join(
+            # Reuse the merged sheet SvgExportTask already wrote this pass
+            # instead of re-parsing and re-merging the same layers again.
+            cached_svg = context.homebrew_layers.get("homebrew_svg") if context.homebrew_layers else None
+            merged_ok = bool(cached_svg and os.path.isfile(cached_svg))
+            homebrew_svg = cached_svg if merged_ok else os.path.join(
                 context.output_dir if keep_svg else temp_dir,
                 f"{context.pcb_name}_homebrew.svg",
             )
-            merged_ok = generate_a4_merged_svg(
-                front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger
-            )
+            if not merged_ok:
+                merged_ok = generate_a4_merged_svg(
+                    front_path, back_path, homebrew_svg, context.pcb_name, logger=context.logger
+                )
 
-            if merged_ok and os.path.isfile(homebrew_svg):
+            context.report_progress(0.35)
+            if merged_ok:
                 # The sheet is drawn 1:1, so the PDF page must match the sheet's
                 # own orientation - deriving it any other way rescales the plot.
                 _, _, sheet_w, sheet_h = parse_svg_dimensions(homebrew_svg)
+                context.report_progress(0.5)
                 pdf_ok = export_svg_to_1200dpi_pdf(
                     homebrew_svg, homebrew_pdf,
                     is_landscape=sheet_w > sheet_h, logger=context.logger,
+                    should_abort=context.is_aborted, python_exe=context.kicad_python,
                 )
             else:
                 # Both layers do not share one A4 sheet: fall back to one board
                 # per page (page 1 front, page 2 back), still at true scale.
                 context.logger.info("Board cannot share a single A4 page; generating multi-page homebrew PDF.")
                 page_svgs = []
-                for path, mark, page in ((front_path, "F.Cu", "page1_front"), (back_path, "B.Cu", "page2_back")):
+                sheets = ((front_path, "F.Cu", "page1_front"), (back_path, "B.Cu", "page2_back"))
+                for sheet_no, (path, mark, page) in enumerate(sheets, start=1):
+                    if context.is_aborted():
+                        return False
+                    context.report_progress(0.35 + 0.15 * (sheet_no / len(sheets)))
                     if not path:
                         continue
                     sheet = os.path.join(temp_dir, f"{page}.svg")
                     if generate_single_a4_sheet_svg(path, sheet, mark=mark, logger=context.logger):
                         page_svgs.append(sheet)
                 if not page_svgs:
-                    context.logger.warning(
-                        "Board is too large for an A4 homebrew sheet at 1:1; PDF skipped."
-                    )
+                    context.add_warning("Board is too large for an A4 homebrew sheet at 1:1; PDF skipped.")
                     return False
+                context.report_progress(0.5)
                 # generate_single_a4_sheet_svg always emits portrait A4 pages.
                 pdf_ok = export_svg_to_1200dpi_pdf(
-                    page_svgs, homebrew_pdf, is_landscape=False, logger=context.logger
+                    page_svgs, homebrew_pdf, is_landscape=False, logger=context.logger,
+                    should_abort=context.is_aborted, python_exe=context.kicad_python,
                 )
 
             if not pdf_ok:
-                context.logger.warning("Failed to render %d DPI homebrew PDF.", PRINT_PDF_DPI)
+                context.add_warning(f"Failed to render {PRINT_PDF_DPI} DPI homebrew PDF.")
                 return False
+            context.report_progress(1.0)
             return True
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -3299,9 +3712,10 @@ class InteractiveBomTask(ExportTask):
             pip_success = False
             err_output = ""
             
+            ibom_pinned = f"InteractiveHtmlBom=={INTERACTIVE_HTML_BOM_PINNED_VERSION}"
             if not context.is_aborted():
                 pip_success = self._run_subprocess(
-                    [py_exe, "-m", "pip", "install", "--user", "InteractiveHtmlBom"],
+                    [py_exe, "-m", "pip", "install", "--user", ibom_pinned],
                     context,
                 )
             if not pip_success and not context.is_aborted():
@@ -3314,7 +3728,7 @@ class InteractiveBomTask(ExportTask):
                         "install",
                         "--user",
                         "--break-system-packages",
-                        "InteractiveHtmlBom",
+                        ibom_pinned,
                     ],
                     context,
                 )
@@ -3591,6 +4005,7 @@ class ExportRunner:
                 self._cleanup_temp_dirs()
                 return False
 
+            self.context.begin_step(idx, total_steps)
             if self.context.progress_callback:
                 msg = f"Running: {task.name}..."
                 keep_going = self.context.progress_callback(idx, total_steps, msg)
