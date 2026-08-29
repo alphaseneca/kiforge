@@ -25,6 +25,17 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install PDF renderer for export tests
+        # librsvg2-bin provides rsvg-convert, the headless SVG->PDF converter
+        # used by export_svg_to_1200dpi_pdf's CLI tier (the same package the
+        # project's Docker image installs). Without it a bare runner has no
+        # working PDF tier at all -- PyQt6 is not installed and the wx tier
+        # needs a running wx.App -- so every test that renders a real PDF
+        # skips, and the export path ships covered only by mocks.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends librsvg2-bin
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
         env:
