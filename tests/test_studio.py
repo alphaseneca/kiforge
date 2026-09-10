@@ -30,6 +30,22 @@ from plugins import kiforge_studio
 class TestKiForgeStudio(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # package_plugin.py copies the root kiforge.py to plugins/kiforge.py for
+        # local plugin development, and kiforge_studio's `from . import kiforge`
+        # prefers that sibling over the root module these tests import and patch.
+        # A stale copy therefore makes Studio tests exercise old code and fail in
+        # ways that look like product regressions -- it cost real debugging time
+        # once already. Fail loudly with the remedy instead.
+        sibling = os.path.join(os.path.dirname(__file__), "..", "plugins", "kiforge.py")
+        if os.path.isfile(sibling):
+            bound = getattr(kiforge_studio.kiforge, "__file__", "")
+            if os.path.basename(os.path.dirname(os.path.abspath(bound))) == "plugins":
+                raise unittest.SkipTest(
+                    "plugins/kiforge.py (a build artifact from package_plugin.py) is "
+                    "shadowing the root kiforge module, so these tests would run "
+                    "against a stale copy. Delete it and re-run: rm plugins/kiforge.py"
+                )
+
         # Create a wx app that stays alive for all tests so wx widgets can be instantiated
         cls.app = wx.App(False)
         # Mock the themed message dialog to prevent modal popups blocking automated tests
@@ -312,7 +328,7 @@ class TestKiForgeStudio(unittest.TestCase):
         self.assertTrue(dialog.chk_drills.IsEnabled())
         dialog.Destroy()
 
-    def test_print_pdf_toggle_forces_copper_svg(self):
+    def test_homebrew_pdf_toggle_forces_copper_svg(self):
         """Verify enabling Homebrew PDF disables and checks the Copper SVG checkbox.
 
         Regression test: this dependency existed, was accidentally dropped in
@@ -322,37 +338,122 @@ class TestKiForgeStudio(unittest.TestCase):
         SVG layers, so it must never be exportable with SVG left off.
         """
         dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
-        dialog.chk_print_pdf.SetValue(True)
+        dialog.chk_homebrew_pdf.SetValue(True)
         dialog._sync_svg_pdf_checkbox_state()
         self.assertTrue(dialog.chk_svg.IsChecked())
         self.assertFalse(dialog.chk_svg.IsEnabled())
-        dialog.chk_print_pdf.SetValue(False)
+        dialog.chk_homebrew_pdf.SetValue(False)
         dialog._sync_svg_pdf_checkbox_state()
         self.assertTrue(dialog.chk_svg.IsEnabled())
         dialog.Destroy()
 
-    def test_background_click_clears_custom_control_focus(self):
-        """Clicking blank panel background must clear focus from a
-        custom-painted checkbox/radio, the same way it would for a native
-        control. _FlatCheckBox/_FlatRadioButton own their painting instead of
-        wrapping a native widget, so wx never gives them this for free --
-        without _dismiss_focus_on_click, a focused control's accent-border
-        highlight stayed lit until something else (e.g. the notebook tab
-        strip) explicitly stole focus, which is what was reported broken.
+    def test_deselected_radio_drops_its_accent_ring(self):
+        """
+        Regression: the previously selected radio kept an orange ring.
+
+        Its dot cleared correctly, but the ring did not. Both custom controls
+        used to bind one handler to EVT_SET_FOCUS and EVT_KILL_FOCUS and read
+        the state back with HasFocus() -- which, inside a kill-focus handler,
+        can still report True because the transfer has not completed. The
+        control that just lost focus stayed permanently "focused", and the
+        paint code draws an accent ring for a focused glyph.
+        """
+        frame = wx.Frame(None)
+        try:
+            group = []
+            first = kiforge_studio._FlatRadioButton(frame, label="Documentation", group=group)
+            second = kiforge_studio._FlatRadioButton(frame, label="JLCPCB", group=group)
+
+            class Event:
+                def Skip(self):
+                    pass
+
+            first._apply_selection()
+            first._on_set_focus(Event())
+            self.assertTrue(first._selected)
+            self.assertTrue(first._has_focus)
+
+            # Select the other one: focus leaves `first` while HasFocus() would
+            # still report True for it.
+            first._on_kill_focus(Event())
+            second._on_set_focus(Event())
+            second._apply_selection()
+
+            self.assertFalse(first._selected, "dot should clear")
+            self.assertFalse(
+                first._has_focus,
+                "focus flag must come from the event, not a mid-transfer HasFocus()",
+            )
+            self.assertFalse(
+                first._hover or first._has_focus or first._selected,
+                "nothing should still be forcing an accent ring on the deselected radio",
+            )
+        finally:
+            frame.Destroy()
+
+    def test_background_click_hands_focus_to_the_container(self):
+        """
+        Clicking blank background must move focus off a custom-painted control,
+        the way clicking elsewhere does for a native one. _FlatCheckBox and
+        _FlatRadioButton paint themselves, and blank panel background claims no
+        focus, so without _clear_focus_on_background_click the accent highlight
+        stays lit until something else explicitly steals focus.
+
+        Asserted through the container's own focus call rather than
+        ``HasFocus()``: real platform focus needs the application to be
+        frontmost, which it never is under a test runner -- not even a native
+        wx.TextCtrl can hold focus there, so a HasFocus() assertion would fail
+        for a reason that has nothing to do with this behaviour.
         """
         dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
-        dialog.notebook.SetSelection(0)
-        radio = dialog._preset_radios[0]
-        radio.SetFocus()
-        self.assertTrue(radio.HasFocus())
+        try:
+            dialog.notebook.SetSelection(0)
+            radio = dialog._preset_radios[0]
+            scroll = radio.GetParent()
 
-        scroll = radio.GetParent()
-        evt = wx.MouseEvent(wx.wxEVT_LEFT_DOWN)
-        evt.SetEventObject(scroll)
-        scroll.ProcessWindowEvent(evt)
+            claimed = []
+            scroll.SetFocusIgnoringChildren = lambda: claimed.append(True)
 
-        self.assertFalse(radio.HasFocus())
-        dialog.Destroy()
+            evt = wx.MouseEvent(wx.wxEVT_LEFT_DOWN)
+            evt.SetEventObject(scroll)
+            scroll.ProcessWindowEvent(evt)
+
+            self.assertTrue(
+                claimed,
+                "clicking the background did not hand focus to the container",
+            )
+        finally:
+            dialog.Destroy()
+
+    def test_background_click_clears_custom_control_focus_end_to_end(self):
+        """The same behaviour against real platform focus, when it is obtainable."""
+        probe = wx.Frame(None)
+        probe.Show()
+        native = wx.TextCtrl(probe)
+        native.SetFocus()
+        can_focus = native.HasFocus()
+        probe.Destroy()
+        if not can_focus:
+            self.skipTest(
+                "application is not frontmost; not even a native control can "
+                "hold focus, so real-focus behaviour is untestable here"
+            )
+
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            dialog.notebook.SetSelection(0)
+            radio = dialog._preset_radios[0]
+            radio.SetFocus()
+            self.assertTrue(radio.HasFocus())
+
+            scroll = radio.GetParent()
+            evt = wx.MouseEvent(wx.wxEVT_LEFT_DOWN)
+            evt.SetEventObject(scroll)
+            scroll.ProcessWindowEvent(evt)
+
+            self.assertFalse(radio.HasFocus())
+        finally:
+            dialog.Destroy()
 
     def test_checkbox_paints_complete_without_graphics_context(self):
         """_FlatCheckBox must render a checked, focused state correctly even
@@ -762,6 +863,131 @@ class TestKiForgeStudio(unittest.TestCase):
             self.assertTrue(dialog._export_close_after_finish)
         finally:
             dialog.Destroy()
+
+
+class TestStudioPalette(unittest.TestCase):
+    """
+    Both ramps must be readable, not merely structurally matched.
+
+    The structural checks (matching keys, in-place swap) run everywhere via
+    tests/kicad_runtime_stub.py. These need real ``wx.Colour`` values, so they
+    live behind the GUI gate with the rest of the wx-dependent tests.
+    """
+
+    _WCAG_BODY = 4.5      # normal text
+    _WCAG_SECONDARY = 3.0  # muted/secondary text and UI edges
+
+    @staticmethod
+    def _luminance(colour):
+        """WCAG 2.1 relative luminance of a wx.Colour."""
+        def channel(value):
+            v = value / 255.0
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+
+        return (
+            0.2126 * channel(colour.Red())
+            + 0.7152 * channel(colour.Green())
+            + 0.0722 * channel(colour.Blue())
+        )
+
+    @classmethod
+    def _contrast(cls, fg, bg):
+        light, dark = sorted((cls._luminance(fg), cls._luminance(bg)), reverse=True)
+        return (light + 0.05) / (dark + 0.05)
+
+    def _ramps(self):
+        return (
+            ("dark", kiforge_studio._DARK_PALETTE),
+            ("light", kiforge_studio._LIGHT_PALETTE),
+        )
+
+    def test_body_text_is_readable_on_every_ground(self):
+        """The reported bug was text at one theme's colour on the other's ground."""
+        for mode, palette in self._ramps():
+            for ground in ("app_bg", "surface", "footer_bg"):
+                with self.subTest(mode=mode, ground=ground):
+                    ratio = self._contrast(palette["text"], palette[ground])
+                    self.assertGreaterEqual(
+                        ratio, self._WCAG_BODY,
+                        f"{mode} text on {ground} is {ratio:.1f}:1",
+                    )
+            with self.subTest(mode=mode, ground="input_bg"):
+                ratio = self._contrast(palette["input_fg"], palette["input_bg"])
+                self.assertGreaterEqual(ratio, self._WCAG_BODY, f"{mode} input {ratio:.1f}:1")
+
+    def test_muted_text_and_accent_stay_legible(self):
+        for mode, palette in self._ramps():
+            for key in ("muted", "accent"):
+                with self.subTest(mode=mode, colour=key):
+                    ratio = self._contrast(palette[key], palette["app_bg"])
+                    self.assertGreaterEqual(
+                        ratio, self._WCAG_SECONDARY,
+                        f"{mode} {key} on app_bg is {ratio:.1f}:1",
+                    )
+
+    def test_the_two_ramps_actually_run_opposite(self):
+        """Guards against a light ramp that was copied from the dark one."""
+        dark_bg = self._luminance(kiforge_studio._DARK_PALETTE["app_bg"])
+        light_bg = self._luminance(kiforge_studio._LIGHT_PALETTE["app_bg"])
+        self.assertLess(dark_bg, 0.1, "dark ground is not dark")
+        self.assertGreater(light_bg, 0.7, "light ground is not light")
+
+    def test_appearance_falls_back_to_luminance_without_is_dark(self):
+        """
+        Not every backend implements SystemAppearance.IsDark.
+
+        wx reports it on Cocoa, GTK and MSW from 4.1, but older builds and some
+        GTK themes raise. The fallback reads SYS_COLOUR_WINDOW -- the colour the
+        OS will actually paint native controls with -- so the palette still
+        matches its surroundings rather than defaulting blindly.
+        """
+        from unittest.mock import patch
+
+        class NoIsDark:
+            @staticmethod
+            def GetAppearance():
+                raise NotImplementedError("backend has no SystemAppearance")
+
+            @staticmethod
+            def GetColour(_which):
+                return wx.Colour(250, 250, 250)  # a light GTK theme
+
+        with patch.object(kiforge_studio.wx, "SystemSettings", NoIsDark):
+            self.assertFalse(kiforge_studio._system_is_dark())
+
+        class NoIsDarkButDark(NoIsDark):
+            @staticmethod
+            def GetColour(_which):
+                return wx.Colour(30, 30, 32)
+
+        with patch.object(kiforge_studio.wx, "SystemSettings", NoIsDarkButDark):
+            self.assertTrue(kiforge_studio._system_is_dark())
+
+    def test_appearance_defaults_to_dark_when_nothing_answers(self):
+        """A headless or half-initialised wx must not break dialog construction."""
+        from unittest.mock import patch
+
+        class Broken:
+            @staticmethod
+            def GetAppearance():
+                raise RuntimeError("no display")
+
+            @staticmethod
+            def GetColour(_which):
+                raise RuntimeError("no display")
+
+        with patch.object(kiforge_studio.wx, "SystemSettings", Broken):
+            self.assertTrue(kiforge_studio._system_is_dark())
+
+    def test_refresh_palette_follows_the_system_appearance(self):
+        mode = kiforge_studio.refresh_palette()
+        self.assertIn(mode, ("dark", "light"))
+        self.assertEqual(kiforge_studio.active_palette_mode(), mode)
+        expected = (
+            kiforge_studio._DARK_PALETTE if mode == "dark" else kiforge_studio._LIGHT_PALETTE
+        )
+        self.assertEqual(kiforge_studio._COLORS["app_bg"], expected["app_bg"])
+
 
 if __name__ == '__main__':
     unittest.main()

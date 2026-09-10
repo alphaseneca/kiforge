@@ -43,7 +43,7 @@ build_cli_args() {
   # Export toggles (EXPORT_SETTING_KEYS)
   append_bool_toggle INPUT_EXPORT_3D export-3d
   append_bool_toggle INPUT_EXPORT_SVG export-svg
-  append_bool_toggle INPUT_EXPORT_PRINT_PDF export-print-pdf
+  append_bool_toggle INPUT_EXPORT_HOMEBREW_PDF export-homebrew-pdf
   append_bool_toggle INPUT_EXPORT_BOM export-bom
   append_bool_toggle INPUT_EXPORT_SCH_PDF export-sch-pdf
   append_bool_toggle INPUT_EXPORT_POS export-pos
@@ -61,9 +61,6 @@ build_cli_args() {
   append_bool_toggle INPUT_POS_EXCLUDE_DNP pos-exclude-dnp
   append_bool_toggle INPUT_STEP_SUBST_MODELS step-subst-models
   append_bool_toggle INPUT_BOM_INCLUDE_MFR_MPN bom-include-mfr-mpn
-
-  # Runtime options (RUNTIME_OPTION_SPECS)
-  append_bool_toggle INPUT_SYNC_TITLE_BLOCK_REV sync-title-block-rev
 
   if [[ -n "${INPUT_VERSION:-}" ]]; then
     args+=("--version-tag" "${INPUT_VERSION}")

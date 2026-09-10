@@ -27,7 +27,7 @@ jobs:
           output_dir: '{{OUTPUT_DIR}}'
           export_3d: '{{EXPORT_3D}}'
           export_svg: '{{EXPORT_SVG}}'
-          export_print_pdf: '{{EXPORT_PRINT_PDF}}'
+          export_homebrew_pdf: '{{EXPORT_HOMEBREW_PDF}}'
           export_bom: '{{EXPORT_BOM}}'
           export_sch_pdf: '{{EXPORT_SCH_PDF}}'
           export_pos: '{{EXPORT_POS}}'
@@ -41,7 +41,6 @@ jobs:
           pos_exclude_dnp: '{{POS_EXCLUDE_DNP}}'
           step_subst_models: '{{STEP_SUBST_MODELS}}'
           bom_include_mfr_mpn: '{{BOM_INCLUDE_MFR_MPN}}'
-          sync_title_block_rev: '{{SYNC_TITLE_BLOCK_REV}}'
 
       - name: Create release and upload assets
         uses: https://github.com/softprops/action-gh-release@v2

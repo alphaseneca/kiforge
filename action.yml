@@ -4,7 +4,6 @@
 # Inputs mirror kiforge.py configuration layers:
 #   - export_* toggles  → EXPORT_SETTING_KEYS (what to produce)
 #   - pos_*/step_*/render_* → EXPORT_PARAM_SPECS (kicad-cli parameters)
-#   - sync_title_block_rev → RUNTIME_OPTION_SPECS (per-run behavior)
 #
 # action/run.sh maps INPUT_* env vars to the same CLI flags as `python kiforge.py`.
 # See USAGE.md for workflow examples and the full input reference.
@@ -32,8 +31,8 @@ inputs:
     description: 'Export copper layer SVGs (true/false)'
     required: false
     default: 'true'
-  export_print_pdf:
-    description: 'Export 1200 DPI print-ready etching & mask PDF (true/false)'
+  export_homebrew_pdf:
+    description: 'Export 1200 DPI homebrew etching & mask PDF (true/false)'
     required: false
     default: 'true'
   export_bom:
@@ -88,10 +87,6 @@ inputs:
     description: 'BOM/iBOM: include Manufacturer & MPN columns (true/false)'
     required: false
     default: 'true'
-  sync_title_block_rev:
-    description: 'Sync schematic title-block (rev) to export version via staged copy (true/false)'
-    required: false
-    default: 'true'
   version:
     description: 'Optional version tag override for output filenames (defaults to GITHUB_REF_NAME or v0.1.0)'
     required: false
@@ -109,7 +104,7 @@ runs:
         INPUT_OUTPUT_DIR: ${{ inputs.output_dir }}
         INPUT_EXPORT_3D: ${{ inputs.export_3d }}
         INPUT_EXPORT_SVG: ${{ inputs.export_svg }}
-        INPUT_EXPORT_PRINT_PDF: ${{ inputs.export_print_pdf }}
+        INPUT_EXPORT_HOMEBREW_PDF: ${{ inputs.export_homebrew_pdf }}
         INPUT_EXPORT_BOM: ${{ inputs.export_bom }}
         INPUT_EXPORT_SCH_PDF: ${{ inputs.export_sch_pdf }}
         INPUT_EXPORT_POS: ${{ inputs.export_pos }}
@@ -123,7 +118,6 @@ runs:
         INPUT_POS_EXCLUDE_DNP: ${{ inputs.pos_exclude_dnp }}
         INPUT_STEP_SUBST_MODELS: ${{ inputs.step_subst_models }}
         INPUT_BOM_INCLUDE_MFR_MPN: ${{ inputs.bom_include_mfr_mpn }}
-        INPUT_SYNC_TITLE_BLOCK_REV: ${{ inputs.sync_title_block_rev }}
         INPUT_VERSION: ${{ inputs.version }}
         GITHUB_REF_NAME: ${{ github.ref_name }}
         GITHUB_REF_TYPE: ${{ github.ref_type }}

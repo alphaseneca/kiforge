@@ -35,7 +35,7 @@ def _has_pdf_render_tier() -> bool:
         return True
     except ImportError:
         pass
-    return bool(shutil.which("rsvg-convert") or shutil.which("inkscape"))
+    return bool(shutil.which("rsvg-convert"))
 
 
 def _rmtree_force(path: str) -> None:
@@ -74,7 +74,7 @@ class TestKiForgeCLI(unittest.TestCase):
         self.assertEqual(args.output_dir, "kiforge")
         self.assertTrue(args.export_3d)
         self.assertTrue(args.export_svg)
-        self.assertTrue(args.export_print_pdf)
+        self.assertTrue(args.export_homebrew_pdf)
         self.assertTrue(args.export_bom)
         self.assertTrue(args.export_sch_pdf)
         self.assertTrue(args.export_pos)
@@ -96,7 +96,7 @@ class TestKiForgeCLI(unittest.TestCase):
         args = kiforge.parse_cli_args([
             "--no-export-3d",
             "--no-export-svg",
-            "--no-export-print-pdf",
+            "--no-export-homebrew-pdf",
             "--no-export-bom",
             "--no-export-sch-pdf",
             "--no-export-pos",
@@ -107,7 +107,7 @@ class TestKiForgeCLI(unittest.TestCase):
         ])
         self.assertFalse(args.export_3d)
         self.assertFalse(args.export_svg)
-        self.assertFalse(args.export_print_pdf)
+        self.assertFalse(args.export_homebrew_pdf)
         self.assertFalse(args.export_bom)
         self.assertFalse(args.export_sch_pdf)
         self.assertFalse(args.export_pos)
@@ -405,8 +405,9 @@ class TestKiForgeCLI(unittest.TestCase):
                 backup = f.read()
 
         try:
-            runtime = kiforge.apply_export_runtime_options({})
-            self.assertTrue(runtime["sync_title_block_rev"])
+            # Title-block sync is behaviour now, not a setting: it is
+            # unconditional for a versioned export and has no key anywhere.
+            self.assertFalse(hasattr(kiforge, "RUNTIME_OPTION_SPECS"))
 
             kiforge.save_settings({"format_jlc": False}, scope="global")
             with open(global_path, "r", encoding="utf-8") as f:
@@ -414,6 +415,7 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertNotIn("sync_title_block_rev", saved)
             self.assertNotIn("sync_title_block_rev", saved.get("exports", {}))
 
+            # A stale key left in a project file by an older KiForge is ignored.
             with open(os.path.join(temp_dir, ".kiforge.json"), "w", encoding="utf-8") as f:
                 json.dump({"exports": {"sync_title_block_rev": False}}, f)
             merged = kiforge.load_merged_settings(temp_dir)
@@ -648,7 +650,10 @@ class TestKiForgeCLI(unittest.TestCase):
                 placeholder = spec["cd_placeholder"]
                 expected = kiforge.build_cd_substitutions("kiforge_out", options)[placeholder]
                 self.assertIn(f"{spec['action_input']}: '{expected}'", content)
-            self.assertIn("sync_title_block_rev: 'false'", content)
+            # The generated workflow must not pass title-block sync at all --
+            # it is native behaviour, and a stale input would be an unknown
+            # input to the composite action.
+            self.assertNotIn("sync_title_block_rev", content)
         finally:
             shutil.rmtree(temp_dir)
 
@@ -681,8 +686,6 @@ class TestKiForgeCLI(unittest.TestCase):
         with open(action_path, "r", encoding="utf-8") as f:
             action_yaml = f.read()
         for spec in kiforge.EXPORT_PARAM_SPECS:
-            self.assertIn(f"{spec['action_input']}:", action_yaml)
-        for spec in kiforge.RUNTIME_OPTION_SPECS:
             self.assertIn(f"{spec['action_input']}:", action_yaml)
 
     def test_placement_export_uses_export_params(self):
@@ -1229,6 +1232,102 @@ class TestKiForgeCLI(unittest.TestCase):
                 self.assertEqual(data, sample_svg)
                 self.assertEqual(kiforge.read_cached_tab_icon_svg("export"), sample_svg)
 
+    def test_bundled_icons_cover_every_studio_glyph(self):
+        """Every icon Studio can draw must ship in the plugin, not be downloaded."""
+        for name in kiforge.TAB_ICON_CDN:
+            with self.subTest(icon=name):
+                path = kiforge.get_icon_path(f"{name}.svg")
+                self.assertIsNotNone(path, f"icons/{name}.svg is not bundled")
+                self.assertTrue(
+                    kiforge.read_bundled_tab_icon_svg(name).strip().startswith(b"<svg"),
+                    f"icons/{name}.svg is not valid SVG",
+                )
+
+    def test_fetch_tab_icon_prefers_bundled_asset_over_network(self):
+        """
+        Studio must render its own UI with no network at all.
+
+        Regression test for icons rendering blank on macOS: KiCad's bundled
+        Python there has no CA store, so the CDN fetch raised
+        CERTIFICATE_VERIFY_FAILED and every glyph silently came back empty,
+        while the same code worked on Windows.
+        """
+        from unittest.mock import patch
+
+        def _explode(*args, **kwargs):
+            raise AssertionError("fetch_tab_icon_svg must not touch the network")
+
+        with patch.object(kiforge.urllib.request, "urlopen", _explode):
+            for name in kiforge.TAB_ICON_CDN:
+                with self.subTest(icon=name):
+                    data = kiforge.fetch_tab_icon_svg(name)
+                    self.assertTrue(data and data.strip().startswith(b"<svg"))
+
+    def test_https_context_resolves_a_ca_store(self):
+        """
+        HTTPS must be usable on KiCad's Python, including the macOS build.
+
+        That build is a python.org framework Python with no default CA file, so
+        an unconfigured context trusts nothing. KiCad ships certifi; the helper
+        falls back to it.
+        """
+        context = kiforge._https_context()
+        self.assertIsNotNone(context)
+        self.assertGreater(
+            context.cert_store_stats().get("x509_ca", 0),
+            0,
+            "no CA certificates loaded -- HTTPS would fail with "
+            "CERTIFICATE_VERIFY_FAILED",
+        )
+
+    def test_https_context_uses_the_system_store_when_it_is_populated(self):
+        """
+        Linux and Windows must keep their own trust store.
+
+        OpenSSL on Linux has a default CA path and CPython on Windows loads the
+        OS root store, so overriding either with certifi would narrow trust for
+        no reason. Only an empty store gets the fallback.
+        """
+        from unittest.mock import MagicMock, patch
+
+        populated = MagicMock()
+        populated.cert_store_stats.return_value = {"x509_ca": 142}
+        with patch.object(kiforge.ssl, "create_default_context", return_value=populated) as mk:
+            self.assertIs(kiforge._https_context(), populated)
+        mk.assert_called_once_with()  # no cafile= -- the system store was used
+
+    def test_https_context_falls_back_to_certifi_on_an_empty_store(self):
+        """KiCad's macOS Python is a framework build with no default CA file."""
+        from unittest.mock import MagicMock, patch
+
+        import types
+
+        empty = MagicMock()
+        empty.cert_store_stats.return_value = {"x509_ca": 0}
+        from_certifi = MagicMock()
+
+        def fake_create(*args, **kwargs):
+            return from_certifi if kwargs.get("cafile") else empty
+
+        # certifi ships inside KiCad but not in every interpreter running these
+        # tests, so stand one in rather than testing the host machine.
+        fake_certifi = types.ModuleType("certifi")
+        fake_certifi.where = lambda: "/stand-in/cacert.pem"
+
+        with patch.object(kiforge.ssl, "create_default_context", side_effect=fake_create):
+            with patch.dict(sys.modules, {"certifi": fake_certifi}):
+                self.assertIs(kiforge._https_context(), from_certifi)
+
+    def test_https_context_survives_a_missing_certifi(self):
+        """Never raise from the helper: a failed fetch must degrade, not crash."""
+        from unittest.mock import MagicMock, patch
+
+        empty = MagicMock()
+        empty.cert_store_stats.return_value = {"x509_ca": 0}
+        with patch.object(kiforge.ssl, "create_default_context", return_value=empty):
+            with patch.dict(sys.modules, {"certifi": None}):
+                self.assertIs(kiforge._https_context(), empty)
+
     def test_destroy_progress_dialog_tolerates_none(self):
         """Progress dialog teardown must not raise when no dialog exists."""
         try:
@@ -1409,7 +1508,7 @@ class TestKiForgeCLI(unittest.TestCase):
     def test_generate_a4_merged_svg_and_pdf(self):
         """Verify merged A4 print SVG and 1200 DPI PDF generation."""
         if not _has_pdf_render_tier():
-            self.skipTest("No PDF renderer available (PyQt6/rsvg-convert/inkscape all missing)")
+            self.skipTest("No PDF renderer available (PyQt6 and rsvg-convert both missing)")
         with tempfile.TemporaryDirectory() as tmp_dir:
             front_svg = os.path.join(tmp_dir, "test_front.svg")
             back_svg = os.path.join(tmp_dir, "test_back.svg")
@@ -1511,7 +1610,7 @@ class TestKiForgeCLI(unittest.TestCase):
         from unittest.mock import patch
 
         if not _has_pdf_render_tier():
-            self.skipTest("No PDF renderer available (PyQt6/rsvg-convert/inkscape all missing)")
+            self.skipTest("No PDF renderer available (PyQt6 and rsvg-convert both missing)")
         with tempfile.TemporaryDirectory() as tmp_dir:
             ctx = self._make_export_context(tmp_dir)
             svg_task = kiforge.SvgExportTask()
@@ -1533,7 +1632,7 @@ class TestKiForgeCLI(unittest.TestCase):
         from unittest.mock import patch
 
         if not _has_pdf_render_tier():
-            self.skipTest("No PDF renderer available (PyQt6/rsvg-convert/inkscape all missing)")
+            self.skipTest("No PDF renderer available (PyQt6 and rsvg-convert both missing)")
         with tempfile.TemporaryDirectory() as tmp_dir:
             ctx = self._make_export_context(tmp_dir)
             front_svg = os.path.join(tmp_dir, "test_front.svg")
@@ -1585,7 +1684,7 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertFalse(cropped)
 
     def test_export_pdf_via_cli_multi_page_uses_rsvg_convert(self):
-        """rsvg-convert accepts multiple SVGs as one multi-page PDF; Inkscape must be skipped for that case."""
+        """rsvg-convert accepts multiple SVGs as one multi-page PDF."""
         from unittest.mock import patch, MagicMock
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1611,9 +1710,76 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertTrue(result)
             self.assertTrue(os.path.isfile(pdf))
 
-    def test_export_pdf_via_cli_multi_page_rejects_inkscape_only(self):
-        """Inkscape can only render one page per invocation, so multi-page must not be attempted through it."""
+    def test_missing_pdf_renderer_packages_maps_distribution_names(self):
+        """Pillow imports as PIL; a name mismatch must not report it missing."""
+        self.assertEqual(kiforge.PDF_RENDERER_PACKAGES, ("Pillow", "PyQt6"))
+        missing = kiforge.missing_pdf_renderer_packages(["Pillow"])
+        try:
+            import PIL  # noqa: F401
+            self.assertEqual(missing, [])
+        except ImportError:
+            self.assertEqual(missing, ["Pillow"])
+
+    def test_install_pdf_renderer_targets_kicads_own_interpreter(self):
+        """
+        The install must land in the interpreter KiCad renders with.
+
+        Inside the KiCad GUI ``sys.executable`` is the application binary, so
+        PathResolver.get_kicad_python_path() is what resolves the real bundled
+        Python -- installing against sys.executable would silently target the
+        wrong environment (or launch the GUI).
+        """
+        from unittest.mock import MagicMock, patch
+
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(kiforge.PathResolver, "get_kicad_python_path",
+                          return_value=sys.executable):
+            with patch("subprocess.run", side_effect=fake_run):
+                ok, message = kiforge.install_pdf_renderer(["Pillow"])
+
+        self.assertTrue(ok, message)
+        self.assertEqual(captured["argv"][:4],
+                         [sys.executable, "-m", "pip", "install"])
+        self.assertIn("Pillow", captured["argv"])
+
+    def test_install_pdf_renderer_reports_failure_without_raising(self):
+        """A failed install degrades to the existing tier fallbacks, never a crash."""
+        from unittest.mock import MagicMock, patch
+
+        with patch.object(kiforge.PathResolver, "get_kicad_python_path",
+                          return_value=sys.executable):
+            with patch("subprocess.run",
+                       return_value=MagicMock(returncode=1, stdout="", stderr="no matching distribution")):
+                ok, message = kiforge.install_pdf_renderer(["Nope"])
+        self.assertFalse(ok)
+        self.assertIn("no matching distribution", message)
+
+        with patch.object(kiforge.PathResolver, "get_kicad_python_path",
+                          return_value="/does/not/exist/python"):
+            ok, message = kiforge.install_pdf_renderer(["Pillow"])
+        self.assertFalse(ok)
+        self.assertIn("Could not locate", message)
+
+    def test_cli_tier_is_rsvg_only(self):
+        """
+        Inkscape is not a converter KiForge will reach for.
+
+        It is a full desktop application, and its CLI rendered one page per
+        invocation so it could never serve the multi-page fallback anyway. With
+        rsvg-convert absent the CLI tier must decline outright rather than fall
+        back to whatever else happens to be on PATH.
+        """
         from unittest.mock import patch
+
+        self.assertEqual(
+            [name for name, _builder, _multi in kiforge.HOMEBREW_PDF_CLI_CONVERTERS],
+            ["rsvg-convert"],
+        )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             svg1 = os.path.join(tmp_dir, "p1.svg")
@@ -1622,6 +1788,7 @@ class TestKiForgeCLI(unittest.TestCase):
             for p in (svg1, svg2):
                 open(p, "w", encoding="utf-8").write("<svg></svg>")
 
+            # Inkscape installed, rsvg-convert not: the tier must still decline.
             def fake_which(name):
                 return f"/usr/bin/{name}" if name == "inkscape" else None
 
@@ -1824,7 +1991,7 @@ class TestKiForgeCLI(unittest.TestCase):
         artwork on print.
         """
         if not _has_pdf_render_tier():
-            self.skipTest("No PDF renderer available (PyQt6/rsvg-convert/inkscape all missing)")
+            self.skipTest("No PDF renderer available (PyQt6 and rsvg-convert both missing)")
         with tempfile.TemporaryDirectory() as tmp_dir:
             front_svg = os.path.join(tmp_dir, "wide_front.svg")
             back_svg = os.path.join(tmp_dir, "wide_back.svg")

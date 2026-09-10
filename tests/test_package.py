@@ -192,6 +192,37 @@ class TestPackagePlugin(unittest.TestCase):
         self.assertIn('KIFORGE_ACTION_REF = "alphaseneca/kiforge@v9.9.9"', source)
         self.assertNotIn("@main", source)
 
+    def test_versioned_zip_stamps_bootstrap_version(self):
+        """
+        Release zips carry the tag in ``__version__``.
+
+        The load bootstrap prints it in its failure report, so a stale value
+        would point support at the wrong build.
+        """
+        zip_path = package_plugin.package_plugin(version="v9.9.9")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            source = zf.read("plugins/__init__.py").decode("utf-8")
+        self.assertIn('__version__ = "9.9.9"', source)
+
+    def test_local_zip_stamps_dev_version(self):
+        """Local builds say so, rather than claiming a release number."""
+        zip_path = package_plugin.package_plugin()
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            source = zf.read("plugins/__init__.py").decode("utf-8")
+        self.assertIn(f'__version__ = "{package_plugin.LOCAL_DEV_VERSION}"', source)
+
+    def test_packaging_never_writes_the_tracked_bootstrap(self):
+        """
+        Stamping goes to a staged copy under dist/, never to tracked source.
+
+        Guards the working tree: a packager that edits committed files leaves a
+        dirty checkout after every build and invites accidental commits.
+        """
+        tracked = Path("plugins/__init__.py")
+        before = tracked.read_bytes()
+        package_plugin.package_plugin(version="v9.9.9")
+        self.assertEqual(before, tracked.read_bytes())
+
     def test_release_repository_json_uses_tag_urls(self):
         """Tag release repository.json points at that tag's packages.json, not @main."""
         package_plugin.package_plugin(version="v9.9.8")
@@ -202,8 +233,24 @@ class TestPackagePlugin(unittest.TestCase):
             repo["packages"]["url"],
         )
 
+    def test_all_studio_icons_ship_in_the_zip(self):
+        """
+        Every glyph Studio can draw must be in the package.
+
+        Derived from ``kiforge.TAB_ICON_CDN`` rather than a hand-kept list, so
+        adding an icon to that map fails here until the SVG is bundled.
+        """
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        import kiforge
+
+        zip_path = package_plugin.package_plugin()
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = set(zf.namelist())
+        for icon in kiforge.TAB_ICON_CDN:
+            self.assertIn(f"plugins/icons/{icon}.svg", names)
+
     def test_installed_layout_resolves_templates(self):
-        """Simulate PCM install layout and verify template lookup works."""
+        """Simulate PCM install layout and verify template and icon lookup works."""
         zip_path = package_plugin.package_plugin()
         temp_root = tempfile.mkdtemp()
         plugins_dir = os.path.join(temp_root, "plugins")
@@ -220,6 +267,13 @@ class TestPackagePlugin(unittest.TestCase):
             self.assertTrue(gitignore and os.path.isfile(gitignore))
             self.assertTrue(github_yml and os.path.isfile(github_yml))
             self.assertIn("templates", gitignore.replace("\\", "/"))
+
+            # Icons resolve from the installed layout too -- get_icon_path walks
+            # the same candidates as get_template_path, and a break there is
+            # exactly what makes Studio render blank glyphs.
+            export_icon = kiforge.get_icon_path("export.svg")
+            self.assertTrue(export_icon and os.path.isfile(export_icon))
+            self.assertIn("icons", export_icon.replace("\\", "/"))
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
             if plugins_dir in sys.path:
