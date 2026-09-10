@@ -1,0 +1,26 @@
+# KiForge ships through KiCad's Plugin and Content Manager, not pip. This file
+# exists so the *interpreter baseline* is machine-readable rather than tribal
+# knowledge: editors, linters, CI and tests all read the floor from here.
+#
+# The floor is a range, not a pinned build. KiCad bundles its own Python and the
+# version differs per platform -- macOS 10.x ships 3.9.13, other platforms ship
+# newer 3.x -- so shipped code has to run on all of them, and pinning any exact
+# patch release would just relocate the failure.
+#
+# Mirrored by plugins/__init__.py:MIN_PYTHON and by the CI matrix.
+# tests/test_python_compat.py fails if any of them drift apart.
+
+[tool.kiforge]
+min-python = "3.9"
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+# Deliberately narrow. This is a compatibility gate, not a style pass: FA is
+# flake8-future-annotations, whose FA102 flags exactly the bug that shipped --
+# PEP 604 (`X | None`) annotations in a module that lacks
+# `from __future__ import annotations`, which parse on 3.9 but raise TypeError
+# when evaluated at def time. Widening this set is a separate decision from
+# keeping the plugin loadable.
+select = ["FA"]

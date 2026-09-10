@@ -30,6 +30,10 @@ The repo-root ``kiforge.py`` is copied to ``plugins/kiforge.py`` before zipping.
 Templates are read from ``templates/`` and placed at ``plugins/templates/`` inside
 the zip (not committed under ``plugins/templates/`` in git).
 """
+# Runs under whatever ``python3`` the developer has -- macOS system Python is
+# still 3.9, which evaluates ``X | None`` annotations at def time and raises
+# TypeError. Keep them unevaluated so packaging works on 3.9+.
+from __future__ import annotations
 
 import os
 import re
@@ -95,6 +99,10 @@ REQUIRED_ZIP_ENTRIES = (
     "plugins/templates/kiforge.gitignore",
     "plugins/templates/github-release.yml",
     "plugins/templates/gitea-release.yml",
+    # Studio renders its own UI from these; a zip without them means blank tab
+    # and dialog glyphs. tests/test_package.py checks the full set against
+    # kiforge.TAB_ICON_CDN -- this entry just proves the directory ships.
+    "plugins/icons/export.svg",
 )
 
 
@@ -302,6 +310,44 @@ def _pin_action_ref_in_plugin(release_tag: str) -> None:
         )
     plugin_path.write_text(updated, encoding="utf-8")
     print(f"  Pinned KIFORGE_ACTION_REF -> {action_ref}")
+
+
+def _stage_bootstrap_with_version(version: str | None, output_dir: Path) -> Path:
+    """
+    Stamp the build version into the packaged ``plugins/__init__.py``.
+
+    The bootstrap prints ``__version__`` in its load-failure report, so a stale
+    value would send support down the wrong path. Unlike ``plugins/kiforge.py``
+    -- a gitignored copy the packager owns -- ``plugins/__init__.py`` is tracked
+    source, so the stamped copy is staged under ``dist/`` and the tracked file is
+    never written. Packaging leaves the working tree clean.
+
+    Reads and writes with ``newline=""`` so the packaged bytes do not depend on
+    the platform running the build.
+    """
+    source = Path("plugins/__init__.py")
+    pcm_version = version.lstrip("v") if version else LOCAL_DEV_VERSION
+    with open(source, "r", encoding="utf-8", newline="") as f:
+        text = f.read()
+    # Callable replacement: re.sub treats a string replacement as a template,
+    # so a backslash in the tag would be read as an escape and either raise or
+    # inject a group reference into the shipped bootstrap.
+    updated, count = re.subn(
+        r'__version__ = "[^"]+"',
+        lambda _match: f'__version__ = "{pcm_version}"',
+        text,
+        count=1,
+    )
+    if count != 1:
+        raise SystemExit(
+            "PCM build failed: could not stamp __version__ in plugins/__init__.py"
+        )
+    staged = output_dir / "staging" / "__init__.py"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    with open(staged, "w", encoding="utf-8", newline="") as f:
+        f.write(updated)
+    print(f"  Stamped plugin __version__ -> {pcm_version}")
+    return staged
 
 
 def _fetch_latest_release_metadata() -> dict | None:
@@ -623,17 +669,22 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
     shutil.copy2("kiforge.py", "plugins/kiforge.py")
     if version:
         _pin_action_ref_in_plugin(version)
+    staged_bootstrap = _stage_bootstrap_with_version(version, output_dir)
 
     template_dir = Path("templates")
     if not template_dir.is_dir():
         print(f"  Warning: templates directory not found: {template_dir}")
+
+    icon_dir = Path("icons")
+    if not icon_dir.is_dir():
+        print(f"  Warning: icons directory not found: {icon_dir}")
 
     print(f"Packaging plugin: {PLUGIN_ID}")
     print(f"Version:          {version or f'{LOCAL_DEV_VERSION} (local zip)'}")
     print(f"Output file:      {zip_path}")
 
     files_to_include = [
-        ("plugins/__init__.py", "plugins/__init__.py"),
+        (str(staged_bootstrap), "plugins/__init__.py"),
         ("plugins/kiforge_studio.py", "plugins/kiforge_studio.py"),
         ("plugins/kiforge.py", "plugins/kiforge.py"),
         ("plugins/icon.png", "plugins/icon.png"),
@@ -644,6 +695,11 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
             if template_src.is_file():
                 arc_path = f"plugins/templates/{template_src.name}"
                 files_to_include.append((str(template_src), arc_path))
+    if icon_dir.is_dir():
+        # .svg only -- icons/README.md documents the set for contributors and
+        # has no business inside the installed plugin.
+        for icon_src in sorted(icon_dir.glob("*.svg")):
+            files_to_include.append((str(icon_src), f"plugins/icons/{icon_src.name}"))
 
     staging_meta_path = output_dir / "metadata.json"
 

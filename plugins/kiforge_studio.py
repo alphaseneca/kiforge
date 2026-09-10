@@ -26,8 +26,12 @@ Registration
 ``plugins/__init__.py`` registers it only when ``pcbnew`` is already in
 ``sys.modules`` so CLI/tests do not trigger KiCad plugin hooks.
 """
+# KiCad 10 bundles Python 3.9 (macOS ships 3.9.13 inside KiCad.app); keep the
+# ``X | None`` annotations below unevaluated so importing this module inside
+# KiCad cannot raise TypeError. See ``kiforge.py`` for the same guard.
+from __future__ import annotations
+
 # pyrefly: ignore [missing-import]
-import sys
 import os
 import threading
 import time
@@ -84,7 +88,19 @@ _CTRL_H = 28
 def _snap_to_grid(value: int, step: int = _SP_XS) -> int:
     """Round a pixel dimension to the nearest step of the 4pt grid."""
     return max(step, int(round(value / step)) * step)
-_COLORS = {
+# Palette -------------------------------------------------------------------
+# Two mirrored Zinc ramps, chosen from the OS appearance at dialog open.
+#
+# Studio used to hardcode the dark ramp only. On a Mac running light mode that
+# produced a dark dialog under a *light* system title bar, with every natively
+# drawn element -- title bar, scrollbars, file dialogs, selection highlights --
+# still light, and any text left at a system colour rendering dark-on-dark. The
+# window looked broken and parts of it were unreadable. Windows users rarely saw
+# it because the KiCad default there is dark.
+#
+# Both ramps must define exactly the same keys; a test enforces that, because a
+# missing key would raise inside a paint handler where exceptions are swallowed.
+_DARK_PALETTE = {
     "app_bg": wx.Colour(24, 24, 27),
     "surface": wx.Colour(39, 39, 42),
     "border": wx.Colour(63, 63, 70),
@@ -94,9 +110,127 @@ _COLORS = {
     "input_bg": wx.Colour(33, 33, 38),
     "input_fg": wx.Colour(244, 244, 245),
     "accent": wx.Colour(217, 119, 6),
+    # Success tone for a completed export, so the confirming button is not
+    # the same amber as "Export".
+    "success": wx.Colour(34, 197, 94),
+}
+_LIGHT_PALETTE = {
+    "app_bg": wx.Colour(250, 250, 250),
+    "surface": wx.Colour(255, 255, 255),
+    "border": wx.Colour(212, 212, 216),
+    "text": wx.Colour(24, 24, 27),
+    "muted": wx.Colour(113, 113, 122),
+    "footer_bg": wx.Colour(250, 250, 250),
+    "input_bg": wx.Colour(255, 255, 255),
+    "input_fg": wx.Colour(24, 24, 27),
+    # Amber reads on both grounds, so the brand accent does not flip.
+    "accent": wx.Colour(217, 119, 6),
+    # Success tone for a completed export, so the confirming button is not
+    # the same amber as "Export".
+    "success": wx.Colour(22, 163, 74),
 }
 
+# Every widget reads _COLORS inside a paint handler, never at import time, so
+# the active palette is applied by mutating this dict in place -- all existing
+# lookups pick the change up with no call-site edits and no stale references.
+_COLORS = dict(_DARK_PALETTE)
+
+# Tab glyphs are tinted to one flat colour, so the dark ramp's near-white tint
+# is invisible on a light ground and vice versa.
+_TAB_ICON_TINTS = {"dark": "#e4e4e7", "light": "#3f3f46"}
+
+# Severity colours are saturated enough to survive both grounds, except the
+# neutral and info tones, which need a darker step on white.
+_MSG_ICON_COLORS_BY_MODE = {
+    "dark": {
+        "success": "#22c55e",
+        "error": "#ef4444",
+        "warning": "#d97706",
+        "cancelled": "#a1a1aa",
+        "info": "#38bdf8",
+        "question": "#a1a1aa",
+    },
+    "light": {
+        "success": "#16a34a",
+        "error": "#dc2626",
+        "warning": "#b45309",
+        "cancelled": "#71717a",
+        "info": "#0284c7",
+        "question": "#71717a",
+    },
+}
+
+# Live severity colours, swapped in place by refresh_palette() exactly as
+# _COLORS is. Defined here, beside the table it mirrors and above the function
+# that mutates it, so the palette block is self-contained: a forward reference
+# would only surface as a NameError at import, which KiCad's loader swallows.
+_MSG_ICON_COLORS = dict(_MSG_ICON_COLORS_BY_MODE["dark"])
+
+_palette_mode = "dark"
+
+
+def _system_is_dark() -> bool:
+    """
+    True when the OS/KiCad appearance is dark.
+
+    ``wx.SystemAppearance.IsDark`` is the supported query on wx 4.1+. The
+    luminance fallback covers older builds and any backend that does not
+    implement it, so this never raises inside a paint path.
+    """
+    try:
+        return bool(wx.SystemSettings.GetAppearance().IsDark())
+    except Exception:
+        pass
+    try:
+        bg = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
+        luminance = 0.299 * bg.Red() + 0.587 * bg.Green() + 0.114 * bg.Blue()
+        return luminance < 128
+    except Exception:
+        return True
+
+
+def active_palette_mode() -> str:
+    """Return the palette currently applied: ``"dark"`` or ``"light"``."""
+    return _palette_mode
+
+
+def refresh_palette() -> str:
+    """
+    Point :data:`_COLORS` at the ramp matching the current system appearance.
+
+    Call before building widgets and again on ``wx.EVT_SYS_COLOUR_CHANGED``.
+    Returns the mode applied. Safe to call before a ``wx.App`` exists -- it
+    falls back to dark rather than raising.
+    """
+    global _palette_mode
+    _palette_mode = "dark" if _system_is_dark() else "light"
+    _COLORS.update(_DARK_PALETTE if _palette_mode == "dark" else _LIGHT_PALETTE)
+    _MSG_ICON_COLORS.update(_MSG_ICON_COLORS_BY_MODE[_palette_mode])
+    return _palette_mode
+
 _BUTTON_RADIUS = 6
+
+
+def _first_line(text: str, limit: int = 90) -> str:
+    """First line of a message, trimmed -- the dialog reports one line."""
+    line = (text or "").strip().splitlines()
+    first = line[0] if line else ""
+    return first if len(first) <= limit else first[: limit - 1] + "\u2026"
+
+
+def _pointer_is_inside(window: wx.Window) -> bool:
+    """
+    True when the mouse pointer is over ``window`` right now.
+
+    Shared by the custom-painted controls because hover has to be answered from
+    the pointer's real position, not from the last enter/leave event: while a
+    control holds the mouse capture the platform stops delivering
+    EVT_LEAVE_WINDOW, so the event-driven flag goes stale.
+    """
+    try:
+        return window.ClientRect.Contains(window.ScreenToClient(wx.GetMousePosition()))
+    except Exception:
+        return False
 
 
 class _FlatButton(wx.Panel):
@@ -106,6 +240,7 @@ class _FlatButton(wx.Panel):
         super().__init__(parent, style=wx.BORDER_NONE)
         self._label = label
         self._primary = primary
+        self._tone = None
         self._hover = False
         self._pressed = False
         self._enabled = True
@@ -115,8 +250,23 @@ class _FlatButton(wx.Panel):
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
         self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self._on_capture_lost)
         self.Bind(wx.EVT_ENTER_WINDOW, self._on_enter)
         self.Bind(wx.EVT_LEAVE_WINDOW, self._on_leave)
+
+    def SetTone(self, colour) -> None:
+        """Override the primary fill -- used to confirm a successful export in green."""
+        self._tone = colour
+        self._primary = colour is not None
+        self.Refresh()
+
+    def SetLabel(self, label: str) -> None:
+        """Change the painted caption -- wx.Panel's own label is not drawn here."""
+        self._label = label
+        self.Refresh()
+
+    def GetLabel(self) -> str:
+        return self._label
 
     def _on_enter(self, event):
         if self._enabled:
@@ -144,11 +294,29 @@ class _FlatButton(wx.Panel):
             self.ReleaseMouse()
         was_pressed = self._pressed
         self._pressed = False
+        # See _FlatRadioButton._on_left_up: a captured mouse suppresses
+        # EVT_LEAVE_WINDOW, so hover has to be recomputed from the pointer.
+        inside = self.ClientRect.Contains(event.GetPosition())
+        self._hover = inside
         self.Refresh()
-        if was_pressed and self.ClientRect.Contains(event.GetPosition()):
+        if was_pressed and inside:
             event = wx.CommandEvent(wx.EVT_BUTTON.typeId, self.GetId())
             event.SetEventObject(self)
             wx.PostEvent(self, event)
+
+    def _on_capture_lost(self, event):
+        """
+        Capture can be taken away at any time (a modal dialog, a window switch).
+
+        Only ``_pressed`` is a click-in-progress and must drop. Hover is a
+        property of where the pointer is, so it is recomputed rather than
+        cleared -- clearing it blanks the highlight on a control the pointer is
+        still resting on, and EVT_ENTER_WINDOW has already fired so nothing
+        restores it until the pointer leaves and comes back.
+        """
+        self._pressed = False
+        self._hover = _pointer_is_inside(self)
+        self.Refresh()
 
     def _on_paint(self, event):
         dc = wx.AutoBufferedPaintDC(self)
@@ -159,7 +327,7 @@ class _FlatButton(wx.Panel):
         dc.Clear()
 
         if self._primary:
-            accent = _COLORS["accent"]
+            accent = self._tone or _COLORS["accent"]
             if not self._enabled:
                 fill = wx.Colour(accent.Red() // 2, accent.Green() // 2, accent.Blue() // 2)
                 text = _COLORS["muted"]
@@ -278,18 +446,34 @@ class _FlatCheckBox(wx.Panel):
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
         self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self._on_capture_lost)
         self.Bind(wx.EVT_ENTER_WINDOW, self._on_enter)
         self.Bind(wx.EVT_LEAVE_WINDOW, self._on_leave)
-        self.Bind(wx.EVT_SET_FOCUS, self._on_focus_change)
-        self.Bind(wx.EVT_KILL_FOCUS, self._on_focus_change)
+        self.Bind(wx.EVT_SET_FOCUS, self._on_set_focus)
+        self.Bind(wx.EVT_KILL_FOCUS, self._on_kill_focus)
         self.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
 
     def AcceptsFocus(self):
         return self._enabled
 
-    def _on_focus_change(self, event):
-        self._has_focus = self.HasFocus()
+    def _on_set_focus(self, event):
+        self._has_focus = True
         self.Refresh()
+        event.Skip()
+
+    def _on_kill_focus(self, event):
+        """
+        Take the state from the event, never from HasFocus().
+
+        Inside EVT_KILL_FOCUS the focus transfer has not completed, so
+        HasFocus() can still report True. Deriving the flag from it left the
+        control that just lost focus permanently "focused", and since the paint
+        code draws an accent ring for a focused glyph, the previously selected
+        radio kept an orange ring after its dot had correctly cleared.
+        """
+        self._has_focus = False
+        self.Refresh()
+        event.Skip()
         event.Skip()
 
     def _on_key_down(self, event):
@@ -325,9 +509,27 @@ class _FlatCheckBox(wx.Panel):
             self.ReleaseMouse()
         was_pressed = self._pressed
         self._pressed = False
+        # See _FlatRadioButton._on_left_up: a captured mouse suppresses
+        # EVT_LEAVE_WINDOW, so hover has to be recomputed from the pointer.
+        inside = self.ClientRect.Contains(event.GetPosition())
+        self._hover = inside
         self.Refresh()
-        if was_pressed and self.ClientRect.Contains(event.GetPosition()):
+        if was_pressed and inside:
             self._toggle()
+
+    def _on_capture_lost(self, event):
+        """
+        Capture can be taken away at any time (a modal dialog, a window switch).
+
+        Only ``_pressed`` is a click-in-progress and must drop. Hover is a
+        property of where the pointer is, so it is recomputed rather than
+        cleared -- clearing it blanks the highlight on a control the pointer is
+        still resting on, and EVT_ENTER_WINDOW has already fired so nothing
+        restores it until the pointer leaves and comes back.
+        """
+        self._pressed = False
+        self._hover = _pointer_is_inside(self)
+        self.Refresh()
 
     def _toggle(self):
         self._checked = not self._checked
@@ -493,18 +695,34 @@ class _FlatRadioButton(wx.Panel):
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
         self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self._on_capture_lost)
         self.Bind(wx.EVT_ENTER_WINDOW, self._on_enter)
         self.Bind(wx.EVT_LEAVE_WINDOW, self._on_leave)
-        self.Bind(wx.EVT_SET_FOCUS, self._on_focus_change)
-        self.Bind(wx.EVT_KILL_FOCUS, self._on_focus_change)
+        self.Bind(wx.EVT_SET_FOCUS, self._on_set_focus)
+        self.Bind(wx.EVT_KILL_FOCUS, self._on_kill_focus)
         self.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
 
     def AcceptsFocus(self):
         return self._enabled
 
-    def _on_focus_change(self, event):
-        self._has_focus = self.HasFocus()
+    def _on_set_focus(self, event):
+        self._has_focus = True
         self.Refresh()
+        event.Skip()
+
+    def _on_kill_focus(self, event):
+        """
+        Take the state from the event, never from HasFocus().
+
+        Inside EVT_KILL_FOCUS the focus transfer has not completed, so
+        HasFocus() can still report True. Deriving the flag from it left the
+        control that just lost focus permanently "focused", and since the paint
+        code draws an accent ring for a focused glyph, the previously selected
+        radio kept an orange ring after its dot had correctly cleared.
+        """
+        self._has_focus = False
+        self.Refresh()
+        event.Skip()
         event.Skip()
 
     def _on_key_down(self, event):
@@ -540,9 +758,30 @@ class _FlatRadioButton(wx.Panel):
             self.ReleaseMouse()
         was_pressed = self._pressed
         self._pressed = False
+        # Recompute hover from where the pointer actually is. While the mouse
+        # is captured the platform stops delivering EVT_LEAVE_WINDOW, so
+        # _hover would otherwise stay True after the click and leave this
+        # control's ring painted in the accent colour as though it were still
+        # hovered -- it reads as a selection that will not clear.
+        inside = self.ClientRect.Contains(event.GetPosition())
+        self._hover = inside
         self.Refresh()
-        if was_pressed and self.ClientRect.Contains(event.GetPosition()):
+        if was_pressed and inside:
             self._select()
+
+    def _on_capture_lost(self, event):
+        """
+        Capture can be taken away at any time (a modal dialog, a window switch).
+
+        Only ``_pressed`` is a click-in-progress and must drop. Hover is a
+        property of where the pointer is, so it is recomputed rather than
+        cleared -- clearing it blanks the highlight on a control the pointer is
+        still resting on, and EVT_ENTER_WINDOW has already fired so nothing
+        restores it until the pointer leaves and comes back.
+        """
+        self._pressed = False
+        self._hover = _pointer_is_inside(self)
+        self.Refresh()
 
     def _apply_selection(self):
         """Select this button and clear its group siblings, without firing an event."""
@@ -551,6 +790,12 @@ class _FlatRadioButton(wx.Panel):
         for other in self._group:
             if other is not self and other._selected:
                 other._selected = False
+                # Recompute rather than trust the cached flag: if the pointer
+                # left this control while another held the mouse capture, no
+                # EVT_LEAVE_WINDOW was delivered and _hover is still True, so
+                # the deselected radio keeps an accent ring until it is hovered
+                # again.
+                other._hover = _pointer_is_inside(other)
                 other.Refresh()
         self._selected = True
         self.Refresh()
@@ -660,14 +905,21 @@ class _FlatRadioButton(wx.Panel):
 
 
 class _ExportProgressDialog(wx.Dialog):
-    """Non-modal export progress window matching Studio theme."""
+    """Non-modal export progress window following the system appearance."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, on_cancel=None):
         super().__init__(
             parent,
             title="KiForge",
             style=wx.DEFAULT_DIALOG_STYLE,
         )
+        self._finished = False
+        # Invoked the moment Cancel is pressed, not on the next poll tick. The
+        # poll timer only runs when the GUI thread is free, and a long export
+        # step can starve it -- which is exactly when a user reaches for
+        # Cancel and finds it does nothing.
+        self._on_cancel_requested = on_cancel
+        refresh_palette()
         self._cancelled = False
         self._value = -1
         self._message = ""
@@ -709,6 +961,56 @@ class _ExportProgressDialog(wx.Dialog):
         self.lbl_message.SetLabel(self._message)
         self.btn_cancel.Disable()
         self.Layout()
+        # Paint "Cancelling..." now rather than whenever the loop next idles,
+        # and abort the export straight away instead of waiting for the poll
+        # timer to notice was_cancelled().
+        self.Update()
+        if self._on_cancel_requested is not None:
+            try:
+                self._on_cancel_requested()
+            except Exception:
+                logger.exception("Cancel request handler failed")
+
+    def _on_dismiss(self, event):
+        """OK on a finished export: close the dialog and release the owner's handle."""
+        owner = self.GetParent()
+        if owner is not None and getattr(owner, "_export_progress", None) is self:
+            owner._export_progress = None
+        self.Hide()
+        self.Destroy()
+
+    def show_result(self, message: str, *, complete: bool = True) -> None:
+        """
+        Turn the progress dialog into the result dialog.
+
+        The export result used to arrive as a second popup after this one was
+        torn down -- two windows for one operation, the first vanishing as the
+        second appeared. The run now finishes where it started: same window,
+        short outcome line, and Cancel becomes OK.
+        """
+        self._finished = True
+        self._message = message
+        self.lbl_message.SetLabel(message)
+        self.gauge.SetValue(100 if complete else 0)
+        self.btn_cancel.SetLabel("OK")
+        self.btn_cancel.Enable()
+        # Green confirms the run finished; a failure or cancellation keeps the
+        # neutral button so the colour means something.
+        self.btn_cancel.SetTone(_COLORS["success"] if complete else None)
+        # Unbind by handler, not by event type: the bare form does not reliably
+        # remove the binding, which would leave _on_cancel firing first and
+        # turning the click into "Cancelling..." instead of dismissing.
+        self.btn_cancel.Unbind(wx.EVT_BUTTON, handler=self._on_cancel)
+        self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_dismiss)
+        self.Layout()
+        self.Fit()
+        self.Update()
+        # The outcome is the thing the user is waiting for -- make sure it is
+        # not sitting behind Studio when it arrives.
+        self.Raise()
+
+    def is_finished(self) -> bool:
+        return self._finished
 
     def was_cancelled(self) -> bool:
         return self._cancelled
@@ -753,26 +1055,19 @@ _MSG_ICON_MATERIAL = {
     "info": "info",
     "question": "question",
 }
-_MSG_ICON_COLORS = {
-    "success": "#22c55e",
-    "error": "#ef4444",
-    "warning": "#d97706",
-    "cancelled": "#a1a1aa",
-    "info": "#38bdf8",
-    "question": "#a1a1aa",
-}
 _MSG_ICON_SIZE = 24  # on-grid (6 * 4)
 # Measure the message text wraps at, and the dialog's width floor. The floor
 # sits just under the wrap measure so a short message produces a dialog that
 # hugs its content instead of being padded out to a fixed width. Both on-grid.
 _MSG_TEXT_WRAP = 300
 _MSG_MIN_WIDTH = 280
-_msg_icon_bitmap_cache: dict[tuple[str, int], wx.Bitmap] = {}
+_msg_icon_bitmap_cache: dict[tuple[str, int, str], wx.Bitmap] = {}
 
 
 def _load_message_icon_bitmap(kind: str, size: int = _MSG_ICON_SIZE) -> wx.Bitmap | None:
     """Rasterize a cached/CDN Material Symbol for the themed message dialog, tinted per severity."""
-    cache_key = (kind, size)
+    colour = _MSG_ICON_COLORS.get(kind, _MSG_ICON_COLORS["info"])
+    cache_key = (kind, size, colour)
     if cache_key in _msg_icon_bitmap_cache:
         cached = _msg_icon_bitmap_cache[cache_key]
         return cached if cached.IsOk() else None
@@ -782,7 +1077,6 @@ def _load_message_icon_bitmap(kind: str, size: int = _MSG_ICON_SIZE) -> wx.Bitma
         _msg_icon_bitmap_cache[cache_key] = wx.Bitmap()
         return None
     try:
-        colour = _MSG_ICON_COLORS.get(kind, _MSG_ICON_COLORS["info"])
         tinted = kiforge.prepare_tab_icon_svg(svg_data, colour)
         bundle = wx.BitmapBundle.FromSVG(tinted, (size, size))
         bitmap = bundle.GetBitmap(wx.Size(size, size))
@@ -794,10 +1088,13 @@ def _load_message_icon_bitmap(kind: str, size: int = _MSG_ICON_SIZE) -> wx.Bitma
 
 
 class _KiForgeMessageDialog(wx.Dialog):
-    """Themed message dialog matching Studio's dark UI, used in place of the plain OS wx.MessageBox."""
+    """Themed message dialog following the system appearance, used in place of wx.MessageBox."""
 
     def __init__(self, parent, message: str, title: str, kind: str, buttons: str):
         super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE)
+        # Can be raised without the settings dialog ever opening (an export
+        # failure from the toolbar), so it resolves the palette itself.
+        refresh_palette()
         self.SetBackgroundColour(_COLORS["app_bg"])
 
         outer = wx.BoxSizer(wx.VERTICAL)
@@ -926,7 +1223,7 @@ EXPORT_PRESETS = {
         "export_step": True,
         "export_3d": True,
         "export_svg": True,
-        "export_print_pdf": True,
+        "export_homebrew_pdf": True,
         "format_jlc": True,
     },
     "jlcpcb": {
@@ -939,7 +1236,7 @@ EXPORT_PRESETS = {
         "export_step": False,
         "export_3d": False,
         "export_svg": False,
-        "export_print_pdf": False,
+        "export_homebrew_pdf": False,
         "format_jlc": True,
     },
     "documentation": {
@@ -952,23 +1249,26 @@ EXPORT_PRESETS = {
         "export_step": True,
         "export_3d": True,
         "export_svg": True,
-        "export_print_pdf": True,
+        "export_homebrew_pdf": True,
         "format_jlc": False,
     },
 }
 _EXPORT_TOGGLE_KEYS = (
     "export_gerbers", "export_drills", "export_pos", "export_bom", "export_ibom",
-    "export_sch_pdf", "export_step", "export_3d", "export_svg", "export_print_pdf",
+    "export_sch_pdf", "export_step", "export_3d", "export_svg", "export_homebrew_pdf",
 )
 
 _TAB_ICON_NAMES = ("export", "advanced", "releases")
 _TAB_ICON_RASTER_SIZE = 48
-_tab_icon_bitmap_cache: dict[tuple[str, int], wx.Bitmap] = {}
+_tab_icon_bitmap_cache: dict[tuple[str, int, str], wx.Bitmap] = {}
 
 
 def _load_tab_icon_bitmap(name: str, size: int = 20) -> wx.Bitmap | None:
-    """Rasterize a cached/CDN Material Symbol for notebook tabs."""
-    cache_key = (name, size)
+    """Rasterize a bundled Material Symbol for notebook tabs, tinted for the theme."""
+    # The tint is part of the key: a near-white glyph cached under dark mode is
+    # invisible once the palette flips to light.
+    tint = _TAB_ICON_TINTS[active_palette_mode()]
+    cache_key = (name, size, tint)
     if cache_key in _tab_icon_bitmap_cache:
         cached_bmp = _tab_icon_bitmap_cache[cache_key]
         return cached_bmp if cached_bmp.IsOk() else None
@@ -978,7 +1278,7 @@ def _load_tab_icon_bitmap(name: str, size: int = 20) -> wx.Bitmap | None:
         _tab_icon_bitmap_cache[cache_key] = wx.Bitmap()
         return None
     try:
-        tinted = kiforge.prepare_tab_icon_svg(svg_data)
+        tinted = kiforge.prepare_tab_icon_svg(svg_data, tint)
         bundle = wx.BitmapBundle.FromSVG(tinted, (_TAB_ICON_RASTER_SIZE, _TAB_ICON_RASTER_SIZE))
         bitmap = bundle.GetBitmap(wx.Size(size, size))
         _tab_icon_bitmap_cache[cache_key] = bitmap
@@ -988,8 +1288,51 @@ def _load_tab_icon_bitmap(name: str, size: int = 20) -> wx.Bitmap | None:
         return None
 
 
-def _pump_ui_events():
-    """Keep wx/KiCad responsive while a background export is running."""
+def _kicad_parent_window():
+    """
+    The KiCad frame a Studio dialog should belong to.
+
+    A dialog with no parent is an unowned window, and Cocoa gives unowned
+    windows a floating level: it then sits above *every* application, not just
+    KiCad -- over the browser, the terminal, everything -- and cannot be sent
+    behind them. Owning it to the invoking frame makes it behave like a normal
+    document-modal dialog and keeps it inside KiCad's window layer.
+
+    ``wx.GetApp().GetTopWindow()`` is not enough on its own: KiCad runs several
+    frames (project manager, PCB editor, schematic editor) and can report one
+    that is hidden or not the one the toolbar button was pressed in, which
+    leaves the dialog unowned again. Prefer the active window, then any visible
+    frame, and only then fall back.
+    """
+    try:
+        active = wx.GetActiveWindow()
+        if active is not None:
+            top = active.GetTopLevelParent()
+            if top is not None and top.IsShown():
+                return top
+    except Exception:
+        pass
+    try:
+        for win in wx.GetTopLevelWindows():
+            if isinstance(win, wx.Frame) and win.IsShown():
+                return win
+    except Exception:
+        pass
+    app = wx.GetApp()
+    return app.GetTopWindow() if app else None
+
+
+def _pump_ui_events(keep_enabled: "wx.Window | None" = None):
+    """
+    Keep wx/KiCad responsive while a background export is running.
+
+    ``wx.SafeYield()`` with no argument disables *every* top-level window for
+    the duration of the yield, and this runs on every poll tick. A click that
+    lands in one of those windows is discarded, so Cancel worked only when the
+    press happened to fall between ticks -- it read as flaky, then as dead.
+    Passing the window that must stay live keeps it clickable while still
+    blocking input to everything behind it, which is what "safe" is for.
+    """
     app = wx.GetApp()
     if app:
         app.ProcessPendingEvents()
@@ -998,7 +1341,10 @@ def _pump_ui_events():
     except Exception:
         pass
     try:
-        wx.SafeYield()
+        if keep_enabled is not None and keep_enabled:
+            wx.SafeYield(keep_enabled)
+        else:
+            wx.SafeYield()
     except Exception:
         pass
 
@@ -1042,6 +1388,11 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             title="KiForge",
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER | wx.MAXIMIZE_BOX
         )
+        # Resolve light/dark before a single widget is built: every custom paint
+        # handler reads _COLORS, and the window chrome around them is drawn by
+        # the OS in the system appearance regardless.
+        refresh_palette()
+        self.Bind(wx.EVT_SYS_COLOUR_CHANGED, self._on_system_colour_changed)
         self.project_dir = project_dir
         self.settings = kiforge.load_merged_settings(project_dir)
         self._export_timer = None
@@ -1127,12 +1478,32 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._cd_sync_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_cd_sync_timer, self._cd_sync_timer)
         self._bind_live_cd_sync_handlers()
-        self._prefetch_tab_icons_async()
+        self._attach_tab_icons()
 
-    def _prefetch_tab_icons_async(self):
-        """Warm the icon cache from CDN without blocking dialog construction."""
+    def _on_system_colour_changed(self, event):
+        """Re-resolve the palette and repaint when the OS theme flips live."""
+        refresh_palette()
+        self.SetBackgroundColour(_COLORS["app_bg"])
+        self._apply_notebook_icons()
+        self.Refresh()
+        event.Skip()
+
+    def _attach_tab_icons(self):
+        """
+        Put icons on the notebook tabs.
+
+        Icons ship inside the plugin, so the normal path is a local file read
+        and runs inline. Only an icon absent from the package -- one added after
+        this release -- falls back to a background CDN warm-up, which keeps the
+        network off the dialog-open path entirely.
+        """
+        missing = [n for n in _TAB_ICON_NAMES if not kiforge.read_bundled_tab_icon_svg(n)]
+        if not missing:
+            self._apply_notebook_icons()
+            return
+
         def worker():
-            for name in _TAB_ICON_NAMES:
+            for name in missing:
                 if kiforge.read_cached_tab_icon_svg(name):
                     continue
                 kiforge.download_tab_icon_svg(name)
@@ -1141,10 +1512,11 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_notebook_icons(self):
-        """Attach Material Symbols icons to notebook tabs (CDN + local SVG cache)."""
+        """Attach the bundled Material Symbols to notebook tabs, tinted for the theme."""
         display_size = 20
-        for name in _TAB_ICON_NAMES:
-            _tab_icon_bitmap_cache.pop((name, display_size), None)
+        # No cache eviction: the tint is part of the key, so a theme flip is
+        # already a miss and re-rasterizes. Evicting the current tint's entry
+        # would only throw away the bitmaps this call is about to use.
         bitmaps = [_load_tab_icon_bitmap(name, display_size) for name in _TAB_ICON_NAMES]
         if not all(bmp and bmp.IsOk() for bmp in bitmaps):
             return
@@ -1182,21 +1554,25 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
 
     def _style_panel(self, panel: wx.Panel, *, surface: bool = True) -> None:
         panel.SetBackgroundColour(_COLORS["surface"] if surface else _COLORS["app_bg"])
-        self._dismiss_focus_on_click(panel)
+        self._clear_focus_on_background_click(panel)
 
-    def _dismiss_focus_on_click(self, event_source: wx.Window, focus_target: wx.Window | None = None) -> None:
+    def _clear_focus_on_background_click(
+        self, event_source: wx.Window, focus_target: wx.Window | None = None
+    ) -> None:
         """
-        Clicking non-interactive background should clear focus/highlight from
-        whatever custom-painted control (_FlatCheckBox/_FlatRadioButton)
-        currently holds it -- the same "click outside to dismiss" behavior a
-        native control gets for free. These controls own their painting
-        instead of wrapping a native widget, so wx never does this for them
-        on its own: focus only moves when something else explicitly claims
-        it, and a plain background or label click claims nothing by default.
-        Wired through _style_panel/_section_label/_muted_label (every
-        non-interactive surface in the dialog already goes through one of
-        those) rather than bound ad hoc per tab, so it applies uniformly
-        everywhere without being re-solved per screen.
+        Move focus off a custom control when the user clicks dead background.
+
+        A native control loses its focus highlight when you click elsewhere,
+        because whatever you clicked takes focus. _FlatCheckBox and
+        _FlatRadioButton paint themselves rather than wrapping a native widget,
+        and blank panel background claims no focus at all, so without this the
+        accent highlight stays lit until something else explicitly steals it.
+
+        Handing focus to the containing panel is the whole mechanism, and it is
+        the same call on every platform. Wired through _style_panel,
+        _section_label and _muted_label -- every non-interactive surface in the
+        dialog goes through one of those -- so it applies uniformly instead of
+        being re-solved per tab.
         """
         target = focus_target or event_source
 
@@ -1225,7 +1601,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         font = lbl.GetFont()
         font.SetWeight(wx.FONTWEIGHT_NORMAL)
         lbl.SetFont(font)
-        self._dismiss_focus_on_click(lbl, parent)
+        self._clear_focus_on_background_click(lbl, parent)
         return lbl
 
     def _muted_label(self, parent, text: str, wrap: int | None = None) -> wx.StaticText:
@@ -1233,7 +1609,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._style_text(lbl, muted=True)
         if wrap:
             lbl.Wrap(wrap)
-        self._dismiss_focus_on_click(lbl, parent)
+        self._clear_focus_on_background_click(lbl, parent)
         return lbl
 
     def _build_header_panel(self):
@@ -1249,7 +1625,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         font.SetPointSize(13)
         font.SetWeight(wx.FONTWEIGHT_BOLD)
         title.SetFont(font)
-        self._dismiss_focus_on_click(title, banner)
+        self._clear_focus_on_background_click(title, banner)
         sizer.Add(accent, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, _SP_MD)
         sizer.Add(title, 0, wx.ALIGN_CENTER_VERTICAL)
         banner.SetSizer(sizer)
@@ -1302,7 +1678,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         # folder field -- gets laid out off the visible area and clipped.
         self.lbl_export_summary.SetMinSize((_SP_SM, -1))
         self._style_text(self.lbl_export_summary, muted=True)
-        self._dismiss_focus_on_click(self.lbl_export_summary, scroll)
+        self._clear_focus_on_background_click(self.lbl_export_summary, scroll)
         # EXPAND so it fills the column: the small min size above stops it
         # dictating the layout's width, but without EXPAND the sizer would
         # then hand it exactly that min size and the text would render into
@@ -1369,14 +1745,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_step = _FlatCheckBox(scroll, label="STEP")
         self.chk_3d = _FlatCheckBox(scroll, label="3D renders")
         self.chk_svg = _FlatCheckBox(scroll, label="Copper SVG")
-        self.chk_print_pdf = _FlatCheckBox(scroll, label="Homebrew PDF")
-        for chk in (self.chk_sch_pdf, self.chk_step, self.chk_3d, self.chk_svg, self.chk_print_pdf):
+        self.chk_homebrew_pdf = _FlatCheckBox(scroll, label="Homebrew PDF")
+        for chk in (self.chk_sch_pdf, self.chk_step, self.chk_3d, self.chk_svg, self.chk_homebrew_pdf):
             doc_col.Add(chk, 0, wx.TOP, _SP_XS)
         self.chk_sch_pdf.Bind(wx.EVT_CHECKBOX, self.on_export_checkbox_changed)
         self.chk_step.Bind(wx.EVT_CHECKBOX, self.on_export_checkbox_changed)
         self.chk_3d.Bind(wx.EVT_CHECKBOX, self.on_export_checkbox_changed)
         self.chk_svg.Bind(wx.EVT_CHECKBOX, self.on_export_checkbox_changed)
-        self.chk_print_pdf.Bind(wx.EVT_CHECKBOX, self.on_print_pdf_toggled)
+        self.chk_homebrew_pdf.Bind(wx.EVT_CHECKBOX, self.on_homebrew_pdf_toggled)
 
         columns.Add(mfg_col, 1, wx.EXPAND | wx.RIGHT, _SP_MD)
         columns.Add(doc_col, 1, wx.EXPAND)
@@ -1406,7 +1782,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
 
         self.lbl_cd_sync_status = wx.StaticText(page, label="")
         self._style_text(self.lbl_cd_sync_status, muted=True)
-        self._dismiss_focus_on_click(self.lbl_cd_sync_status, page)
+        self._clear_focus_on_background_click(self.lbl_cd_sync_status, page)
         sizer.Add(self.lbl_cd_sync_status, 0, inset | wx.TOP, _SP_SM)
 
         page.SetSizer(sizer)
@@ -1415,7 +1791,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     def _build_footer_panel(self):
         footer = wx.Panel(self)
         footer.SetBackgroundColour(_COLORS["footer_bg"])
-        self._dismiss_focus_on_click(footer)
+        self._clear_focus_on_background_click(footer)
         sizer = wx.BoxSizer(wx.HORIZONTAL)
 
         btn_save = _FlatButton(footer, "Save", min_width=64)
@@ -1498,7 +1874,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             "export_step": self.chk_step,
             "export_3d": self.chk_3d,
             "export_svg": self.chk_svg,
-            "export_print_pdf": self.chk_print_pdf,
+            "export_homebrew_pdf": self.chk_homebrew_pdf,
         }
         self._applying_preset = True
         try:
@@ -1543,7 +1919,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             "export_step": "chk_step",
             "export_3d": "chk_3d",
             "export_svg": "chk_svg",
-            "export_print_pdf": "chk_print_pdf",
+            "export_homebrew_pdf": "chk_homebrew_pdf",
         }
         return mapping[export_key]
 
@@ -1559,7 +1935,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             "export_step": "STEP",
             "export_3d": "3D renders",
             "export_svg": "SVG",
-            "export_print_pdf": "Homebrew PDF",
+            "export_homebrew_pdf": "Homebrew PDF",
         }
         for key in _EXPORT_TOGGLE_KEYS:
             if getattr(self, self._export_checkbox_attr(key)).IsChecked():
@@ -1735,7 +2111,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_step.SetValue(self._export_setting('export_step'))
         self.chk_3d.SetValue(self._export_setting('export_3d'))
         self.chk_svg.SetValue(self._export_setting('export_svg'))
-        self.chk_print_pdf.SetValue(self._export_setting('export_print_pdf'))
+        self.chk_homebrew_pdf.SetValue(self._export_setting('export_homebrew_pdf'))
         self.txt_output_dir.SetValue(self.settings.get('output_dir', 'kiforge'))
         self.chk_generate_cd.SetValue(
             self._export_setting('generate_cd', self.settings.get('generate_ci', True))
@@ -1800,7 +2176,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             'export_step': self.chk_step.IsChecked(),
             'export_3d': self.chk_3d.IsChecked(),
             'export_svg': self.chk_svg.IsChecked(),
-            'export_print_pdf': self.chk_print_pdf.IsChecked(),
+            'export_homebrew_pdf': self.chk_homebrew_pdf.IsChecked(),
             'format_jlc': self._export_setting('format_jlc'),
             'generate_cd': self.chk_generate_cd.IsChecked(),
         }
@@ -1823,7 +2199,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """Homebrew PDF is generated from the Copper SVG layers, so Copper SVG
         export is required whenever Homebrew PDF is enabled -- lock it on
         (checked, disabled) rather than let the two drift out of sync."""
-        if self.chk_print_pdf.IsChecked():
+        if self.chk_homebrew_pdf.IsChecked():
             self.chk_svg.SetValue(True)
             self.chk_svg.Disable()
         else:
@@ -1836,7 +2212,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._sync_drill_checkbox_state()
         self.on_export_checkbox_changed(event)
 
-    def on_print_pdf_toggled(self, event):
+    def on_homebrew_pdf_toggled(self, event):
         """Keep Copper SVG export aligned with Homebrew PDF requirements."""
         if event is not None and hasattr(event, "Skip"):
             event.Skip()
@@ -1905,9 +2281,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             return
         try:
             curr = self._current_settings()
-            target = kiforge.save_settings(curr, project_dir=project_dir, scope="project")
+            kiforge.save_settings(curr, project_dir=project_dir, scope="project")
             self.settings = curr
-            _message_box(f"Project defaults saved.", "Config Saved", wx.OK | wx.ICON_INFORMATION)
+            _message_box("Project defaults saved.", "Config Saved", wx.OK | wx.ICON_INFORMATION)
         except Exception as e:
             _message_box(f"Failed to save project settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
 
@@ -1963,7 +2339,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             _message_box("Please specify a valid output directory name.", "Error", wx.OK | wx.ICON_ERROR, parent=self)
             return
 
-        export_flags = kiforge.apply_export_runtime_options(self._export_options())
+        export_flags = self._export_options()
 
         state = {
             'running': True,
@@ -2005,8 +2381,30 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_close_after_finish = False
         self.btn_export.Disable()
 
-        self._export_progress = _ExportProgressDialog(self)
+        def request_cancel():
+            """Abort the worker as soon as Cancel is pressed."""
+            state["cancelled"] = True
+            context.cancel()
+            self._export_join_deadline = min(
+                getattr(self, "_export_join_deadline", time.time() + 20), time.time() + 20
+            )
+
+        # The result dialog from the previous run stays up until dismissed, so
+        # clear it before starting another export rather than leaking it.
+        self._destroy_export_progress()
+        self._export_progress = _ExportProgressDialog(self, on_cancel=request_cancel)
         self._export_progress.Show()
+        # Show() only queues the paint; on macOS the window stays blank until
+        # the event loop next idles, which a busy export can delay noticeably.
+        # Update() paints it now so the dialog is on screen before the worker
+        # starts competing for the loop.
+        self._export_progress.Update()
+        # A modeless child of a *modal* parent opens behind it, so the progress
+        # window ends up hidden under Studio and the export looks like it
+        # produced no feedback at all. Raise() is the fix that works for a
+        # dialog -- wxFRAME_FLOAT_ON_PARENT is a frame-only style and wxDialog
+        # silently strips it.
+        self._export_progress.Raise()
 
         def export_worker():
             try:
@@ -2046,21 +2444,27 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self._destroy_export_progress()
             return
 
+        # Backstop, not the primary path. Cancellation normally lands the
+        # instant the button is pressed, through the on_cancel callback the
+        # dialog is constructed with -- the poll timer cannot be relied on,
+        # because a long export step starves it, which is exactly when Cancel
+        # gets used. This branch still matters for a progress dialog built
+        # without that callback, where it is the only thing that would ever
+        # cancel; the `not state["cancelled"]` guard makes it a no-op once the
+        # callback has already run.
+        #
+        # The dialog deliberately stays up after a cancel: the worker still has
+        # to unwind the current step, and tearing the window down at that point
+        # left Studio looking idle -- no progress window, Export still disabled
+        # -- for as long as that took, which read as the cancel doing nothing.
+        # _finish_export_progress() closes it when the worker actually exits.
         if progress and progress.was_cancelled() and not state["cancelled"]:
             state["cancelled"] = True
             context.cancel()
             self._export_join_deadline = min(self._export_join_deadline, time.time() + 20)
-            # Deliberately NOT destroying the dialog here. Cancelling asks the
-            # worker to stop, it does not stop it instantly: the current step
-            # still has to unwind. Tearing the dialog down at this point threw
-            # away the "Cancelling..." state _on_cancel had just put on screen
-            # and left Studio looking idle -- no progress window, but Export
-            # still disabled -- for as long as the worker took to finish, which
-            # read as the cancel having done nothing at all. The dialog stays
-            # until the worker actually exits (or the 20s deadline above
-            # releases the UI), and _finish_export_progress() closes it.
 
-        _pump_ui_events()
+        # Keep the progress dialog live: it owns Cancel.
+        _pump_ui_events(progress)
 
         if state["running"]:
             # Unconditional: the dialog decides whether this tick advances the
@@ -2092,7 +2496,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         context = self._export_context
         project_dir = self._export_project_dir
         self._export_running = False
-        self._destroy_export_progress()
+        self._stop_export_timer()
         self._export_thread = None
         self._export_state = None
         self._export_context = None
@@ -2102,11 +2506,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         wx.CallAfter(self._finish_export_ui, state, context, project_dir)
 
     def _finish_export_ui(self, state, context, project_dir):
-        """Present the export result after the progress dialog has fully closed."""
+        """Present the export result in the progress dialog that ran the export."""
         if not self:
             return
         if state and context:
             self._show_export_result(state, context, project_dir)
+        else:
+            self._destroy_export_progress()
         # Only close the whole Studio window when the user explicitly asked to
         # close it while an export was running (see on_close). A cancelled,
         # failed, or even successful export otherwise must leave Studio open
@@ -2116,55 +2522,52 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self.EndModal(wx.ID_CANCEL)
 
     def _show_export_result(self, state, context, project_dir):
-        """Show the export result after the progress dialog closes."""
+        """
+        Report the outcome in the progress dialog, as one short line.
+
+        One window for one operation: the dialog that showed the progress shows
+        the result, its Cancel becomes OK, and there is no second popup
+        appearing as the first disappears. Detail that does not fit one line --
+        the full warning text, the failure traceback -- is already in the log;
+        see kiforge.setup_logger().
+        """
+        progress = self._export_progress
+        if progress is None:
+            return
+
         if state['cancelled']:
-            _message_box(
-                "Export cancelled.",
-                "KiForge",
-                wx.OK | wx.ICON_WARNING,
-                parent=self,
-                kind="cancelled",
-            )
+            progress.show_result("Export cancelled.", complete=False)
             return
 
         if state['error_msg']:
-            _message_box(
-                f"Export failed:\n\n{state['error_msg']}",
-                "KiForge Error",
-                wx.OK | wx.ICON_ERROR,
-                parent=self,
-            )
+            logger.error("Export failed: %s", state['error_msg'])
+            progress.show_result(f"Export failed: {_first_line(state['error_msg'])}", complete=False)
             return
 
         if state['success']:
+            # Shown as a path fragment ("/kiforge") rather than a bare name, so
+            # it reads as a folder rather than a word in the sentence.
+            # Separators are normalised first: os.path.basename only splits the
+            # host platform's separator, and this string is for display, not
+            # for opening anything.
+            tail = context.output_dir.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+            folder = "/" + (tail or context.output_dir)
             if context.warnings:
-                _message_box(
-                    "Export completed with warnings:\n\n"
-                    + "\n\n".join(f"- {warning}" for warning in context.warnings)
-                    + f"\n\nCompleted files are in:\n{context.output_dir}",
-                    "KiForge Completed with Warnings",
-                    wx.OK | wx.ICON_WARNING,
-                    parent=self,
+                for warning in context.warnings:
+                    logger.warning("Export warning: %s", warning)
+                count = len(context.warnings)
+                progress.show_result(
+                    f"Export complete with {count} warning{'s' if count != 1 else ''}. "
+                    f"Saved to {folder}."
                 )
             else:
-                _message_box(
-                    f"Export complete.\n\nFiles saved to:\n{context.output_dir}",
-                    "KiForge",
-                    wx.OK | wx.ICON_INFORMATION,
-                    parent=self,
-                    kind="success",
-                )
+                progress.show_result(f"Export complete. Saved to {folder}.")
             return
 
-        summary = "\n\n".join(f"- {warning}" for warning in context.warnings) or (
-            "No export steps completed successfully."
-        )
-        _message_box(
-            f"Export failed:\n\n{summary}",
-            "KiForge Export Failed",
-            wx.OK | wx.ICON_ERROR,
-            parent=self,
-        )
+        for warning in context.warnings:
+            logger.warning("Export warning: %s", warning)
+        summary = _first_line(context.warnings[0]) if context.warnings else "no steps completed"
+        progress.show_result(f"Export failed: {summary}", complete=False)
 
     def on_close(self, event):
         """Triggered when the close button is clicked."""
@@ -2244,10 +2647,7 @@ class ExporterPlugin(_PluginBase):
             if pro_files:
                 project_dir = cwd
 
-        parent_window = None
-        app = wx.GetApp()
-        if app and hasattr(app, "GetTopWindow"):
-            parent_window = app.GetTopWindow()
+        parent_window = _kicad_parent_window()
 
         dialog = None
         try:
@@ -2279,7 +2679,9 @@ def run_standalone():
     """
     kiforge.setup_logger()
     
-    app = wx.App(False)
+    # Held in a local on purpose: the app must outlive ShowModal() below,
+    # and dropping the reference would collect it immediately.
+    app = wx.App(False)  # noqa: F841
     
     # Check current directory for project files
     project_dir = os.getcwd()

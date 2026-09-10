@@ -40,9 +40,7 @@ user-configurable and flow through CLI, GitHub Action, CD YAML, and
    CSV and STEP ``kicad-cli`` flags. Declared once in :data:`EXPORT_PARAM_SPECS`;
    consumed by Studio, :func:`parse_cli_args`, ``action.yml`` → ``action/run.sh``,
    and :func:`build_cd_substitutions`.
-3. **Runtime options** (``RUNTIME_OPTION_SPECS``) — per-run only (e.g.
-   ``sync_title_block_rev``); not saved to ``.kiforge.json``.
-4. **Fixed pipelines** — :data:`BOM_EXPORT_DEFAULTS` (raw BOM + iBOM columns/grouping),
+3. **Fixed pipelines** — :data:`BOM_EXPORT_DEFAULTS` (raw BOM + iBOM columns/grouping),
    :data:`RENDER_3D_DEFAULTS` (3D PNG renders), :data:`GERBER_EXPORT_DEFAULTS` /
    :data:`DRILL_EXPORT_DEFAULTS` (JLC-aligned gerber/drill). Not exposed as parameters.
 
@@ -94,12 +92,15 @@ ExportTask       Abstract export step; subclasses implement ``is_applicable`` / 
 ExportRunner     Ordered pipeline driver with progress and cleanup.
 generate_cd_files  Write CD workflow YAML and update project ``.gitignore``.
 """
+# KiCad 10 bundles Python 3.9 (macOS ships 3.9.13 inside KiCad.app), so the
+# ``X | None`` annotations below must never be evaluated at import time --
+# without this they raise TypeError and the plugin silently fails to register.
+from __future__ import annotations
 
 import os
 import sys
 import csv
 import html
-import io
 import zipfile
 import shutil
 import tempfile
@@ -109,6 +110,7 @@ import site
 import threading
 import json
 import re
+import ssl
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -212,7 +214,6 @@ INTERACTIVE_HTML_BOM_PINNED_VERSION = "2.11.2"
 #   export (manufacturing layers only, merged drill file).
 # - DEFAULT_IBOM_SETTINGS: HTML BOM presentation only (tracks, dark mode, …);
 #   column layout comes from BOM_EXPORT_DEFAULTS via build_ibom_cli_args().
-# - RUNTIME_OPTION_SPECS: per-run flags (title-block sync); never saved.
 #
 # Merge order at export time: defaults → global settings.json → .kiforge.json →
 # explicit CLI/GUI overrides (see load_merged_settings, build_cli_options).
@@ -228,7 +229,7 @@ DEFAULT_EXPORT_SETTINGS = {
     "export_step": True,
     "export_3d": True,
     "export_svg": True,
-    "export_print_pdf": True,
+    "export_homebrew_pdf": True,
     "format_jlc": True,
     "generate_cd": True,
 }
@@ -367,30 +368,6 @@ EXPORT_PARAM_SPECS = (
 
 EXPORT_PARAM_KEYS = tuple(spec["key"] for spec in EXPORT_PARAM_SPECS)
 assert set(EXPORT_PARAM_KEYS) == set(DEFAULT_EXPORT_PARAMS), "EXPORT_PARAM_SPECS keys must match DEFAULT_EXPORT_PARAMS"
-
-# Per-run flags (CLI / Action / CD). Not loaded from or saved to .kiforge.json.
-DEFAULT_EXPORT_RUNTIME_OPTIONS = {
-    "sync_title_block_rev": True,
-}
-
-RUNTIME_OPTION_SPECS = (
-    {
-        "key": "sync_title_block_rev",
-        "type": "bool",
-        "cli": "--sync-title-block-rev",
-        "help": "Sync schematic title-block (rev) to export version via staged copy",
-        "action_input": "sync_title_block_rev",
-        "cd_placeholder": "SYNC_TITLE_BLOCK_REV",
-    },
-)
-
-
-def apply_export_runtime_options(options: dict | None) -> dict:
-    """Attach per-run flags from RUNTIME_OPTION_SPECS (never loaded from JSON)."""
-    merged = dict(options or {})
-    for key, default in DEFAULT_EXPORT_RUNTIME_OPTIONS.items():
-        merged.setdefault(key, default)
-    return merged
 
 DEFAULT_SETTINGS = {
     "output_dir": "kiforge",
@@ -779,16 +756,16 @@ def _cd_value_for_export_param(options: dict, spec: dict) -> str:
 
 def _normalize_cd_options(options: dict) -> dict:
     """Flatten export toggles and export_params for CD template substitution."""
-    return apply_export_runtime_options(apply_export_params_to_options(options or {}))
+    return apply_export_params_to_options(options or {})
 
 
 def build_cd_substitutions(output_dir_name: str, options: dict) -> dict[str, str]:
     """
     Build all ``{{PLACEHOLDER}}`` values for CD workflow templates.
 
-    Derived from :data:`EXPORT_SETTING_KEYS`, :data:`EXPORT_PARAM_SPECS`, and
-    :data:`RUNTIME_OPTION_SPECS` so Studio, CLI ``--generate-cd``, and the
-    composite Action share one mapping table.
+    Derived from :data:`EXPORT_SETTING_KEYS` and :data:`EXPORT_PARAM_SPECS` so
+    Studio, CLI ``--generate-cd``, and the composite Action share one mapping
+    table.
     """
     opts = _normalize_cd_options(options)
     substitutions = {
@@ -804,12 +781,6 @@ def build_cd_substitutions(output_dir_name: str, options: dict) -> dict[str, str
         )
     for spec in EXPORT_PARAM_SPECS:
         substitutions[spec["cd_placeholder"]] = _cd_value_for_export_param(opts, spec)
-    for spec in RUNTIME_OPTION_SPECS:
-        placeholder = spec.get("cd_placeholder")
-        if placeholder:
-            substitutions[placeholder] = _cd_option_str(
-                opts, spec["key"], DEFAULT_EXPORT_RUNTIME_OPTIONS[spec["key"]]
-            )
     return substitutions
 
 
@@ -876,6 +847,68 @@ def _tab_icon_cache_path(tab_name: str) -> str:
     return os.path.join(tab_icon_cache_dir(), f"{tab_name}.svg")
 
 
+def get_icon_path(filename: str) -> str | None:
+    """
+    Find a bundled Studio icon, using the same layout rules as templates.
+
+    Resolution order mirrors :func:`get_template_path`:
+      1. ``<kiforge.py dir>/icons/`` -- repo root (CLI dev) or PCM install
+         (``plugins/icons/`` inside the plugin zip)
+      2. ``<parent of kiforge.py>/icons/`` -- repo root when running the copied
+         ``plugins/kiforge.py`` during local plugin development
+    """
+    candidates = [
+        os.path.join(KIFORGE_ROOT, "icons", filename),
+        os.path.join(os.path.dirname(KIFORGE_ROOT), "icons", filename),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def read_bundled_tab_icon_svg(tab_name: str) -> bytes | None:
+    """Read a Studio icon shipped inside the plugin. No network, any platform."""
+    path = get_icon_path(f"{tab_name}.svg")
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+        return data if data.strip().startswith(b"<svg") else None
+    except OSError as exc:
+        logger.warning("Failed to read bundled icon %s: %s", tab_name, exc)
+        return None
+
+
+def _https_context() -> ssl.SSLContext | None:
+    """
+    Build an SSL context that has a usable CA bundle on every platform.
+
+    KiCad's macOS Python is a python.org framework build, and nothing runs its
+    "Install Certificates" step, so ``ssl.get_default_verify_paths().cafile`` is
+    None and the default context trusts nothing: every HTTPS request dies with
+    CERTIFICATE_VERIFY_FAILED. The identical code works on Windows, where Python
+    uses the OS certificate store -- which is why network-dependent UI worked
+    there and silently failed on a Mac.
+
+    KiCad does ship ``certifi``, so fall back to its bundle when the default
+    store comes up empty. Returns None to mean "use urllib's default".
+    """
+    context = None
+    try:
+        context = ssl.create_default_context()
+        if context.cert_store_stats().get("x509_ca", 0):
+            return context
+    except Exception:
+        pass
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return context
+
+
 def read_cached_tab_icon_svg(tab_name: str) -> bytes | None:
     path = _tab_icon_cache_path(tab_name)
     if not os.path.isfile(path):
@@ -906,7 +939,7 @@ def download_tab_icon_svg(tab_name: str) -> bytes | None:
     url = TAB_ICON_CDN_URL.format(icon=icon_id)
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "KiForge-Studio/1.0"})
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=10, context=_https_context()) as response:
             data = response.read()
         if data.strip().startswith(b"<svg"):
             write_cached_tab_icon_svg(tab_name, data)
@@ -917,7 +950,16 @@ def download_tab_icon_svg(tab_name: str) -> bytes | None:
 
 
 def fetch_tab_icon_svg(tab_name: str) -> bytes | None:
-    """Return tab icon SVG from disk cache, refreshing from CDN when missing."""
+    """
+    Return a Studio icon SVG: bundled asset first, then disk cache, then CDN.
+
+    The bundled copy is the normal path and needs no network, so the UI renders
+    identically offline, behind a proxy, and on a Mac whose Python cannot verify
+    TLS. The cache and CDN tiers remain for icons added after a release.
+    """
+    bundled = read_bundled_tab_icon_svg(tab_name)
+    if bundled:
+        return bundled
     cached = read_cached_tab_icon_svg(tab_name)
     if cached:
         return cached
@@ -1393,7 +1435,7 @@ def export_options_from_context(context: "ExportContext") -> dict:
     """
     keys = (
         "export_gerbers", "export_drills", "export_pos", "export_bom", "export_ibom",
-        "export_sch_pdf", "export_step", "export_3d", "export_svg", "export_print_pdf", "format_jlc",
+        "export_sch_pdf", "export_step", "export_3d", "export_svg", "export_homebrew_pdf", "format_jlc",
         "generate_cd", "version",
     )
     options = {key: context.options.get(key, DEFAULT_SETTINGS.get(key, True)) for key in keys}
@@ -2294,10 +2336,10 @@ class SchematicPdfExportTask(ExportTask):
         sch_input = context.sch_file
         temp_dir = None
         try:
-            if (
-                context.options.get("sync_title_block_rev")
-                and getattr(context, "version_str", None)
-            ):
+            # Unconditional: a versioned export gets that version in the
+            # schematic's title block, on a staged copy that leaves the user's
+            # own .kicad_sch untouched.
+            if getattr(context, "version_str", None):
                 try:
                     temp_dir, sch_input = create_title_block_staged_copy(
                         context.sch_file, context.version_str
@@ -2718,7 +2760,7 @@ def generate_a4_merged_svg(
     pw, ph = layout["page_w"], layout["page_h"]
     rotated = layout["rotated"]
     bw, bh = layout["board_w"], layout["board_h"]
-    orig_w, orig_h = layout["orig_w"], layout["orig_h"]
+    orig_h = layout["orig_h"]
 
     clip_defs = []
     layers_svg = []
@@ -2892,7 +2934,7 @@ def generate_single_a4_sheet_svg(
 
         pw, ph = fit["page_w"], fit["page_h"]
         rotated = fit["rotated"]
-        orig_w, orig_h = fit["orig_w"], fit["orig_h"]
+        orig_h = fit["orig_h"]
         w, h = fit["board_w"], fit["board_h"]
         x, y = fit["pos"]
 
@@ -2938,29 +2980,147 @@ def generate_single_a4_sheet_svg(
         return False
 
 
-PRINT_PDF_DPI = 1200
+HOMEBREW_PDF_DPI = 1200
 # Raster fallback resolutions, tried in order. A full A4 page at 1200 DPI is
 # ~139 megapixels and needs well over a gigabyte while it is copied through
 # wx.Bitmap -> wx.Image -> bytes -> PIL, so drop to 600 DPI rather than fail.
-PRINT_PDF_RASTER_DPI_LADDER = (1200, 600)
+HOMEBREW_PDF_RASTER_DPI_LADDER = (1200, 600)
 # External converters tried last, as (executable, argv builder, supports_multi_page).
-# rsvg-convert accepts multiple input files and emits one page per file when the
-# output is PDF, so it is the only converter usable for the oversized-board
-# multi-page fallback; Inkscape's CLI only ever produces one page per invocation.
-# This is also the only PDF tier that actually works inside the shipped Docker
-# Action image (no PyQt6, no wx.App there) -- see the Dockerfile's librsvg2-bin.
-PRINT_PDF_CLI_CONVERTERS = (
-    ("inkscape", lambda exe, svgs, pdf: [exe, svgs[0], f"--export-filename={pdf}", f"--export-dpi={PRINT_PDF_DPI}"], False),
-    ("rsvg-convert", lambda exe, svgs, pdf: [exe, "-f", "pdf", "-d", str(PRINT_PDF_DPI), "-p", str(PRINT_PDF_DPI), "-o", pdf, *svgs], True),
+# rsvg-convert only. It is a small library binary that ships with librsvg, it
+# accepts multiple input files and emits one page per file for PDF output (so it
+# is the only converter usable for the oversized-board multi-page fallback), and
+# it is the one PDF tier that works inside the shipped Docker Action image (no
+# PyQt6, no wx.App there) -- see the Dockerfile's librsvg2-bin.
+#
+# Inkscape was deliberately dropped: it is a full desktop application, not a
+# converter, and expecting users to install one to export a PDF is not a
+# reasonable dependency. Its CLI also only ever produced one page per
+# invocation, so it could not serve the multi-page fallback anyway.
+HOMEBREW_PDF_CLI_CONVERTERS = (
+    ("rsvg-convert", lambda exe, svgs, pdf: [exe, "-f", "pdf", "-d", str(HOMEBREW_PDF_DPI), "-p", str(HOMEBREW_PDF_DPI), "-o", pdf, *svgs], True),
 )
-PRINT_PDF_CLI_TIMEOUT_SEC = 180
+HOMEBREW_PDF_CLI_TIMEOUT_SEC = 180
+
+# Optional renderers for the homebrew PDF tiers. KiCad ships neither, but it
+# ships its own pip and its site-packages is user-writable on a normal install,
+# so they can be added to the very interpreter KiCad will render with -- no
+# virtualenv, no --user, no admin. That is the whole reason this exists: telling
+# someone to install a desktop application (or to hand-manage a Python
+# environment inside an .app bundle) to export a PDF is not a real answer.
+PDF_RENDERER_PACKAGES = ("Pillow", "PyQt6")
+PDF_RENDERER_INSTALL_TIMEOUT_SEC = 600
 
 
-def _is_headless_session() -> bool:
-    """True when no windowing system is reachable (CI, Docker, plain ssh session)."""
-    if sys.platform in ("win32", "darwin"):
-        return False
-    return not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+# The distribution name is not always the import name.
+PDF_RENDERER_IMPORT_NAMES = {"Pillow": "PIL"}
+
+
+def _probe_missing_in_interpreter(exe: str, wanted, import_names):
+    """
+    Ask another interpreter which renderer packages it cannot import.
+
+    Returns the missing distribution names, or None when the probe could not
+    run at all so the caller can fall back to an in-process check.
+    """
+    code = (
+        "import importlib.util, sys\n"
+        "print('\\n'.join(n for n in sys.argv[1:] "
+        "if importlib.util.find_spec(n) is None))"
+    )
+    try:
+        result = subprocess.run(
+            [exe, "-c", code, *import_names],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            startupinfo=_subprocess_startupinfo(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    absent = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return [name for name, mod in zip(wanted, import_names) if mod in absent]
+
+
+def missing_pdf_renderer_packages(packages=None, *, python_exe=None) -> list[str]:
+    """
+    Return the renderer packages the interpreter KiCad renders with cannot import.
+
+    It must be *that* interpreter, not this one. Studio runs inside KiCad's
+    bundled Python, but the CLI usually does not, and a developer's system
+    Python very often already has Pillow and PyQt6 while KiCad's has neither.
+    Checking the running process there would report "nothing missing" and skip
+    the install that was the whole point.
+    """
+    wanted = list(packages or PDF_RENDERER_PACKAGES)
+    import_names = [PDF_RENDERER_IMPORT_NAMES.get(name, name) for name in wanted]
+    target = python_exe or PathResolver.get_kicad_python_path()
+
+    if target and os.path.isfile(target):
+        try:
+            same = os.path.realpath(target) == os.path.realpath(sys.executable or "")
+        except OSError:
+            same = False
+        if not same:
+            probed = _probe_missing_in_interpreter(target, wanted, import_names)
+            if probed is not None:
+                return probed
+
+    # Same interpreter as this process, or the probe could not run.
+    import importlib.util
+
+    missing = []
+    for name, mod in zip(wanted, import_names):
+        try:
+            found = importlib.util.find_spec(mod) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(name)
+    return missing
+
+
+def install_pdf_renderer(packages=None, *, python_exe=None, log=None):
+    """
+    Install the optional PDF renderers into the interpreter KiCad runs.
+
+    Targets :meth:`PathResolver.get_kicad_python_path`, which resolves the real
+    bundled interpreter even inside the KiCad GUI (where ``sys.executable`` is
+    the application binary, not Python).
+
+    Returns ``(ok, message)``. Never raises: a failed install is reported, and
+    the export tiers keep falling back exactly as they did before.
+    """
+    wanted = list(packages or PDF_RENDERER_PACKAGES)
+    exe = python_exe or PathResolver.get_kicad_python_path()
+    if not exe or not os.path.isfile(exe):
+        return False, f"Could not locate KiCad's Python interpreter (resolved: {exe!r})."
+
+    argv = [exe, "-m", "pip", "install", "--disable-pip-version-check", *wanted]
+    (log or logger).info("Installing PDF renderers into %s: %s", exe, ", ".join(wanted))
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=PDF_RENDERER_INSTALL_TIMEOUT_SEC,
+            startupinfo=_subprocess_startupinfo(),
+        )
+    except FileNotFoundError:
+        return False, f"{exe} has no usable pip module."
+    except subprocess.TimeoutExpired:
+        return False, "Installation timed out. Check the network and try again."
+    except OSError as exc:
+        return False, f"Installation could not start: {exc}"
+
+    if result.returncode == 0:
+        return True, f"Installed {', '.join(wanted)} into KiCad's Python."
+
+    detail = (result.stderr or result.stdout or "").strip().splitlines()
+    tail = detail[-1] if detail else f"pip exited with {result.returncode}"
+    (log or logger).warning("PDF renderer install failed: %s", tail)
+    return False, f"Installation failed: {tail}"
 
 
 def _discard_file(path: str) -> None:
@@ -2988,8 +3148,12 @@ def _export_pdf_via_qt(svg_paths: list[str], output_pdf_path: str, is_landscape:
     # Qt calls qFatal() (which abort()s the process, uncatchable from Python)
     # when it cannot open a display, so force the offscreen platform plugin
     # before QGuiApplication is constructed.
-    if _is_headless_session():
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    # This tier renders to a PDF file and never puts anything on screen, so the
+    # offscreen platform plugin is always the right one -- there is nothing to
+    # detect. Qt would otherwise try to reach a display and terminate the
+    # process when it cannot. setdefault so an explicit QT_QPA_PLATFORM still
+    # wins for anyone who has a reason to choose differently.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6 import QtCore, QtGui, QtSvg
 
     app = QtGui.QGuiApplication.instance()
@@ -3002,7 +3166,7 @@ def _export_pdf_via_qt(svg_paths: list[str], output_pdf_path: str, is_landscape:
         QtGui.QPageLayout.Orientation.Landscape if is_landscape
         else QtGui.QPageLayout.Orientation.Portrait
     )
-    writer.setResolution(PRINT_PDF_DPI)
+    writer.setResolution(HOMEBREW_PDF_DPI)
     writer.setPageMargins(QtCore.QMarginsF(0, 0, 0, 0))
 
     painter = QtGui.QPainter(writer)
@@ -3023,7 +3187,7 @@ def _export_pdf_via_qt(svg_paths: list[str], output_pdf_path: str, is_landscape:
         if logger:
             logger.info(
                 "Exported %d DPI vector PDF (%d page(s)) via PyQt6: %s",
-                PRINT_PDF_DPI, len(svg_paths), output_pdf_path,
+                HOMEBREW_PDF_DPI, len(svg_paths), output_pdf_path,
             )
         return True
     return False
@@ -3042,7 +3206,7 @@ def _export_pdf_via_wx(svg_paths: list[str], output_pdf_path: str, is_landscape:
 
     page_mm = (297.0, 210.0) if is_landscape else (210.0, 297.0)
     last_error = None
-    for dpi in PRINT_PDF_RASTER_DPI_LADDER:
+    for dpi in HOMEBREW_PDF_RASTER_DPI_LADDER:
         size = wx.Size(int(page_mm[0] / 25.4 * dpi), int(page_mm[1] / 25.4 * dpi))
         frames = []
         try:
@@ -3173,7 +3337,7 @@ def _export_pdf_via_subprocess(
         return False
 
     try:
-        polls_left = int(PRINT_PDF_CLI_TIMEOUT_SEC / _QT_PDF_POLL_SEC)
+        polls_left = int(HOMEBREW_PDF_CLI_TIMEOUT_SEC / _QT_PDF_POLL_SEC)
         while True:
             try:
                 proc.wait(timeout=_QT_PDF_POLL_SEC)
@@ -3226,13 +3390,13 @@ def _export_pdf_via_cli(
     should_abort: Callable[[], bool] | None = None,
 ) -> bool:
     """
-    Tier 3 - external converters (Inkscape: single page only; rsvg-convert: any page count).
+    Tier 3 - external converter (rsvg-convert; any page count).
 
     ``should_abort`` is checked before each converter for the same reason the
     tier ladder checks it: a cancelled export must not start the next
     converter and sit through another full conversion.
     """
-    for name, build_argv, supports_multi in PRINT_PDF_CLI_CONVERTERS:
+    for name, build_argv, supports_multi in HOMEBREW_PDF_CLI_CONVERTERS:
         if should_abort is not None and should_abort():
             _discard_file(output_pdf_path)
             return False
@@ -3245,7 +3409,7 @@ def _export_pdf_via_cli(
             res = subprocess.run(
                 build_argv(exe, svg_paths, output_pdf_path),
                 capture_output=True,
-                timeout=PRINT_PDF_CLI_TIMEOUT_SEC,
+                timeout=HOMEBREW_PDF_CLI_TIMEOUT_SEC,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             if logger:
@@ -3388,10 +3552,11 @@ def export_svg_to_1200dpi_pdf(
     #        machine producing byte-comparable artwork matters more for a
     #        manufacturing file than an occasional vector upgrade that only
     #        some installs would get.
-    #   CLI  rsvg-convert / Inkscape are common on Linux, absent as often as
-    #        not elsewhere -- an upgrade when present, never depended on.
-    #   Qt   PyQt6 is not part of KiCad on any platform; it only exists when
-    #        running under a system Python that happens to have it (CLI/CD).
+    #   CLI  rsvg-convert is common on Linux, absent as often as not
+    #        elsewhere -- an upgrade when present, never depended on.
+    #   Qt   PyQt6 is not part of KiCad on any platform; it is available when
+    #        installed into KiCad's own interpreter (see install_pdf_renderer)
+    #        or when running under a system Python that has it (CLI/CD).
     #
     # Every GUI-toolkit renderer is offered out-of-process first; the
     # in-process variants stay as a last resort for hosts where spawning the
@@ -3556,7 +3721,7 @@ class HomebrewPdfExportTask(ExportTask):
         super().__init__("Exporting Homebrew PDF")
 
     def is_applicable(self, context: ExportContext) -> bool:
-        return context.options.get("export_print_pdf", True) and bool(context.pcb_file)
+        return context.options.get("export_homebrew_pdf", True) and bool(context.pcb_file)
 
     def _resolve_layers(self, context: ExportContext, temp_dir: str) -> tuple[str | None, str | None, bool]:
         """
@@ -3591,7 +3756,67 @@ class HomebrewPdfExportTask(ExportTask):
             return front, back, cropped
         return export_copper_layers(self, context, temp_dir)
 
+    def _ensure_renderer_installed(self, context: ExportContext) -> None:
+        """
+        Install the PDF renderers on demand, the way iBOM installs its own.
+
+        KiCad ships neither Pillow nor PyQt6, and PCM has no way to declare or
+        install dependencies -- an addon package is a plain zip that KiCad
+        extracts, with no install script and no hook (see the KiCad addon
+        specification). The earliest code KiCad runs is this plugin's
+        ``__init__.py`` at plugin-scan time, and pip-installing from there would
+        block KiCad's startup on a network download.
+
+        So the dependency is resolved where it is needed, exactly like
+        :class:`IbomExportTask` does for InteractiveHtmlBom: at the point the
+        export first requires it, through the cancellable subprocess runner so
+        progress is reported and Cancel still works.
+
+        Best effort -- a failed install leaves the tier ladder to fall through
+        as before, and :meth:`run` reports the remedy in its warning.
+        """
+        py_exe = context.kicad_python
+        if not py_exe:
+            return
+        missing = missing_pdf_renderer_packages(python_exe=py_exe)
+        if not missing:
+            return
+
+        context.logger.info(
+            "Homebrew PDF renderer missing from %s: %s. Installing via pip...",
+            py_exe, ", ".join(missing),
+        )
+
+        # One package per pip call so the dialog can name the one it is on.
+        # PyQt6 is a ~100 MB download and the only feedback during it is this
+        # label, so "Installing PyQt6 (2 of 2)" beats a single frozen message
+        # covering both.
+        base = [py_exe, "-m", "pip", "install", "--user"]
+        total = len(missing)
+        for index, name in enumerate(missing, start=1):
+            if context.is_aborted():
+                return
+            if context.progress_callback:
+                step = f" ({index} of {total})" if total > 1 else ""
+                context.progress_callback(None, None, f"Installing {name}{step}\u2026")
+
+            ok = self._run_subprocess(base + [name], context)
+            if not ok and not context.is_aborted():
+                # Same escalation as IbomExportTask: externally-managed
+                # environments (PEP 668) refuse a plain --user install.
+                context.logger.info("pip install failed for %s. Retrying with --break-system-packages...", name)
+                ok = self._run_subprocess(base + ["--break-system-packages", name], context)
+
+            if ok:
+                context.logger.info("Installed homebrew PDF renderer: %s", name)
+            else:
+                context.logger.warning("Could not install homebrew PDF renderer: %s", name)
+
+        if context.progress_callback and not context.is_aborted():
+            context.progress_callback(None, None, "Exporting Homebrew PDF\u2026")
+
     def run(self, context: ExportContext) -> bool:
+        self._ensure_renderer_installed(context)
         homebrew_pdf = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.pdf")
         # The merged sheet only belongs in the output folder when the user asked
         # for SVGs; otherwise it is a scratch intermediate for the PDF.
@@ -3660,7 +3885,19 @@ class HomebrewPdfExportTask(ExportTask):
                 )
 
             if not pdf_ok:
-                context.add_warning(f"Failed to render {PRINT_PDF_DPI} DPI homebrew PDF.")
+                # Name the fix: on a stock KiCad no renderer tier exists at all,
+                # and "failed to render" alone sends people looking for a bug in
+                # their board instead of a missing package.
+                missing = missing_pdf_renderer_packages()
+                remedy = (
+                    f" No renderer is installed -- run "
+                    f"'python kiforge.py --install-pdf-renderer' with KiCad's "
+                    f"Python to add {', '.join(missing)}."
+                    if missing else ""
+                )
+                context.add_warning(
+                    f"Failed to render {HOMEBREW_PDF_DPI} DPI homebrew PDF.{remedy}"
+                )
                 return False
             context.report_progress(1.0)
             return True
@@ -4126,7 +4363,7 @@ def generate_cd_files(project_dir: str, output_dir_name: str, options: dict) -> 
 generate_ci_files = generate_cd_files
 
 
-def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=True, export_print_pdf=True, export_bom=True, export_sch_pdf=True, export_pos=True, export_step=True, export_gerbers=True, export_drills=True, export_ibom=True, progress_callback=None, context=None):
+def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=True, export_homebrew_pdf=True, export_bom=True, export_sch_pdf=True, export_pos=True, export_step=True, export_gerbers=True, export_drills=True, export_ibom=True, progress_callback=None, context=None):
     """
     Main library entry point for CLI, Studio, and CD workflows.
 
@@ -4137,10 +4374,10 @@ def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=Tr
     (skipped inside GitHub Actions itself).
     """
     if context is None:
-        options = apply_export_runtime_options(apply_export_params_to_options({
+        options = apply_export_params_to_options({
             "export_3d": export_3d,
             "export_svg": export_svg,
-            "export_print_pdf": export_print_pdf,
+            "export_homebrew_pdf": export_homebrew_pdf,
             "export_bom": export_bom,
             "export_sch_pdf": export_sch_pdf,
             "export_pos": export_pos,
@@ -4148,13 +4385,13 @@ def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=Tr
             "export_gerbers": export_gerbers,
             "export_drills": export_drills,
             "export_ibom": export_ibom,
-        }))
+        })
 
         context = ExportContext(project_path, output_dir, options, progress_callback)
         if not context.resolve():
             return False
     else:
-        context.options = apply_export_runtime_options(apply_export_params_to_options(context.options))
+        context.options = apply_export_params_to_options(context.options)
 
     runner = ExportRunner(context)
     success = runner.execute()
@@ -4195,8 +4432,7 @@ def parse_cli_args(args=None):
 
     Export toggles are generated from EXPORT_SETTING_KEYS. Placement/STEP flags
     are generated from EXPORT_PARAM_SPECS (plus ``--top`` / ``--bottom`` aliases).
-    Runtime flags come from RUNTIME_OPTION_SPECS. BOM and 3D render behavior is
-    not configurable on the CLI.
+    BOM and 3D render behavior is not configurable on the CLI.
     """
     import argparse
 
@@ -4246,14 +4482,14 @@ def parse_cli_args(args=None):
         default=None,
         help="Placement CSV: bottom side only (alias for --pos-side back)",
     )
-    for spec in RUNTIME_OPTION_SPECS:
-        parser.add_argument(
-            spec["cli"],
-            action=argparse.BooleanOptionalAction,
-            dest=spec["key"],
-            default=DEFAULT_EXPORT_RUNTIME_OPTIONS[spec["key"]],
-            help=spec["help"],
-        )
+    parser.add_argument(
+        "--install-pdf-renderer",
+        action="store_true",
+        help=(
+            "Install the optional PDF renderers (%s) into KiCad's own Python, "
+            "then exit" % ", ".join(PDF_RENDERER_PACKAGES)
+        ),
+    )
     parser.add_argument(
         "--generate-cd",
         action="store_true",
@@ -4279,14 +4515,6 @@ def export_params_from_cli_args(args) -> dict | None:
     return params or None
 
 
-def runtime_options_from_cli_args(args) -> dict:
-    """Collect per-run runtime flags from parsed CLI arguments."""
-    runtime = {}
-    for spec in RUNTIME_OPTION_SPECS:
-        runtime[spec["key"]] = getattr(args, spec["key"])
-    return apply_export_runtime_options(runtime)
-
-
 def build_cli_options(args, *, flatten_params: bool = False) -> dict:
     """
     Build an options dict from parsed CLI arguments.
@@ -4305,7 +4533,6 @@ def build_cli_options(args, *, flatten_params: bool = False) -> dict:
     export_params = export_params_from_cli_args(args)
     if export_params:
         options["export_params"] = merge_export_params(None, export_params)
-    options.update(runtime_options_from_cli_args(args))
     if flatten_params:
         return apply_export_params_to_options(options)
     return options
@@ -4315,6 +4542,15 @@ if __name__ == "__main__":
     setup_logger()
     args = parse_cli_args()
     
+    if args.install_pdf_renderer:
+        missing = missing_pdf_renderer_packages()
+        if not missing:
+            print("PDF renderers already available: %s" % ", ".join(PDF_RENDERER_PACKAGES))
+            sys.exit(0)
+        ok, message = install_pdf_renderer(missing)
+        print(message)
+        sys.exit(0 if ok else 1)
+
     if args.generate_cd:
         options = build_cli_options(args, flatten_params=True)
         msg, success = generate_cd_files(args.project_path, args.output_dir, options)

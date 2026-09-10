@@ -11,8 +11,40 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
-  unit-tests:
-    name: Python unit tests
+  # KiForge only ever runs inside KiCad, which bundles its own Python -- 3.9.13
+  # on macOS, newer 3.x elsewhere -- so the supported interpreter is a range,
+  # not one build. This job imports every shipped module under a stand-in KiCad
+  # runtime and asserts a toolbar button gets registered, across the whole
+  # range and all three platforms. It needs no dependencies, so it can run
+  # where the full suite would be guesswork, and it is what catches code that
+  # parses everywhere but only *runs* on the newest interpreter.
+  import-gate:
+    name: KiCad load (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Floor and current: anything valid on both is valid in between.
+        python-version: ['3.9', '3.12']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Import shipped modules under a stand-in KiCad runtime
+        run: python tests/kicad_runtime_stub.py
+
+  # Write-time enforcement of the same floor. ruff's FA102 flags PEP 604
+  # (`X | None`) annotations in a module without `from __future__ import
+  # annotations` -- valid syntax on the floor, TypeError when evaluated there.
+  # Pinned to a known-good release so a new ruff cannot turn CI red on its own.
+  lint:
+    name: Compatibility lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -23,7 +55,37 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install ruff
+        run: pip install ruff==0.16.6
+
+      - name: Check interpreter compatibility rules
+        run: ruff check .
+
+  unit-tests:
+    name: Python unit tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    needs: [import-gate, lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        # All three platforms. KiForge's only hard dependencies are KiCad's own
+        # pcbnew and wx, and everything else it imports is the standard library,
+        # so nothing here is platform-specific by design -- any failure on one
+        # OS is a portability bug worth seeing rather than a reason to narrow
+        # the matrix.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.9', '3.12']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
       - name: Install PDF renderer for export tests
+        if: runner.os == 'Linux'
         # librsvg2-bin provides rsvg-convert, the headless SVG->PDF converter
         # used by export_svg_to_1200dpi_pdf's CLI tier (the same package the
         # project's Docker image installs). Without it a bare runner has no
