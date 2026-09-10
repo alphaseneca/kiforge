@@ -65,7 +65,7 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `export_step` | Export STEP 3D model | `'true'` |
 | `export_3d` | Export front & back 3D PNG renders | `'true'` |
 | `export_svg` | Export front & back copper layer SVGs | `'true'` |
-| `export_print_pdf` | Export 1200 DPI print-ready etching & mask PDF (1:1 true scale) | `'true'` |
+| `export_homebrew_pdf` | Export 1200 DPI homebrew etching & mask PDF (1:1 true scale) | `'true'` |
 | `export_ibom` | Export Interactive HTML BOM | `'true'` |
 | `format_jlc` | Also produce JLC-ready BOM/CPL from KiCad CSV exports | `'true'` |
 | `pos_side` | Placement CSV side: `both`, `front` (top), or `back` (bottom) | `'both'` |
@@ -73,7 +73,6 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | `pos_exclude_dnp` | Placement CSV: exclude DNP parts | `'true'` |
 | `step_subst_models` | STEP export: substitute missing 3D models | `'true'` |
 | `bom_include_mfr_mpn` | BOM/iBOM: include Manufacturer & MPN columns | `'true'` |
-| `sync_title_block_rev` | Sync schematic title-block `(rev …)` to the export version | `'true'` |
 | `version` | Override version suffix for output filenames | _(auto from Git tag)_ |
 
 > **Export parameters:** The `pos_*`, `step_*`, and `bom_*` inputs map to `export_params` in `.kiforge.json`. Gerber/drill layers and 3D render quality are fixed (`GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`, `RENDER_3D_DEFAULTS`). BOM fields and iBOM grouping mirror `BOM_EXPORT_DEFAULTS` (with Manufacturer and MPN columns toggled on/off dynamically via the `bom_include_mfr_mpn` flag). Raw `*_bom.csv` includes `ID` and `MPN`; JLC copies are produced by `JLCPCBFormatter` when `format_jlc` is on.
@@ -108,7 +107,7 @@ KiForge writes all files into `output_dir/` on the GitHub Actions runner — not
 | `<name>_front.svg` | Front copper layer SVG (negative B&W) | `export_svg` |
 | `<name>_back.svg` | Back copper layer SVG (mirrored negative B&W) | `export_svg` |
 | `<name>_homebrew.svg` | Merged A4 homebrew etching sheet with calibration scale & optical fiducials | `export_svg` |
-| `<name>_homebrew.pdf` | 1200 DPI homebrew etching & mask PDF (1:1 true scale) | `export_print_pdf` |
+| `<name>_homebrew.pdf` | 1200 DPI homebrew etching & mask PDF (1:1 true scale) | `export_homebrew_pdf` |
 | `<name>_ibom.html` | Interactive HTML BOM | `export_ibom` |
 | `<name>_pos_neoden.csv` | NeoDen formatted pick-and-place CSV | `templates/gitea-pnp-neoden.yml` |
 | `<name>_pnp_ref_origin.png` | Front-copper optical alignment image with origin crosshairs | `templates/gitea-pnp-neoden.yml` |
@@ -317,6 +316,40 @@ python kiforge.py --generate-cd --no-export-3d --pos-side back
 When export-parameter flags are omitted, KiForge merges defaults with project/global settings from `.kiforge.json` (Studio **Save** writes those files).
 
 ---
+
+## Homebrew PDF renderers
+
+On your own machine the homebrew PDF needs **Pillow** and/or **PyQt6** — nothing
+else. wxPython always ships with KiCad, so wx + Pillow is the usual path, and
+PyQt6 adds a true-vector tier. A stock KiCad install has neither, which is why a
+fresh machine has no working tier at all.
+
+`rsvg-convert` is **not** something you install. It is the last-resort tier for
+the headless Docker container the GitHub Action runs in, where Pillow and PyQt6
+are absent and wx has no display to open. On a desktop it is never reached.
+
+KiCad ships its own `pip`, and its `site-packages` is writable on a normal
+install, so both can be added to the exact interpreter KiCad renders with — no
+virtualenv, no `--user`, no administrator rights:
+
+```bash
+python kiforge.py --install-pdf-renderer
+```
+
+Run it with **KiCad's own Python** so the packages land where KiCad will find
+them. On macOS that is:
+
+```bash
+/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 kiforge.py --install-pdf-renderer
+```
+
+On Windows it is `C:\Program Files\KiCad\10.0\bin\python.exe`; on Linux KiCad
+uses the system interpreter, so plain `python3` is correct. KiForge resolves the
+target itself, so running it from inside KiCad's scripting console also works.
+
+Inkscape is deliberately **not** used. It is a full desktop application rather
+than a converter, and its CLI only ever rendered one page per invocation, so it
+could not produce the multi-page fallback for oversized boards either.
 
 ## Log File
 

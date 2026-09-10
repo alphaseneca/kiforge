@@ -9,13 +9,18 @@ kiforge/
 │   ├── kiforge.gitignore      # Merged into downstream project .gitignore
 │   ├── github-release.yml     # GitHub Actions CD workflow template
 │   └── gitea-release.yml      # Gitea Actions CD workflow template
+├── icons/                     # Studio UI glyphs, bundled (never fetched at runtime)
 ├── plugins/
+│   ├── __init__.py            # Load bootstrap; owns MIN_PYTHON (see below)
 │   ├── kiforge_studio.py      # KiCad GUI
 │   └── kiforge.py             # Auto-copied from root when packaging (gitignored)
 ├── tests/
 │   ├── sample_project/        # Minimal KiCad 10 project
+│   ├── kicad_runtime_stub.py  # Stand-in wx/pcbnew; runnable as the load gate
 │   ├── test_cli.py
+│   ├── test_python_compat.py  # Interpreter baseline + "never fail silently"
 │   └── test_studio.py
+├── pyproject.toml             # Interpreter floor + ruff compatibility rules
 └── package_plugin.py          # Builds PCM zip; templates zip to plugins/templates/
 ```
 
@@ -29,6 +34,69 @@ kiforge/
 | Global | `%APPDATA%/kiforge/settings.json` (Windows) | Same keys; project overrides |
 
 Load order: built-in defaults → global → project → runtime dialog/CLI flags.
+
+## Interpreter baseline
+
+KiCad bundles its own Python and **the version differs per platform** — macOS
+10.x ships 3.9.13 inside `KiCad.app`, other platforms ship newer 3.x. So the
+supported interpreter is a range with a floor, and every shipped module has to
+run across all of it. The floor is declared in four places that a test keeps in
+agreement:
+
+| Where | What it does |
+|---|---|
+| `plugins/__init__.py:MIN_PYTHON` | checked at load time, before any KiForge import |
+| `pyproject.toml` `[tool.kiforge] min-python` | the human/tooling-readable declaration |
+| `pyproject.toml` `[tool.ruff] target-version` | makes ruff enforce it while you type |
+| `.github/workflows/test-action.yml` matrix | what CI actually exercises |
+
+`tests/test_python_compat.py` fails if any of them drift apart. To change the
+floor, change all four — the test will tell you if you missed one.
+
+The specific trap: `str | None` (PEP 604) is valid *syntax* on 3.9 but is
+evaluated at `def` time, so it raises `TypeError: unsupported operand type(s)
+for |` on import. Inside KiCad that is invisible — PCM reports the package
+installed and no toolbar button appears. Shipped modules therefore carry
+`from __future__ import annotations`, which keeps annotations unevaluated.
+
+Check both before pushing:
+
+```bash
+python tests/kicad_runtime_stub.py
+```
+
+That imports every shipped module under a stand-in KiCad runtime (fake `wx` and
+`pcbnew`) and asserts KiForge registers a toolbar button. It needs no
+dependencies and takes under a second. CI runs it on Linux, macOS and Windows
+across the interpreter range.
+
+The gate runs under whatever interpreter invokes it, so the strongest local
+check is KiCad's own bundled Python — the one the plugin will actually run on:
+
+```bash
+# macOS
+/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 tests/kicad_runtime_stub.py
+# Windows
+"C:\Program Files\KiCad\10.0\bin\python.exe" tests/kicad_runtime_stub.py
+# Linux — KiCad uses the system interpreter
+python3 tests/kicad_runtime_stub.py
+```
+
+**There is nothing to install for any of this.** KiForge imports only the
+standard library plus `wx` and `pcbnew`, and those two come from KiCad itself —
+they cannot be installed from PyPI. `pcbnew` is not published there at all, and
+KiCad compiles its own wxWidgets, so a PyPI `wxPython` would be ABI-mismatched
+with the running KiCad rather than a working substitute. `PIL` and `PyQt6` are
+optional PDF-rendering tiers, imported lazily inside the functions that use them
+and falling back when absent. That is why the compatibility problem is solved by
+supporting the whole interpreter range rather than by installing anything.
+
+```bash
+pip install ruff==0.16.6 && ruff check .
+```
+
+Ruff is configured narrowly — only `FA`, whose FA102 flags PEP 604 annotations
+in a module missing the future import. `ruff check --fix .` adds it for you.
 
 ## Running unit tests
 
@@ -90,8 +158,17 @@ The `@main` default in repo-root `kiforge.py` is for **contributors** running
 
 | Workflow | Purpose |
 |---|---|
-| `.github/workflows/test-action.yml` | Unit tests + composite-action export on `tests/sample_project` |
+| `.github/workflows/test-action.yml` | Load gate, compatibility lint, unit tests, composite-action export |
 | `.github/workflows/release.yml` | Build PCM zip and publish GitHub Release assets on `v*` tags |
+
+`test-action.yml` runs four jobs in order:
+
+| Job | Where | Purpose |
+|---|---|---|
+| `import-gate` | Linux, macOS, Windows × Python 3.9 and 3.12 | Imports every shipped module under a stand-in KiCad and asserts the toolbar button registers. Runs first because it needs no dependencies and pinpoints load breakage |
+| `lint` | Linux | `ruff check .` — the interpreter-compatibility rules |
+| `unit-tests` | Linux, macOS, Windows × Python 3.9 and 3.12 | The suite, on every platform |
+| `integration` | Linux | Composite-action export on `tests/sample_project` |
 
 Composite action layout:
 

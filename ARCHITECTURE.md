@@ -91,7 +91,7 @@ The `ExportContext.resolve()` method performs all environment discovery:
 5. **Version Suffix**: Resolved by `resolve_export_version()` — explicit option → `GITHUB_REF_NAME` → `VERSION` env → git tag → `v0.1.0`. Appended to `pcb_name` for all versioned outputs.
 6. **Rotation Offsets**: Loaded through `load_merged_settings()` from `.kiforge.json`; runtime options override project values.
 
-Schematic PDF export optionally writes `(rev …)` into a staged schematic copy so the source file is not modified (`sync_title_block_rev` runtime flag).
+Schematic PDF export writes `(rev …)` into a staged schematic copy so the source file is never modified. This is unconditional for a versioned export — it was a `sync_title_block_rev` flag on the CLI, Action and CD workflow, which only created a way to get it wrong.
 
 ### Phase 2: Pipeline Initialization
 `ExportRunner` builds an ordered task pipeline consisting of two parts:
@@ -133,12 +133,30 @@ KiCad's internal scripting environment has unique constraints:
   class ExporterPlugin(_PluginBase):
       ...
   ```
-* **Safe Import Registration**: The plugin registration hook must run only when KiCad scans python files on startup. To prevent C++ assertions when running tests or CLI, `plugins/__init__.py` utilizes a strict environment check:
+* **Safe Import Registration**: The plugin registration hook must run only when KiCad scans python files on startup. To prevent C++ assertions when running tests or CLI, `plugins/__init__.py` uses a strict environment check — `pcbnew` in `sys.modules` is the one reliable signal that Python is running inside KiCad:
   ```python
   if 'pcbnew' in sys.modules:
-      from .kiforge_studio import ExporterPlugin
-      ExporterPlugin().register()
+      load()
   ```
+* **Interpreter baseline**: KiCad bundles its own Python and **the version differs per platform** — macOS 10.x ships 3.9.13 inside `KiCad.app`, other platforms ship newer 3.x. The supported interpreter is therefore a *range with a floor*, never one build; pinning an exact patch release would just relocate the failure to another platform. The floor lives in `plugins/__init__.py:MIN_PYTHON` and is mirrored by `pyproject.toml` (`[tool.kiforge] min-python`, ruff `target-version`) and the CI matrix, with `tests/test_python_compat.py` failing if any of them drift apart.
+
+  The trap this closes: `str | None` (PEP 604) is valid *syntax* on 3.9 but is evaluated at `def` time, so it raises `TypeError` on import. Shipped modules carry `from __future__ import annotations`, ruff's FA102 enforces it at write time, and the import gate below proves it at merge time.
+* **Load bootstrap — failure is always visible**: KiCad's loader wraps each plugin import in a bare `except:` and only records the traceback in `pcbnew.GetWizardsBackTrace()`, which nothing surfaces prominently. A plugin that raises during import is indistinguishable from one that is not installed: PCM reports it installed, and no toolbar button appears. `plugins/__init__.py` is written to defend against exactly that — stdlib only, no annotations, no syntax newer than 3.6, so it can run on an interpreter it does not support in order to *report* that it does not support it:
+  ```python
+  def load():
+      if sys.version_info < MIN_PYTHON:      # checked before any KiForge import
+          ...register the stand-in, return False
+      try:
+          from .kiforge_studio import ExporterPlugin
+          ExporterPlugin().register()
+      except Exception:
+          if not _register_failure_plugin(...):
+              raise                          # last resort: let KiCad hold the traceback
+  ```
+  The invariant: **if KiForge is installed, something always appears in the toolbar** — either the plugin, or a button that reports what went wrong and writes a copyable report to the temp directory.
+* **Import gate**: because `pcbnew` and KiCad's `wx` cannot be installed from PyPI, nothing outside a real KiCad ever imported `plugins/kiforge_studio.py`, and `tests/test_studio.py` skips unless `KIFORGE_RUN_GUI_TESTS=1`. `tests/kicad_runtime_stub.py` closes that blind spot: it installs permissive fakes for `wx` and `pcbnew` — with a faithful `ActionPlugin` so registration can be *asserted* rather than mocked — imports every shipped module, and confirms a toolbar button was registered. It needs no dependencies, runs standalone, and CI runs it on all three platforms across the supported interpreter range.
+* **UI assets ship with the plugin**: Studio's nine Material Symbols live in `plugins/icons/` inside the zip, not on a CDN. They used to be fetched from `fonts.gstatic.com` on first render, which failed outright on macOS: KiCad's bundled Python there is a python.org framework build with no default CA store, so every request raised `CERTIFICATE_VERIFY_FAILED` and each glyph silently rendered blank — while the identical code worked on Windows, where Python uses the OS certificate store. A plugin must not need the network to draw its own UI. The cache and CDN tiers survive only for an icon added after a release, and `kiforge._https_context()` now falls back to the `certifi` bundle KiCad already ships, which repairs HTTPS on that interpreter generally.
+* **The palette follows the system appearance**: `_COLORS` was a single hardcoded dark ramp with no appearance detection anywhere, so a Mac in light mode drew a dark dialog under a light system title bar, with natively drawn elements — title bar, scrollbars, file dialogs, selection highlights — still light and system-coloured text landing dark-on-dark. `refresh_palette()` resolves `_DARK_PALETTE` or `_LIGHT_PALETTE` from `wx.SystemAppearance.IsDark()` (luminance fallback) and applies it by **mutating `_COLORS` in place**, so all ~100 existing lookups pick up the change with no call-site edits and no stale references. Every dialog resolves it at construction, and `EVT_SYS_COLOUR_CHANGED` re-resolves on a live theme flip. Icon tints are part of the bitmap cache key, so a flip cannot serve a near-white glyph onto a white ground. Ramp parity and the in-place contract are checked by `tests/kicad_runtime_stub.py` on every platform; contrast is checked against real `wx.Colour` in `tests/test_studio.py`.
 * **iBOM toolbar coexistence**: `INTERACTIVE_HTML_BOM_CLI_MODE` and `INTERACTIVE_HTML_BOM_NO_DISPLAY` must never be set at `kiforge.py` import time — only in `ensure_ibom_subprocess_env()` for the iBOM export subprocess. Setting them globally breaks the standalone InteractiveHtmlBom plugin toolbar in KiCad.
 
 ---
@@ -213,7 +231,6 @@ Saved JSON structure:
 | --- | --- | --- | --- | --- |
 | Export toggles | `EXPORT_SETTING_KEYS` | `exports` | Yes | Which outputs to produce |
 | Export parameters | `EXPORT_PARAM_SPECS` | `export_params` | Yes | Placement, STEP, & BOM flags |
-| Runtime | `RUNTIME_OPTION_SPECS` | _(none)_ | Yes | Per-run behavior (title-block sync) |
 | BOM layout | `BOM_EXPORT_DEFAULTS` | _(none)_ | No | Raw CSV + iBOM columns/grouping |
 | 3D renders | `RENDER_3D_DEFAULTS` | _(none)_ | No | `kicad-cli pcb render` flags |
 | Gerbers / drills | `GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS` | _(none)_ | No | JLC-aligned manufacturing export |
