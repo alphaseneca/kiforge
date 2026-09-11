@@ -35,19 +35,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Linux: modern distro Python + Docker baseline
-          - os: ubuntu-latest
-            python-version: '3.12'
-          # Linux floor: minimum supported Python runtime
-          - os: ubuntu-latest
-            python-version: '3.9'
-          # macOS: KiCad bundled Python environment (3.9)
-          - os: macos-latest
-            python-version: '3.9'
-          # Windows: standard Windows runtime & path resolution
-          - os: windows-latest
-            python-version: '3.12'
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.9', '3.12']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
