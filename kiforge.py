@@ -329,7 +329,7 @@ EXPORT_PARAM_SPECS = (
         "choices": ("both", "front", "back"),
         "cli": "--pos-side",
         "help": "Placement CSV: board side (both, front/top, back/bottom)",
-        "action_input": "pos_side",
+        "action_input": "pos-side",
         "cd_placeholder": "POS_SIDE",
     },
     {
@@ -337,7 +337,7 @@ EXPORT_PARAM_SPECS = (
         "type": "bool",
         "cli": "--pos-smd-only",
         "help": "Placement CSV: include SMD parts only",
-        "action_input": "pos_smd_only",
+        "action_input": "pos-smd-only",
         "cd_placeholder": "POS_SMD_ONLY",
     },
     {
@@ -345,7 +345,7 @@ EXPORT_PARAM_SPECS = (
         "type": "bool",
         "cli": "--pos-exclude-dnp",
         "help": "Placement CSV: exclude do-not-populate parts",
-        "action_input": "pos_exclude_dnp",
+        "action_input": "pos-exclude-dnp",
         "cd_placeholder": "POS_EXCLUDE_DNP",
     },
     {
@@ -353,7 +353,7 @@ EXPORT_PARAM_SPECS = (
         "type": "bool",
         "cli": "--step-subst-models",
         "help": "STEP export: substitute missing 3D models",
-        "action_input": "step_subst_models",
+        "action_input": "step-subst-models",
         "cd_placeholder": "STEP_SUBST_MODELS",
     },
     {
@@ -361,7 +361,7 @@ EXPORT_PARAM_SPECS = (
         "type": "bool",
         "cli": "--bom-include-mfr-mpn",
         "help": "BOM/iBOM: include Manufacturer and MPN columns",
-        "action_input": "bom_include_mfr_mpn",
+        "action_input": "bom-include-mfr-mpn",
         "cd_placeholder": "BOM_INCLUDE_MFR_MPN",
     },
 )

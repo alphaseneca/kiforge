@@ -129,6 +129,10 @@ policy](https://dev-docs.kicad.org/en/rules-guidelines/code-style/index.html):
   [anti-patterns](https://dev-docs.kicad.org/en/rules-guidelines/anti-patterns/index.html).
   Parse a token and discard it rather than skipping by count; write `yes`/`no`
   rather than relying on presence.
+- **Naming conventions across interfaces**:
+  - **CLI flags**: always kebab-case (`--pcb-file`, `--project-path`, `--output-dir`, `--export-gerbers`).
+  - **GitHub Action inputs**: canonical names are kebab-case (`pcb-file`, `project-path`, `output-dir`, `export-gerbers`), matching CLI flags. Always maintain backwards-compatible `snake_case` aliases (`pcb_file`, `project_path`, `output_dir`) in `action.yml` and runner mappings.
+  - **Python code & internals**: PEP 8 snake_case (`pcb_file`, `project_path`, `output_dir`).
 
 ## 6. Failure must be visible
 
@@ -163,6 +167,12 @@ policy](https://dev-docs.kicad.org/en/rules-guidelines/ui/index.html):
 - **Escape must cancel.** Dialogs need a `wxID_CANCEL` path.
 - Quote filenames with single quotes.
 - Spell strings out; abbreviate only units and universally-known terms (PCB, mm).
+- **Dynamic control availability**: disable controls dynamically with explanatory
+  tooltips when backing files are missing rather than throwing errors at export
+  time. For instance, when exporting from a board file without a matching
+  `.kicad_sch` schematic, disable schematic-dependent controls (`chk_sch_pdf`,
+  `chk_bom`, `chk_bom_mfr_mpn`). When no `.kicad_pcb` exists or 0 outputs are
+  selected, disable `btn_export`.
 
 Custom-painted controls (`_FlatButton`, `_FlatCheckBox`, `_FlatRadioButton`) own
 their painting, so wx gives them nothing for free. Two rules learned the hard

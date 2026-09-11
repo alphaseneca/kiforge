@@ -270,10 +270,10 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertTrue(os.path.isfile(github_workflow_path))
             with open(github_workflow_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-                self.assertIn("output_dir: 'kiforge_test_ci'", content)
-                self.assertIn("export_3d: 'false'", content)
-                self.assertIn("pos_side: 'both'", content)
-                self.assertIn("pos_smd_only: 'true'", content)
+                self.assertIn("output-dir: 'kiforge_test_ci'", content)
+                self.assertIn("export-3d: 'false'", content)
+                self.assertIn("pos-side: 'both'", content)
+                self.assertIn("pos-smd-only: 'true'", content)
                 self.assertIn(kiforge.KIFORGE_ACTION_REF, content)
                 self.assertIn("softprops/action-gh-release@v3", content)
                 self.assertIn("generate_release_notes: true", content)
@@ -285,8 +285,8 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertTrue(os.path.isfile(gitea_workflow_path))
             with open(gitea_workflow_path, 'r', encoding='utf-8') as f:
                 gitea_content = f.read()
-                self.assertIn("output_dir: 'kiforge_test_ci'", gitea_content)
-                self.assertIn("export_3d: 'false'", gitea_content)
+                self.assertIn("output-dir: 'kiforge_test_ci'", gitea_content)
+                self.assertIn("export-3d: 'false'", gitea_content)
                 self.assertIn(
                     f"https://github.com/{kiforge.KIFORGE_ACTION_REF}",
                     gitea_content,

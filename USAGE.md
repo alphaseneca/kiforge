@@ -36,7 +36,7 @@ jobs:
       - name: Run KiForge
         uses: alphaseneca/kiforge@vX.Y.Z
         with:
-          project_path: '.'
+          project-path: '.'
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v3
@@ -52,31 +52,33 @@ jobs:
 ## All Available Inputs
 
 All inputs are optional. Every export is enabled by default. Set an input to `'false'` to disable it.
+Canonical input names are **kebab-case** (matching CLI flags); legacy `snake_case` aliases (`project_path`, `output_dir`, etc.) are supported for backwards compatibility.
 
 | Input | Description | Default |
 |---|---|---|
-| `project_path` | Relative path to your KiCad project directory (containing `.kicad_pro`) | `'.'` |
-| `pcb_file` | Path to specific `.kicad_pcb` board file (e.g. from `.history` or backup) | _(none)_ |
-| `output_dir` | Directory where output files are saved (relative to `project_path`) | `'kiforge'` |
-| `export_gerbers` | Export Gerber layer files (zipped) | `'true'` |
-| `export_drills` | Export drill files (included in Gerber ZIP) | `'true'` |
-| `export_bom` | Export Bill of Materials CSV (KiCad raw + optional JLC copy) | `'true'` |
-| `export_pos` | Export component placement CSV (KiCad raw + optional JLC copy) | `'true'` |
-| `export_sch_pdf` | Export schematic as a PDF | `'true'` |
-| `export_step` | Export STEP 3D model | `'true'` |
-| `export_3d` | Export front & back 3D PNG renders | `'true'` |
-| `export_svg` | Export front & back copper layer SVGs | `'true'` |
-| `export_homebrew_pdf` | Export 1200 DPI homebrew etching & mask PDF (1:1 true scale) | `'true'` |
-| `export_ibom` | Export Interactive HTML BOM | `'true'` |
-| `format_jlc` | Also produce JLC-ready BOM/CPL from KiCad CSV exports | `'true'` |
-| `pos_side` | Placement CSV side: `both`, `front` (top), or `back` (bottom) | `'both'` |
-| `pos_smd_only` | Placement CSV: SMD parts only | `'true'` |
-| `pos_exclude_dnp` | Placement CSV: exclude DNP parts | `'true'` |
-| `step_subst_models` | STEP export: substitute missing 3D models | `'true'` |
-| `bom_include_mfr_mpn` | BOM/iBOM: include Manufacturer & MPN columns | `'true'` |
+| `project-path` | Relative path to your KiCad project directory (containing `.kicad_pro`) | `'.'` |
+| `pcb-file` | Path to specific `.kicad_pcb` board file (e.g. from `.history` or backup) | _(none)_ |
+| `output-dir` | Directory where output files are saved (relative to `project-path`) | `'kiforge'` |
+| `export-gerbers` | Export Gerber layer files (zipped) | `'true'` |
+| `export-drills` | Export drill files (included in Gerber ZIP) | `'true'` |
+| `export-bom` | Export Bill of Materials CSV (KiCad raw + optional JLC copy) | `'true'` |
+| `export-pos` | Export component placement CSV (KiCad raw + optional JLC copy) | `'true'` |
+| `export-sch-pdf` | Export schematic as a PDF | `'true'` |
+| `export-step` | Export STEP 3D model | `'true'` |
+| `export-3d` | Export front & back 3D PNG renders | `'true'` |
+| `export-svg` | Export front & back copper layer SVGs | `'true'` |
+| `export-homebrew-pdf` | Export 1200 DPI homebrew etching & mask PDF (1:1 true scale) | `'true'` |
+| `export-ibom` | Export Interactive HTML BOM | `'true'` |
+| `format-jlc` | Also produce JLC-ready BOM/CPL from KiCad CSV exports | `'true'` |
+| `pos-side` | Placement CSV side: `both`, `front` (top), or `back` (bottom) | `'both'` |
+| `pos-smd-only` | Placement CSV: SMD parts only | `'true'` |
+| `pos-exclude-dnp` | Placement CSV: exclude DNP parts | `'true'` |
+| `step-subst-models` | STEP export: substitute missing 3D models | `'true'` |
+| `bom-include-mfr-mpn` | BOM/iBOM: include Manufacturer & MPN columns | `'true'` |
 | `version` | Override version suffix for output filenames | _(auto from Git tag)_ |
+| `kicad-version` | KiCad Docker image version | `'10.0'` |
 
-> **Export parameters:** The `pos_*`, `step_*`, and `bom_*` inputs map to `export_params` in `.kiforge.json`. Gerber/drill layers and 3D render quality are fixed (`GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`, `RENDER_3D_DEFAULTS`). BOM fields and iBOM grouping mirror `BOM_EXPORT_DEFAULTS` (with Manufacturer and MPN columns toggled on/off dynamically via the `bom_include_mfr_mpn` flag). Raw `*_bom.csv` includes `ID` and `MPN`; JLC copies are produced by `JLCPCBFormatter` when `format_jlc` is on.
+> **Export parameters:** The `pos-*`, `step-*`, and `bom-*` inputs map to `export_params` in `.kiforge.json`. Gerber/drill layers and 3D render quality are fixed (`GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`, `RENDER_3D_DEFAULTS`). BOM fields and iBOM grouping mirror `BOM_EXPORT_DEFAULTS` (with Manufacturer and MPN columns toggled on/off dynamically via the `bom-include-mfr-mpn` flag). Raw `*_bom.csv` includes `ID` and `MPN`; JLC copies are produced by `JLCPCBFormatter` when `format-jlc` is on.
 
 > **3D Model Resolution & Multi-Stage Rendering:** KiForge always sets `KIPRJMOD` to the resolved project directory, so footprints that bundle custom 3D models with the project resolve reliably via `${KIPRJMOD}/<relative-path>` — on every OS, and in CD/Docker where nothing outside the checked-out repo is guaranteed to exist. Separately, KiForge resolves `KICAD10_3DMODEL_DIR` (and the `KISYS3DMOD`/`KICAD{7,8,9}_3DMODEL_DIR` aliases) to KiCad's *official* system 3D library, derived from the running `kicad-cli` binary's own install location — never from a project folder, since standard KiCad footprints depend on that variable pointing at the real library. 3D rendering also employs a multi-stage fallback ladder: if high-quality raytracing (`--preset 2`) fails due to VRML (`.wrl`) mesh parse errors, missing models, or headless environment limits, KiForge automatically falls back to standard rasterization (`--preset 0`) so that complete board renders with all available SMD 3D models are always preserved.
 >
@@ -174,12 +176,12 @@ Exports only what JLCPCB needs to manufacture and assemble your board: Gerbers, 
       - name: Run KiForge
         uses: alphaseneca/kiforge@vX.Y.Z
         with:
-          project_path: '.'
-          export_3d: 'false'
-          export_svg: 'false'
-          export_sch_pdf: 'false'
-          export_step: 'false'
-          export_ibom: 'false'
+          project-path: '.'
+          export-3d: 'false'
+          export-svg: 'false'
+          export-sch-pdf: 'false'
+          export-step: 'false'
+          export-ibom: 'false'
 ```
 
 ---
@@ -192,13 +194,13 @@ Exports the schematic PDF, 3D renders, and SVGs — no fabrication data.
       - name: Run KiForge
         uses: alphaseneca/kiforge@vX.Y.Z
         with:
-          project_path: '.'
-          export_gerbers: 'false'
-          export_drills: 'false'
-          export_bom: 'false'
-          export_pos: 'false'
-          export_step: 'false'
-          export_ibom: 'false'
+          project-path: '.'
+          export-gerbers: 'false'
+          export-drills: 'false'
+          export-bom: 'false'
+          export-pos: 'false'
+          export-step: 'false'
+          export-ibom: 'false'
 ```
 
 ---
@@ -211,13 +213,13 @@ Useful for sharing a reviewable board layout alongside fabrication files.
       - name: Run KiForge
         uses: alphaseneca/kiforge@vX.Y.Z
         with:
-          project_path: '.'
-          export_3d: 'false'
-          export_svg: 'false'
-          export_bom: 'false'
-          export_sch_pdf: 'false'
-          export_pos: 'false'
-          export_step: 'false'
+          project-path: '.'
+          export-3d: 'false'
+          export-svg: 'false'
+          export-bom: 'false'
+          export-sch-pdf: 'false'
+          export-pos: 'false'
+          export-step: 'false'
 ```
 
 ---
@@ -230,8 +232,8 @@ If your KiCad project is not in the repository root:
       - name: Run KiForge
         uses: alphaseneca/kiforge@vX.Y.Z
         with:
-          project_path: 'hardware/my-board'
-          output_dir: 'hardware/my-board/kiforge'
+          project-path: 'hardware/my-board'
+          output-dir: 'hardware/my-board/kiforge'
 ```
 
 ---
@@ -261,8 +263,8 @@ jobs:
       - name: Run KiForge Exporter
         uses: alphaseneca/kiforge@vX.Y.Z
         with:
-          project_path: '.'
-          output_dir: 'kiforge'
+          project-path: '.'
+          output-dir: 'kiforge'
 
       - name: Create GitHub Release and Upload Assets
         uses: softprops/action-gh-release@v3

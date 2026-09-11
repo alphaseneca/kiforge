@@ -187,9 +187,9 @@ class TestKiForgeStudio(unittest.TestCase):
         # Read workflow to verify flags
         with open(workflow_path, 'r', encoding='utf-8') as f:
             yaml_content = f.read()
-            self.assertIn("output_dir: 'kiforge_ci_test'", yaml_content)
-            self.assertIn("export_3d: 'false'", yaml_content)
-            self.assertIn("export_bom: 'true'", yaml_content)
+            self.assertIn("output-dir: 'kiforge_ci_test'", yaml_content)
+            self.assertIn("export-3d: 'false'", yaml_content)
+            self.assertIn("export-bom: 'true'", yaml_content)
             
         # Verify gitignore has been updated
         with open(gitignore_path, 'r', encoding='utf-8') as f:
@@ -1035,6 +1035,76 @@ class TestKiForgeStudio(unittest.TestCase):
         with patch.object(kiforge_studio.KiForgeStudioSettingsDialog, "_check_dependencies_async") as mock_check:
             dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
             mock_check.assert_called_once()
+            dialog.Destroy()
+
+
+    def test_dialog_disables_schematic_controls_when_no_schematic(self):
+        """When a PCB exists but no matching .kicad_sch exists, disable schematic controls."""
+        pcb_path = os.path.join(self.test_dir, "solo_board.kicad_pcb")
+        with open(pcb_path, "w", encoding="utf-8") as f:
+            f.write("(kicad_pcb (version 20240108) (generator kiforge_test))\n")
+
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir, pcb_file=pcb_path)
+        try:
+            self.assertFalse(dialog.chk_sch_pdf.IsEnabled())
+            self.assertFalse(dialog.chk_sch_pdf.GetValue())
+            self.assertIn("no matching .kicad_sch", dialog.chk_sch_pdf.GetToolTipText())
+
+            self.assertFalse(dialog.chk_bom.IsEnabled())
+            self.assertFalse(dialog.chk_bom.GetValue())
+            self.assertIn("no matching .kicad_sch", dialog.chk_bom.GetToolTipText())
+
+            self.assertFalse(dialog.chk_bom_mfr_mpn.IsEnabled())
+            self.assertTrue(dialog.btn_export.IsEnabled())
+        finally:
+            dialog.Destroy()
+
+    def test_dialog_enables_schematic_controls_when_schematic_exists(self):
+        """When both .kicad_pcb and .kicad_sch exist, schematic controls are enabled."""
+        pcb_path = os.path.join(self.test_dir, "paired_board.kicad_pcb")
+        sch_path = os.path.join(self.test_dir, "paired_board.kicad_sch")
+        with open(pcb_path, "w", encoding="utf-8") as f:
+            f.write("(kicad_pcb (version 20240108) (generator kiforge_test))\n")
+        with open(sch_path, "w", encoding="utf-8") as f:
+            f.write("(kicad_sch (version 20240108) (generator kiforge_test))\n")
+
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir, pcb_file=pcb_path)
+        try:
+            self.assertTrue(dialog.chk_sch_pdf.IsEnabled())
+            self.assertTrue(dialog.chk_bom.IsEnabled())
+            self.assertTrue(dialog.chk_bom_mfr_mpn.IsEnabled())
+            self.assertEqual(dialog.chk_sch_pdf.GetToolTipText(), "")
+            self.assertEqual(dialog.chk_bom.GetToolTipText(), "")
+            self.assertTrue(dialog.btn_export.IsEnabled())
+        finally:
+            dialog.Destroy()
+
+    def test_dialog_disables_export_button_when_no_pcb_exists(self):
+        """When no .kicad_pcb exists, the Export button is disabled with descriptive tooltip."""
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            self.assertFalse(dialog.btn_export.IsEnabled())
+            self.assertIn("no .kicad_pcb board file found", dialog.btn_export.GetToolTipText())
+        finally:
+            dialog.Destroy()
+
+    def test_dialog_disables_export_button_when_no_outputs_selected(self):
+        """When PCB exists but 0 outputs are selected, Export button is disabled."""
+        pcb_path = os.path.join(self.test_dir, "test_board.kicad_pcb")
+        with open(pcb_path, "w", encoding="utf-8") as f:
+            f.write("(kicad_pcb (version 20240108) (generator kiforge_test))\n")
+
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir, pcb_file=pcb_path)
+        try:
+            self.assertTrue(dialog.btn_export.IsEnabled())
+            for key in kiforge_studio._EXPORT_TOGGLE_KEYS:
+                chk = getattr(dialog, dialog._export_checkbox_attr(key), None)
+                if chk:
+                    chk.SetValue(False)
+            dialog._sync_export_button_state()
+            self.assertFalse(dialog.btn_export.IsEnabled())
+            self.assertIn("no export outputs selected", dialog.btn_export.GetToolTipText())
+        finally:
             dialog.Destroy()
 
 

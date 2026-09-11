@@ -1972,6 +1972,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self._set_preset_choice(preset_id)
             self._sync_drill_checkbox_state()
             self._sync_svg_pdf_checkbox_state()
+            self._sync_file_availability_state()
             self._update_export_summary()
             self._schedule_cd_sync()
         finally:
@@ -2033,6 +2034,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             summary += " · JLC"
         self._export_summary_text = summary
         self._apply_export_summary()
+        self._sync_export_button_state(bool(enabled))
 
     def _apply_export_summary(self):
         """
@@ -2204,6 +2206,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._set_preset_choice(self._detect_active_preset())
         self._sync_drill_checkbox_state()
         self._sync_svg_pdf_checkbox_state()
+        self._sync_file_availability_state()
         self._update_export_summary()
 
     def _export_param(self, key, default=None):
@@ -2289,6 +2292,118 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self.chk_svg.Disable()
         else:
             self.chk_svg.Enable()
+
+    def _resolve_active_files(self) -> tuple[str | None, str | None]:
+        """Resolve active (.kicad_pcb, .kicad_sch) file paths for current project or pcb_file."""
+        board_file = None
+        sch_file = None
+        if self.pcb_file and os.path.isfile(self.pcb_file):
+            board_file = os.path.abspath(self.pcb_file)
+        elif self.project_dir and os.path.isfile(self.project_dir) and self.project_dir.endswith(".kicad_pcb"):
+            board_file = os.path.abspath(self.project_dir)
+        elif self.project_dir and os.path.isdir(self.project_dir):
+            try:
+                pcb_files = [
+                    os.path.join(self.project_dir, f)
+                    for f in os.listdir(self.project_dir)
+                    if f.endswith(".kicad_pcb") and not f.startswith(".") and not f.startswith("~")
+                ]
+                if pcb_files:
+                    pcb_files.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
+                    board_file = os.path.abspath(pcb_files[0])
+            except OSError:
+                pass
+
+        if board_file:
+            board_dir = os.path.dirname(board_file)
+            base_name = os.path.splitext(os.path.basename(board_file))[0]
+            candidate = os.path.join(board_dir, f"{base_name}.kicad_sch")
+            if os.path.isfile(candidate):
+                sch_file = candidate
+            elif os.path.isdir(board_dir):
+                try:
+                    sch_files = [
+                        os.path.join(board_dir, f)
+                        for f in os.listdir(board_dir)
+                        if f.endswith(".kicad_sch") and not f.startswith(".") and not f.startswith("~")
+                    ]
+                    if sch_files:
+                        sch_files.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
+                        sch_file = os.path.abspath(sch_files[0])
+                except OSError:
+                    pass
+
+        if not sch_file and self.project_dir and os.path.isdir(self.project_dir):
+            try:
+                sch_files = [
+                    os.path.join(self.project_dir, f)
+                    for f in os.listdir(self.project_dir)
+                    if f.endswith(".kicad_sch") and not f.startswith(".") and not f.startswith("~")
+                ]
+                if sch_files:
+                    sch_files.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
+                    sch_file = os.path.abspath(sch_files[0])
+            except OSError:
+                pass
+
+        return board_file, sch_file
+
+    def _sync_file_availability_state(self):
+        """
+        Dynamically enable/disable UI controls based on available files.
+        When schematic is absent, disable schematic-dependent controls (Schematic PDF, BOM).
+        """
+        board_file, sch_file = self._resolve_active_files()
+        has_sch = bool(sch_file and os.path.isfile(sch_file))
+        sch_missing = bool(board_file and not has_sch)
+
+        if hasattr(self, "chk_sch_pdf"):
+            if sch_missing:
+                self.chk_sch_pdf.SetValue(False)
+                self.chk_sch_pdf.Disable()
+                self.chk_sch_pdf.SetToolTip("Disabled: no matching .kicad_sch schematic file found")
+            else:
+                self.chk_sch_pdf.Enable()
+                self.chk_sch_pdf.SetToolTip("")
+
+        if hasattr(self, "chk_bom"):
+            if sch_missing:
+                self.chk_bom.SetValue(False)
+                self.chk_bom.Disable()
+                self.chk_bom.SetToolTip("Disabled: no matching .kicad_sch schematic file found")
+            else:
+                self.chk_bom.Enable()
+                self.chk_bom.SetToolTip("")
+
+        if hasattr(self, "chk_bom_mfr_mpn"):
+            if sch_missing:
+                self.chk_bom_mfr_mpn.Disable()
+            else:
+                self.chk_bom_mfr_mpn.Enable()
+
+        self._sync_export_button_state()
+
+    def _sync_export_button_state(self, has_outputs: bool | None = None):
+        """Enable or disable the Export button based on board file and output selections."""
+        if not hasattr(self, "btn_export"):
+            return
+        board_file, _ = self._resolve_active_files()
+        has_pcb = bool(board_file and os.path.isfile(board_file))
+        if has_outputs is None:
+            has_outputs = any(
+                getattr(self, self._export_checkbox_attr(key)).IsChecked()
+                for key in _EXPORT_TOGGLE_KEYS
+                if hasattr(self, self._export_checkbox_attr(key))
+            )
+        if not has_pcb:
+            self.btn_export.Disable()
+            self.btn_export.SetToolTip("Disabled: no .kicad_pcb board file found")
+        elif not has_outputs:
+            self.btn_export.Disable()
+            self.btn_export.SetToolTip("Disabled: no export outputs selected")
+        else:
+            self.btn_export.Enable()
+            self.btn_export.SetToolTip("")
 
     def on_gerbers_toggled(self, event):
         """Keep drill export aligned with Gerber export requirements."""

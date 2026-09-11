@@ -69,8 +69,8 @@ jobs:
       - name: Run KiForge composite action on sample project
         uses: ./
         with:
-          project_path: tests/sample_project
-          output_dir: kiforge
+          project-path: tests/sample_project
+          output-dir: kiforge
           version: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
 
       - name: Verify export artifacts exist

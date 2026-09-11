@@ -2,8 +2,11 @@
 #
 # Runs the KiCad 10 exporter inside the official kicad/kicad Docker image.
 # Inputs mirror kiforge.py configuration layers:
-#   - export_* toggles  → EXPORT_SETTING_KEYS (what to produce)
-#   - pos_*/step_*/render_* → EXPORT_PARAM_SPECS (kicad-cli parameters)
+#   - export-* toggles      → EXPORT_SETTING_KEYS (what to produce)
+#   - pos-*/step-*/render-* → EXPORT_PARAM_SPECS (kicad-cli parameters)
+#
+# Canonical input names are kebab-case (e.g. project-path, pcb-file, output-dir).
+# Legacy snake_case aliases (e.g. project_path, pcb_file) are preserved for backwards compatibility.
 #
 # action/run.sh maps INPUT_* env vars to the same CLI flags as `python kiforge.py`.
 # See USAGE.md for workflow examples and the full input reference.
@@ -15,90 +18,170 @@ branding:
   color: 'blue'
 
 inputs:
+  project-path:
+    description: 'Relative path to the KiCad project directory (contains .kicad_pro; default: .)'
+    required: false
+    default: ''
   project_path:
-    description: 'Relative path to the KiCad project directory (contains .kicad_pro)'
-    required: true
-    default: '.'
-  pcb_file:
+    description: 'Legacy alias for project-path'
+    required: false
+    default: ''
+  pcb-file:
     description: 'Path to specific .kicad_pcb board file (e.g. from .history or backup)'
     required: false
     default: ''
+  pcb_file:
+    description: 'Legacy alias for pcb-file'
+    required: false
+    default: ''
+  output-dir:
+    description: 'Directory inside the workspace where outputs will be saved (default: kiforge)'
+    required: false
+    default: ''
   output_dir:
-    description: 'Directory inside the workspace where outputs will be saved (relative to project_path)'
+    description: 'Legacy alias for output-dir'
     required: false
-    default: 'kiforge'
+    default: ''
+  export-3d:
+    description: 'Export 3D front/back renders (true/false, default: true)'
+    required: false
+    default: ''
   export_3d:
-    description: 'Export 3D front/back renders (true/false)'
+    description: 'Legacy alias for export-3d'
     required: false
-    default: 'true'
+    default: ''
+  export-svg:
+    description: 'Export copper layer SVGs (true/false, default: true)'
+    required: false
+    default: ''
   export_svg:
-    description: 'Export copper layer SVGs (true/false)'
+    description: 'Legacy alias for export-svg'
     required: false
-    default: 'true'
+    default: ''
+  export-homebrew-pdf:
+    description: 'Export 1200 DPI homebrew etching & mask PDF (true/false, default: true)'
+    required: false
+    default: ''
   export_homebrew_pdf:
-    description: 'Export 1200 DPI homebrew etching & mask PDF (true/false)'
+    description: 'Legacy alias for export-homebrew-pdf'
     required: false
-    default: 'true'
+    default: ''
+  export-bom:
+    description: 'Export Bill of Materials (true/false, default: true)'
+    required: false
+    default: ''
   export_bom:
-    description: 'Export Bill of Materials (true/false)'
+    description: 'Legacy alias for export-bom'
     required: false
-    default: 'true'
+    default: ''
+  export-sch-pdf:
+    description: 'Export schematic PDF (true/false, default: true)'
+    required: false
+    default: ''
   export_sch_pdf:
-    description: 'Export schematic PDF (true/false)'
+    description: 'Legacy alias for export-sch-pdf'
     required: false
-    default: 'true'
+    default: ''
+  export-pos:
+    description: 'Export component placement file (true/false, default: true)'
+    required: false
+    default: ''
   export_pos:
-    description: 'Export component placement file (true/false)'
+    description: 'Legacy alias for export-pos'
     required: false
-    default: 'true'
+    default: ''
+  export-step:
+    description: 'Export STEP 3D model (true/false, default: true)'
+    required: false
+    default: ''
   export_step:
-    description: 'Export STEP 3D model (true/false)'
+    description: 'Legacy alias for export-step'
     required: false
-    default: 'true'
+    default: ''
+  export-gerbers:
+    description: 'Export Gerber files (true/false, default: true)'
+    required: false
+    default: ''
   export_gerbers:
-    description: 'Export Gerber files (true/false)'
+    description: 'Legacy alias for export-gerbers'
     required: false
-    default: 'true'
+    default: ''
+  export-drills:
+    description: 'Export Drill files (true/false, default: true)'
+    required: false
+    default: ''
   export_drills:
-    description: 'Export Drill files (true/false)'
+    description: 'Legacy alias for export-drills'
     required: false
-    default: 'true'
+    default: ''
+  export-ibom:
+    description: 'Export Interactive HTML BOM (true/false, default: true)'
+    required: false
+    default: ''
   export_ibom:
-    description: 'Export Interactive HTML BOM (true/false)'
+    description: 'Legacy alias for export-ibom'
     required: false
-    default: 'true'
+    default: ''
+  format-jlc:
+    description: 'Also produce JLC-ready BOM/CPL from KiCad CSV exports (true/false, default: true)'
+    required: false
+    default: ''
   format_jlc:
-    description: 'Also produce JLC-ready BOM/CPL from KiCad CSV exports (true/false)'
+    description: 'Legacy alias for format-jlc'
     required: false
-    default: 'true'
+    default: ''
+  pos-side:
+    description: 'Placement export side: both, front, or back (default: both)'
+    required: false
+    default: ''
   pos_side:
-    description: 'Placement export side: both, front (top), or back (bottom)'
+    description: 'Legacy alias for pos-side'
     required: false
-    default: 'both'
+    default: ''
+  pos-smd-only:
+    description: 'Placement CSV includes SMD parts only (true/false, default: true)'
+    required: false
+    default: ''
   pos_smd_only:
-    description: 'Placement CSV includes SMD parts only (true/false)'
+    description: 'Legacy alias for pos-smd-only'
     required: false
-    default: 'true'
+    default: ''
+  pos-exclude-dnp:
+    description: 'Exclude DNP parts from placement CSV (true/false, default: true)'
+    required: false
+    default: ''
   pos_exclude_dnp:
-    description: 'Exclude DNP parts from placement CSV (true/false)'
+    description: 'Legacy alias for pos-exclude-dnp'
     required: false
-    default: 'true'
+    default: ''
+  step-subst-models:
+    description: 'STEP export: substitute missing 3D models (true/false, default: true)'
+    required: false
+    default: ''
   step_subst_models:
-    description: 'STEP export: substitute missing 3D models (true/false)'
+    description: 'Legacy alias for step-subst-models'
     required: false
-    default: 'true'
+    default: ''
+  bom-include-mfr-mpn:
+    description: 'BOM/iBOM: include Manufacturer & MPN columns (true/false, default: true)'
+    required: false
+    default: ''
   bom_include_mfr_mpn:
-    description: 'BOM/iBOM: include Manufacturer & MPN columns (true/false)'
+    description: 'Legacy alias for bom-include-mfr-mpn'
     required: false
-    default: 'true'
+    default: ''
   version:
     description: 'Optional version tag override for output filenames (defaults to GITHUB_REF_NAME or v0.1.0)'
     required: false
     default: ''
-  kicad_version:
-    description: 'KiCad Docker image version (minimum supported is 10.0; no upper cap, e.g. 10.0, 11.0, nightly)'
+  kicad-version:
+    description: 'KiCad Docker image version (minimum supported is 10.0; default: 10.0)'
     required: false
-    default: '10.0'
+    default: ''
+  kicad_version:
+    description: 'Legacy alias for kicad-version'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -108,27 +191,27 @@ runs:
       env:
         KIFORGE_ACTION_PATH: ${{ github.action_path }}
         KIFORGE_WORKSPACE: ${{ github.workspace }}
-        INPUT_PROJECT_PATH: ${{ inputs.project_path }}
-        INPUT_PCB_FILE: ${{ inputs.pcb_file }}
-        INPUT_OUTPUT_DIR: ${{ inputs.output_dir }}
-        INPUT_EXPORT_3D: ${{ inputs.export_3d }}
-        INPUT_EXPORT_SVG: ${{ inputs.export_svg }}
-        INPUT_EXPORT_HOMEBREW_PDF: ${{ inputs.export_homebrew_pdf }}
-        INPUT_EXPORT_BOM: ${{ inputs.export_bom }}
-        INPUT_EXPORT_SCH_PDF: ${{ inputs.export_sch_pdf }}
-        INPUT_EXPORT_POS: ${{ inputs.export_pos }}
-        INPUT_EXPORT_STEP: ${{ inputs.export_step }}
-        INPUT_EXPORT_GERBERS: ${{ inputs.export_gerbers }}
-        INPUT_EXPORT_DRILLS: ${{ inputs.export_drills }}
-        INPUT_EXPORT_IBOM: ${{ inputs.export_ibom }}
-        INPUT_FORMAT_JLC: ${{ inputs.format_jlc }}
-        INPUT_POS_SIDE: ${{ inputs.pos_side }}
-        INPUT_POS_SMD_ONLY: ${{ inputs.pos_smd_only }}
-        INPUT_POS_EXCLUDE_DNP: ${{ inputs.pos_exclude_dnp }}
-        INPUT_STEP_SUBST_MODELS: ${{ inputs.step_subst_models }}
-        INPUT_BOM_INCLUDE_MFR_MPN: ${{ inputs.bom_include_mfr_mpn }}
+        INPUT_PROJECT_PATH: ${{ inputs['project-path'] || inputs.project_path }}
+        INPUT_PCB_FILE: ${{ inputs['pcb-file'] || inputs.pcb_file }}
+        INPUT_OUTPUT_DIR: ${{ inputs['output-dir'] || inputs.output_dir }}
+        INPUT_EXPORT_3D: ${{ inputs['export-3d'] || inputs.export_3d }}
+        INPUT_EXPORT_SVG: ${{ inputs['export-svg'] || inputs.export_svg }}
+        INPUT_EXPORT_HOMEBREW_PDF: ${{ inputs['export-homebrew-pdf'] || inputs.export_homebrew_pdf }}
+        INPUT_EXPORT_BOM: ${{ inputs['export-bom'] || inputs.export_bom }}
+        INPUT_EXPORT_SCH_PDF: ${{ inputs['export-sch-pdf'] || inputs.export_sch_pdf }}
+        INPUT_EXPORT_POS: ${{ inputs['export-pos'] || inputs.export_pos }}
+        INPUT_EXPORT_STEP: ${{ inputs['export-step'] || inputs.export_step }}
+        INPUT_EXPORT_GERBERS: ${{ inputs['export-gerbers'] || inputs.export_gerbers }}
+        INPUT_EXPORT_DRILLS: ${{ inputs['export-drills'] || inputs.export_drills }}
+        INPUT_EXPORT_IBOM: ${{ inputs['export-ibom'] || inputs.export_ibom }}
+        INPUT_FORMAT_JLC: ${{ inputs['format-jlc'] || inputs.format_jlc }}
+        INPUT_POS_SIDE: ${{ inputs['pos-side'] || inputs.pos_side }}
+        INPUT_POS_SMD_ONLY: ${{ inputs['pos-smd-only'] || inputs.pos_smd_only }}
+        INPUT_POS_EXCLUDE_DNP: ${{ inputs['pos-exclude-dnp'] || inputs.pos_exclude_dnp }}
+        INPUT_STEP_SUBST_MODELS: ${{ inputs['step-subst-models'] || inputs.step_subst_models }}
+        INPUT_BOM_INCLUDE_MFR_MPN: ${{ inputs['bom-include-mfr-mpn'] || inputs.bom_include_mfr_mpn }}
         INPUT_VERSION: ${{ inputs.version }}
-        INPUT_KICAD_VERSION: ${{ inputs.kicad_version }}
+        INPUT_KICAD_VERSION: ${{ inputs['kicad-version'] || inputs.kicad_version }}
         GITHUB_REF_NAME: ${{ github.ref_name }}
         GITHUB_REF_TYPE: ${{ github.ref_type }}
       run: bash "${{ github.action_path }}/action/run.sh"
