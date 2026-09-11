@@ -695,7 +695,7 @@ class TestKiForgeStudio(unittest.TestCase):
         the environment, not about threading.
         """
         if kiforge.missing_pdf_renderer_packages() and not shutil.which("rsvg-convert"):
-            self.skipTest("no PDF renderer available (Pillow/PyQt6/rsvg-convert all missing)")
+            self.skipTest("no PDF renderer available (Pillow/rsvg-convert all missing)")
 
         front_svg = os.path.join(self.test_dir, "f.svg")
         back_svg = os.path.join(self.test_dir, "b.svg")
@@ -1023,6 +1023,18 @@ class TestKiForgeStudio(unittest.TestCase):
 
             self.assertTrue(dialog._export_close_after_finish)
         finally:
+            dialog.Destroy()
+
+    def test_dialog_accepts_pcb_file(self):
+        pcb_file = os.path.join(self.test_dir, "history_board.kicad_pcb")
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir, pcb_file=pcb_file)
+        self.assertEqual(dialog.pcb_file, pcb_file)
+        dialog.Destroy()
+
+    def test_dialog_launches_background_dependency_check(self):
+        with patch.object(kiforge_studio.KiForgeStudioSettingsDialog, "_check_dependencies_async") as mock_check:
+            dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+            mock_check.assert_called_once()
             dialog.Destroy()
 
 

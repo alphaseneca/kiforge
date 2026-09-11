@@ -1813,7 +1813,7 @@ class ExportContext:
     JLCPCB rotation offsets, and thread-safe cancellation for GUI exports.
     """
     
-    def __init__(self, project_path: str, output_dir_name: str, options: dict, progress_callback=None):
+    def __init__(self, project_path: str, output_dir_name: str, options: dict, progress_callback=None, pcb_file: str | None = None):
         self.project_path = os.path.abspath(project_path)
         self.output_dir_name = output_dir_name
         self.options = options
@@ -1822,7 +1822,7 @@ class ExportContext:
         # Resolved attributes
         self.kicad_cli = None
         self.kicad_python = None
-        self.pcb_file = None
+        self.pcb_file = os.path.abspath(pcb_file) if pcb_file else None
         self.sch_file = None
         self.pcb_name = None
         self.project_dir = None
@@ -1926,6 +1926,27 @@ class ExportContext:
 
     def _discover_project_files(self) -> bool:
         """Walk the project tree to locate .kicad_pcb, .kicad_pro, and schematic files."""
+        if not self.pcb_file and os.path.isfile(self.project_path) and self.project_path.endswith(".kicad_pcb"):
+            self.pcb_file = self.project_path
+
+        if self.pcb_file and os.path.isfile(self.pcb_file):
+            self.pcb_name = os.path.splitext(os.path.basename(self.pcb_file))[0]
+            if not self.project_dir:
+                self.project_dir = os.path.dirname(self.pcb_file)
+            sch_name = f"{self.pcb_name}.kicad_sch"
+            potential_sch = os.path.join(self.project_dir, sch_name)
+            if os.path.isfile(potential_sch):
+                self.sch_file = potential_sch
+            else:
+                try:
+                    for file in sorted(os.listdir(self.project_dir)):
+                        if file.endswith(".kicad_sch"):
+                            self.sch_file = os.path.join(self.project_dir, file)
+                            break
+                except OSError:
+                    pass
+            return True
+
         for root, dirs, files in os.walk(self.project_path):
             dirs[:] = [d for d in dirs if not d.startswith(".") and d != ".history"]
             for file in files:
@@ -3145,7 +3166,7 @@ HOMEBREW_PDF_CLI_TIMEOUT_SEC = 180
 # virtualenv, no --user, no admin. That is the whole reason this exists: telling
 # someone to install a desktop application (or to hand-manage a Python
 # environment inside an .app bundle) to export a PDF is not a real answer.
-PDF_RENDERER_PACKAGES = ("Pillow", "PyQt6")
+PDF_RENDERER_PACKAGES = ("Pillow",)
 PDF_RENDERER_INSTALL_TIMEOUT_SEC = 600
 
 
@@ -3246,7 +3267,7 @@ def missing_pdf_renderer_packages(packages=None, *, python_exe=None) -> list[str
 
     It must be *that* interpreter, not this one. Studio runs inside KiCad's
     bundled Python, but the CLI usually does not, and a developer's system
-    Python very often already has Pillow and PyQt6 while KiCad's has neither.
+    Python very often already has Pillow while KiCad's has neither.
     Checking the running process there would report "nothing missing" and skip
     the install that was the whole point.
     """
@@ -3363,66 +3384,6 @@ def _discard_file(path: str) -> None:
         pass
 
 
-# Holds the sole QGuiApplication this process ever creates. PyQt6 owns the
-# wrapped C++ object by refcount: a QGuiApplication built without keeping a
-# reference is garbage-collected almost immediately, which deletes the C++
-# singleton but leaves QGuiApplication::instance() dangling - later Qt calls
-# (QPainter, QSvgRenderer) then read freed memory and crash the whole
-# interpreter with no Python exception to catch. This module-level slot is
-# what keeps that reference alive for the process lifetime.
-_qt_app_ref = None
-
-
-def _export_pdf_via_qt(svg_paths: list[str], output_pdf_path: str, is_landscape: bool, logger) -> bool:
-    """Tier 1 - true vector PDF through PyQt6's QPdfWriter."""
-    global _qt_app_ref
-    # Qt calls qFatal() (which abort()s the process, uncatchable from Python)
-    # when it cannot open a display, so force the offscreen platform plugin
-    # before QGuiApplication is constructed.
-    # This tier renders to a PDF file and never puts anything on screen, so the
-    # offscreen platform plugin is always the right one -- there is nothing to
-    # detect. Qt would otherwise try to reach a display and terminate the
-    # process when it cannot. setdefault so an explicit QT_QPA_PLATFORM still
-    # wins for anyone who has a reason to choose differently.
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    add_package_dir_to_path()
-    from PyQt6 import QtCore, QtGui, QtSvg
-
-    app = QtGui.QGuiApplication.instance()
-    if app is None:
-        app = QtGui.QGuiApplication([])
-    _qt_app_ref = app  # see module comment above - must outlive this call
-    writer = QtGui.QPdfWriter(output_pdf_path)
-    writer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.PageSizeId.A4))
-    writer.setPageOrientation(
-        QtGui.QPageLayout.Orientation.Landscape if is_landscape
-        else QtGui.QPageLayout.Orientation.Portrait
-    )
-    writer.setResolution(HOMEBREW_PDF_DPI)
-    writer.setPageMargins(QtCore.QMarginsF(0, 0, 0, 0))
-
-    painter = QtGui.QPainter(writer)
-    try:
-        for idx, sp in enumerate(svg_paths):
-            renderer = QtSvg.QSvgRenderer(sp)
-            # An unparsable SVG makes render() a silent no-op, which would
-            # otherwise ship a blank-but-non-empty PDF as a success.
-            if not renderer.isValid():
-                raise ValueError(f"Qt could not parse SVG: {sp}")
-            if idx > 0:
-                writer.newPage()
-            renderer.render(painter)
-    finally:
-        painter.end()
-
-    if os.path.isfile(output_pdf_path) and os.path.getsize(output_pdf_path) > 0:
-        if logger:
-            logger.info(
-                "Exported %d DPI vector PDF (%d page(s)) via PyQt6: %s",
-                HOMEBREW_PDF_DPI, len(svg_paths), output_pdf_path,
-            )
-        return True
-    return False
 
 
 def _export_pdf_via_wx(svg_paths: list[str], output_pdf_path: str, is_landscape: bool, logger) -> bool:
@@ -3521,7 +3482,7 @@ _PDF_WORKER_SRC = (
 
 # How often the parent looks at should_abort() while the worker renders. Small
 # enough that Cancel feels immediate, large enough not to spin a core.
-_QT_PDF_POLL_SEC = 0.2
+_SUBPROCESS_PDF_POLL_SEC = 0.2
 
 
 def _export_pdf_via_subprocess(
@@ -3536,9 +3497,9 @@ def _export_pdf_via_subprocess(
     """
     Run one of the GUI-toolkit PDF tiers out-of-process.
 
-    ``tier_func`` names the in-process tier to run (``_export_pdf_via_qt`` or
-    ``_export_pdf_via_wx``); the worker imports this module and calls it, so
-    each renderer keeps exactly one implementation.
+    ``tier_func`` names the in-process tier to run (``_export_pdf_via_wx``);
+    the worker imports this module and calls it, so each renderer keeps
+    exactly one implementation.
 
     Both toolkits insist on building their application object on the
     process's main thread. In-process that means hijacking the *GUI* thread:
@@ -3570,10 +3531,10 @@ def _export_pdf_via_subprocess(
         return False
 
     try:
-        polls_left = int(HOMEBREW_PDF_CLI_TIMEOUT_SEC / _QT_PDF_POLL_SEC)
+        polls_left = int(HOMEBREW_PDF_CLI_TIMEOUT_SEC / _SUBPROCESS_PDF_POLL_SEC)
         while True:
             try:
-                proc.wait(timeout=_QT_PDF_POLL_SEC)
+                proc.wait(timeout=_SUBPROCESS_PDF_POLL_SEC)
                 break
             except subprocess.TimeoutExpired:
                 if should_abort is not None and should_abort():
@@ -3798,9 +3759,7 @@ def export_svg_to_1200dpi_pdf(
     # and are the only tiers that can block the GUI thread.
     tiers = (
         ("wx+Pillow (subprocess)", _sub("_export_pdf_via_wx"), False),
-        ("PyQt6 (subprocess)", _sub("_export_pdf_via_qt"), False),
         ("wx+Pillow", lambda: _export_pdf_via_wx(svg_paths, output_pdf_path, is_landscape, logger), True),
-        ("PyQt6", lambda: _export_pdf_via_qt(svg_paths, output_pdf_path, is_landscape, logger), True),
         ("CLI converter",
          lambda: _export_pdf_via_cli(svg_paths, output_pdf_path, logger, should_abort), False),
     )
@@ -4025,9 +3984,6 @@ class HomebrewPdfExportTask(ExportTask):
         )
 
         # One package per pip call so the dialog can name the one it is on.
-        # PyQt6 is a ~100 MB download and the only feedback during it is this
-        # label, so "Installing PyQt6 (2 of 2)" beats a single frozen message
-        # covering both.
         base = [py_exe, "-m", "pip", "install", "--disable-pip-version-check"]
         total = len(missing)
         for index, name in enumerate(missing, start=1):
@@ -4038,12 +3994,10 @@ class HomebrewPdfExportTask(ExportTask):
                 context.progress_callback(None, None, f"Installing {name}{step}\u2026")
 
             # Same ladder as install_pdf_renderer, but driven through the
-            # cancellable runner so progress reports and Cancel keep working
-            # during a ~100 MB download. An attempt counts only when the
-            # target interpreter can import the package afterwards: pip exits
-            # 0 on "Requirement already satisfied" even when the files it is
-            # satisfied by are gone, which is what made every export reinstall
-            # the same two packages and still fail to render.
+            # cancellable runner so progress reports and Cancel keep working.
+            # An attempt counts only when the target interpreter can import
+            # the package afterwards: pip exits 0 on "Requirement already satisfied"
+            # even when the files it is satisfied by are gone.
             installed = False
             for flags in pip_install_attempts(py_exe):
                 self._run_subprocess(base + flags + [name], context)
@@ -4609,7 +4563,7 @@ def generate_cd_files(project_dir: str, output_dir_name: str, options: dict) -> 
 generate_ci_files = generate_cd_files
 
 
-def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=True, export_homebrew_pdf=True, export_bom=True, export_sch_pdf=True, export_pos=True, export_step=True, export_gerbers=True, export_drills=True, export_ibom=True, progress_callback=None, context=None):
+def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=True, export_homebrew_pdf=True, export_bom=True, export_sch_pdf=True, export_pos=True, export_step=True, export_gerbers=True, export_drills=True, export_ibom=True, progress_callback=None, context=None, pcb_file=None):
     """
     Main library entry point for CLI, Studio, and CD workflows.
 
@@ -4633,7 +4587,7 @@ def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=Tr
             "export_ibom": export_ibom,
         })
 
-        context = ExportContext(project_path, output_dir, options, progress_callback)
+        context = ExportContext(project_path, output_dir, options, progress_callback, pcb_file=pcb_file)
         if not context.resolve():
             return False
     else:
@@ -4687,6 +4641,13 @@ def parse_cli_args(args=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--project-path", "--project_path", dest="project_path", default=".")
+    parser.add_argument(
+        "--pcb-file",
+        "--pcb_file",
+        dest="pcb_file",
+        default=None,
+        help="Path to specific .kicad_pcb board file (e.g. from history or backup)",
+    )
     parser.add_argument("--output-dir", "--output_dir", dest="output_dir", default="kiforge")
     for key in EXPORT_SETTING_KEYS:
         if key == "generate_cd":
@@ -4806,7 +4767,7 @@ if __name__ == "__main__":
     try:
         options = build_cli_options(args)
         
-        context = ExportContext(args.project_path, args.output_dir, options)
+        context = ExportContext(args.project_path, args.output_dir, options, pcb_file=args.pcb_file)
         if not context.resolve():
             sys.exit(1)
             

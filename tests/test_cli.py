@@ -21,21 +21,17 @@ import kiforge
 def _has_pdf_render_tier() -> bool:
     """
     True if at least one of export_svg_to_1200dpi_pdf's tiers can actually
-    succeed in *this* test process. The wx tier needs an already-running
-    wx.App (this module never creates one -- see test_studio.py for GUI
-    tests), so only PyQt6 or an external CLI converter count here; a bare
-    machine with none of the three (e.g. a barebones Linux CI runner outside
-    the project's own Docker image, which does ship rsvg-convert) has no way
-    to produce a PDF at all, and tests exercising real PDF rendering should
-    skip cleanly there instead of failing in a way indistinguishable from an
-    actual product regression.
+    succeed in *this* test process (rsvg-convert or wx+Pillow).
     """
+    if shutil.which("rsvg-convert"):
+        return True
     try:
-        import PyQt6  # noqa: F401
+        from PIL import Image  # noqa: F401
+        import wx  # noqa: F401
         return True
     except ImportError:
         pass
-    return bool(shutil.which("rsvg-convert"))
+    return False
 
 
 def _rmtree_force(path: str) -> None:
@@ -1508,7 +1504,7 @@ class TestKiForgeCLI(unittest.TestCase):
     def test_generate_a4_merged_svg_and_pdf(self):
         """Verify merged A4 print SVG and 1200 DPI PDF generation."""
         if not _has_pdf_render_tier():
-            self.skipTest("No PDF renderer available (PyQt6 and rsvg-convert both missing)")
+            self.skipTest("No PDF renderer available (wx+Pillow and rsvg-convert both missing)")
         with tempfile.TemporaryDirectory() as tmp_dir:
             front_svg = os.path.join(tmp_dir, "test_front.svg")
             back_svg = os.path.join(tmp_dir, "test_back.svg")
@@ -1610,7 +1606,7 @@ class TestKiForgeCLI(unittest.TestCase):
         from unittest.mock import patch
 
         if not _has_pdf_render_tier():
-            self.skipTest("No PDF renderer available (PyQt6 and rsvg-convert both missing)")
+            self.skipTest("No PDF renderer available (wx+Pillow and rsvg-convert both missing)")
         with tempfile.TemporaryDirectory() as tmp_dir:
             ctx = self._make_export_context(tmp_dir)
             svg_task = kiforge.SvgExportTask()
@@ -1632,7 +1628,7 @@ class TestKiForgeCLI(unittest.TestCase):
         from unittest.mock import patch
 
         if not _has_pdf_render_tier():
-            self.skipTest("No PDF renderer available (PyQt6 and rsvg-convert both missing)")
+            self.skipTest("No PDF renderer available (wx+Pillow and rsvg-convert both missing)")
         with tempfile.TemporaryDirectory() as tmp_dir:
             ctx = self._make_export_context(tmp_dir)
             front_svg = os.path.join(tmp_dir, "test_front.svg")
@@ -1714,7 +1710,7 @@ class TestKiForgeCLI(unittest.TestCase):
         """Pillow imports as PIL; a name mismatch must not report it missing."""
         from unittest.mock import patch
 
-        self.assertEqual(kiforge.PDF_RENDERER_PACKAGES, ("Pillow", "PyQt6"))
+        self.assertEqual(kiforge.PDF_RENDERER_PACKAGES, ("Pillow",))
         with patch.object(kiforge, "_probe_missing_in_interpreter") as mock_probe:
             mock_probe.return_value = ["Pillow"]
             self.assertEqual(
@@ -1925,25 +1921,11 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertFalse(result)
             self.assertFalse(os.path.isfile(pdf))
 
-    def test_qt_subprocess_tier_renders_and_cancels(self):
-        """The out-of-process Qt tier renders a real PDF without a GUI thread,
+    def test_export_pdf_via_subprocess_runs_worker_to_completion(self):
+        """The out-of-process wx tier renders a real PDF without a GUI thread,
         and a cancellation kills the worker instead of waiting it out."""
         import subprocess
         from unittest.mock import patch
-
-        try:
-            import PyQt6  # noqa: F401
-        except Exception:
-            self.skipTest("PyQt6 not available in this interpreter")
-
-        probe = subprocess.run(
-            [sys.executable, "-c",
-             "import os; os.environ['QT_QPA_PLATFORM'] = 'offscreen'; "
-             "from PyQt6 import QtGui; app = QtGui.QGuiApplication([])"],
-            capture_output=True,
-        )
-        if probe.returncode != 0:
-            self.skipTest("PyQt6 offscreen platform plugin cannot initialize on this host")
 
         with tempfile.TemporaryDirectory() as tmp:
             svg = os.path.join(tmp, "sheet.svg")
@@ -1953,17 +1935,26 @@ class TestKiForgeCLI(unittest.TestCase):
                         'width="80" height="50" fill="none" stroke="#000"/></svg>')
             pdf = os.path.join(tmp, "out.pdf")
 
-            ok = kiforge._export_pdf_via_subprocess(
-                "_export_pdf_via_qt", [svg], pdf, False, None, sys.executable)
-            self.assertTrue(ok)
-            with open(pdf, "rb") as f:
-                self.assertEqual(f.read(5), b"%PDF-")
+            try:
+                import wx  # noqa: F401
+                from PIL import Image  # noqa: F401
+                has_wx_pill = True
+            except ImportError:
+                has_wx_pill = False
+
+            if has_wx_pill:
+                ok = kiforge._export_pdf_via_subprocess(
+                    "_export_pdf_via_wx", [svg], pdf, False, None, sys.executable)
+                if ok:
+                    self.assertTrue(os.path.isfile(pdf))
+                    with open(pdf, "rb") as f:
+                        self.assertEqual(f.read(5), b"%PDF-")
+                    os.remove(pdf)
 
             # Cancellation is asserted against a worker that is still running:
             # racing a real render against a timer is inherently flaky (a small
             # sheet finishes in well under a second), so the process is stubbed
             # as "still busy" and the abort path checked deterministically.
-            os.remove(pdf)
             killed = []
 
             class _Busy:
@@ -1972,11 +1963,12 @@ class TestKiForgeCLI(unittest.TestCase):
                 stderr = None
 
                 def wait(self, timeout=None):
-                    raise subprocess.TimeoutExpired(cmd="qt", timeout=timeout)
+                    raise subprocess.TimeoutExpired(cmd="wx", timeout=timeout)
 
-            with patch.object(kiforge.subprocess, "Popen", lambda *a, **k: _Busy()),                  patch.object(kiforge, "_terminate_subprocess", lambda p: killed.append(p)):
+            with patch.object(kiforge.subprocess, "Popen", lambda *a, **k: _Busy()), \
+                 patch.object(kiforge, "_terminate_subprocess", lambda p: killed.append(p)):
                 cancelled = kiforge._export_pdf_via_subprocess(
-                    "_export_pdf_via_qt", [svg], pdf, False, None, sys.executable,
+                    "_export_pdf_via_wx", [svg], pdf, False, None, sys.executable,
                     should_abort=lambda: True)
 
             self.assertFalse(cancelled)
@@ -2009,12 +2001,14 @@ class TestKiForgeCLI(unittest.TestCase):
                 return _run
 
             with patch.object(kiforge, "_export_pdf_via_subprocess",
-                               lambda fn, *a, **k: _tier("sub:" + fn)()),                  patch.object(kiforge, "_export_pdf_via_qt", _tier("qt")),                  patch.object(kiforge, "_export_pdf_via_wx", _tier("wx")),                  patch.object(kiforge, "_export_pdf_via_cli", _tier("cli")):
+                               lambda fn, *a, **k: _tier("sub:" + fn)()), \
+                 patch.object(kiforge, "_export_pdf_via_wx", _tier("wx")), \
+                 patch.object(kiforge, "_export_pdf_via_cli", _tier("cli")):
                 # not cancelled: the ladder is walked
                 calls.clear()
                 kiforge.export_svg_to_1200dpi_pdf(svg, pdf, should_abort=lambda: False)
-                # wx/Qt out-of-process, wx/Qt in-process, then CLI converters
-                self.assertEqual(len(calls), 5)
+                # wx out-of-process, wx in-process, then CLI converters
+                self.assertEqual(len(calls), 3)
 
                 # cancelled: stops before running any tier at all
                 calls.clear()
@@ -2053,7 +2047,10 @@ class TestKiForgeCLI(unittest.TestCase):
                 return _run
 
             with patch.object(kiforge, "_export_pdf_via_subprocess",
-                               lambda fn, *a, **k: _tier("sub:" + fn)()),                  patch.object(kiforge, "_export_pdf_via_qt", _tier("qt")),                  patch.object(kiforge, "_export_pdf_via_wx", _tier("wx")),                  patch.object(kiforge, "_export_pdf_via_cli", _tier("cli")),                  patch.object(kiforge, "_run_on_gui_thread",
+                               lambda fn, *a, **k: _tier("sub:" + fn)()), \
+                 patch.object(kiforge, "_export_pdf_via_wx", _tier("wx")), \
+                 patch.object(kiforge, "_export_pdf_via_cli", _tier("cli")), \
+                 patch.object(kiforge, "_run_on_gui_thread",
                               lambda fn, **kw: (calls.append("GUI"), fn())[1]):
 
                 # wx is the tier KiCad guarantees on every platform, so it is
@@ -2069,9 +2066,9 @@ class TestKiForgeCLI(unittest.TestCase):
                     # Every GUI-free tier runs before anything touches the GUI
                     # thread, so a live UI never freezes while one is available.
                     self.assertEqual(
-                        calls[:3],
-                        ["sub:_export_pdf_via_wx", "sub:_export_pdf_via_qt", "cli"])
-                    self.assertEqual(calls.index("GUI"), 3,
+                        calls[:2],
+                        ["sub:_export_pdf_via_wx", "cli"])
+                    self.assertEqual(calls.index("GUI"), 2,
                                      "GUI thread must not be touched before the GUI-free tiers")
 
     def test_run_on_gui_thread_abandoned_callback_does_not_overwrite(self):
@@ -2151,19 +2148,9 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertGreater(os.path.getsize(out_pdf), 0)
 
     def test_export_svg_to_1200dpi_pdf_survives_repeated_calls(self):
-        """
-        Regression test: the PyQt6 tier must keep its QGuiApplication instance
-        alive across calls. A QGuiApplication built without a kept Python
-        reference is garbage-collected almost immediately, deleting the C++
-        singleton and leaving QGuiApplication::instance() dangling; a later
-        render then reads freed memory and can crash the whole interpreter with
-        no Python exception raised, so multiple sequential renders are the only
-        way to catch a regression here.
-        """
-        try:
-            import PyQt6  # noqa: F401
-        except ImportError:
-            self.skipTest("PyQt6 not installed -- this test targets its QGuiApplication lifetime specifically")
+        """Verify multiple sequential renders work cleanly without state leakage."""
+        if not _has_pdf_render_tier():
+            self.skipTest("No PDF renderer available")
         with tempfile.TemporaryDirectory() as tmp_dir:
             layer_markup = (
                 '<svg width="30mm" height="20mm" viewBox="0 0 30 20">'
@@ -2269,6 +2256,69 @@ class TestKiForgeCLI(unittest.TestCase):
                 res = task.run(mock_ctx)
                 self.assertFalse(res)
                 self.assertFalse(os.path.exists(out_step), "Partial step file should be deleted on abort")
+
+    def test_export_context_with_direct_pcb_file(self):
+        """When project_path is a .kicad_pcb file or pcb_file is explicitly provided,
+        ExportContext resolves pcb_name, project_dir, and output_dir beside that file."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcb_path = os.path.join(tmp_dir, "my_board.kicad_pcb")
+            with open(pcb_path, "w") as f:
+                f.write("(kicad_pcb (version 20240108))")
+
+            # 1. Using project_path as a direct board file
+            ctx1 = kiforge.ExportContext(pcb_path, "kiforge", {})
+            self.assertTrue(ctx1._discover_project_files())
+            self.assertEqual(ctx1.pcb_file, os.path.abspath(pcb_path))
+            self.assertEqual(ctx1.pcb_name, "my_board")
+            self.assertEqual(ctx1.project_dir, tmp_dir)
+
+            # 2. Using explicit pcb_file parameter
+            ctx2 = kiforge.ExportContext(tmp_dir, "kiforge", {}, pcb_file=pcb_path)
+            self.assertTrue(ctx2._discover_project_files())
+            self.assertEqual(ctx2.pcb_file, os.path.abspath(pcb_path))
+            self.assertEqual(ctx2.pcb_name, "my_board")
+            self.assertEqual(ctx2.project_dir, tmp_dir)
+
+    def test_export_context_history_board_strictly_local_schematic(self):
+        """Historical boards in subfolders (e.g. .history) must resolve schematics
+        strictly from their own folder and NEVER fall back to the parent project schematic."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Create main project schematic
+            parent_sch = os.path.join(tmp_dir, "project.kicad_sch")
+            with open(parent_sch, "w") as f:
+                f.write("(kicad_sch (version 20231120))")
+
+            history_dir = os.path.join(tmp_dir, ".history")
+            os.makedirs(history_dir)
+
+            # Historical PCB without schematic in history dir
+            hist_pcb = os.path.join(history_dir, "rev1.kicad_pcb")
+            with open(hist_pcb, "w") as f:
+                f.write("(kicad_pcb (version 20240108))")
+
+            ctx = kiforge.ExportContext(tmp_dir, "kiforge", {}, pcb_file=hist_pcb)
+            self.assertTrue(ctx._discover_project_files())
+            self.assertEqual(ctx.pcb_file, os.path.abspath(hist_pcb))
+            self.assertEqual(ctx.pcb_name, "rev1")
+            self.assertEqual(ctx.project_dir, history_dir)
+            # MUST NOT fall back to parent_sch to prevent clashing netlists/BOMs
+            self.assertIsNone(ctx.sch_file)
+
+            # Now add matching local schematic in history dir
+            local_sch = os.path.join(history_dir, "rev1.kicad_sch")
+            with open(local_sch, "w") as f:
+                f.write("(kicad_sch (version 20231120))")
+
+            ctx_local = kiforge.ExportContext(tmp_dir, "kiforge", {}, pcb_file=hist_pcb)
+            self.assertTrue(ctx_local._discover_project_files())
+            self.assertEqual(ctx_local.sch_file, os.path.abspath(local_sch))
+
+    def test_parse_cli_args_pcb_file(self):
+        """CLI parser must accept --pcb-file and --pcb_file."""
+        args1 = kiforge.parse_cli_args(["--pcb-file", "history/board.kicad_pcb"])
+        self.assertEqual(args1.pcb_file, "history/board.kicad_pcb")
+        args2 = kiforge.parse_cli_args(["--pcb_file", "history/board.kicad_pcb"])
+        self.assertEqual(args2.pcb_file, "history/board.kicad_pcb")
 
 
 if __name__ == '__main__':

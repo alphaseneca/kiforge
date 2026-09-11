@@ -1435,13 +1435,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     ``wx.Timer``.
     """
     
-    def __init__(self, parent, project_dir=None):
+    def __init__(self, parent, project_dir=None, pcb_file=None):
         """
         Initializes the settings dialog window.
         
         Args:
             parent: The parent wxWindow or None if running standalone.
             project_dir (str, optional): Pre-resolved project root folder.
+            pcb_file (str, optional): Path to active .kicad_pcb board file.
         """
         super(KiForgeStudioSettingsDialog, self).__init__(
             parent, 
@@ -1454,6 +1455,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         refresh_palette()
         self.Bind(wx.EVT_SYS_COLOUR_CHANGED, self._on_system_colour_changed)
         self.project_dir = project_dir
+        self.pcb_file = pcb_file
         self.settings = kiforge.load_merged_settings(project_dir)
         self._export_timer = None
         self._export_state = None
@@ -1490,6 +1492,29 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._poll_export_progress, self._export_timer)
         self.Bind(wx.EVT_CLOSE, self.on_window_close)
+        self._check_dependencies_async()
+
+    def _check_dependencies_async(self):
+        """Check and install missing PDF renderer dependencies (Pillow) in the background."""
+        def worker():
+            try:
+                target_python = kiforge.PathResolver.get_kicad_python_path()
+                if not target_python or not os.path.isfile(target_python):
+                    return
+                missing = kiforge.missing_pdf_renderer_packages(python_exe=target_python)
+                if not missing:
+                    logger.debug("PDF renderer requirements (Pillow) already satisfied.")
+                    return
+                logger.info("Background installing missing PDF renderer packages: %s...", missing)
+                ok, msg = kiforge.install_pdf_renderer(missing, python_exe=target_python, log=logger)
+                if ok:
+                    logger.info("Background installation of Pillow succeeded.")
+                else:
+                    logger.warning("Background installation of Pillow failed: %s", msg)
+            except Exception as exc:
+                logger.debug("Error in background dependency check: %s", exc)
+
+        threading.Thread(target=worker, daemon=True, name="kiforge-dep-check").start()
 
     def on_window_close(self, event):
         """Handle title-bar close while an export may still be running."""
@@ -2290,6 +2315,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             and project_dir != self._settings_project_dir
         ):
             self.project_dir = project_dir
+            if self.pcb_file and not os.path.abspath(self.pcb_file).startswith(os.path.abspath(project_dir)):
+                self.pcb_file = None
             self._reload_settings(project_dir)
             self._settings_project_dir = project_dir
 
@@ -2309,6 +2336,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             chosen_dir = dlg.GetPath()
             self.txt_project_dir.SetValue(chosen_dir)
             self.project_dir = chosen_dir
+            if self.pcb_file and not os.path.abspath(self.pcb_file).startswith(os.path.abspath(chosen_dir)):
+                self.pcb_file = None
             self._reload_settings(chosen_dir)
             self._settings_project_dir = chosen_dir
         dlg.Destroy()
@@ -2419,7 +2448,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 state["msg"] = message
             return not state.get("cancelled")
 
-        context = kiforge.ExportContext(project_dir, output_dir_name, export_flags, progress_callback)
+        context = kiforge.ExportContext(
+            project_dir,
+            output_dir_name,
+            export_flags,
+            progress_callback,
+            pcb_file=self.pcb_file,
+        )
         if not context.resolve():
             _message_box(
                 "Failed to resolve project files or KiCad executables.",
@@ -2703,19 +2738,26 @@ class ExporterPlugin(_PluginBase):
         logger.info("KiForge Studio action plugin invoked.")
 
         project_dir = None
+        board_file = None
         try:
-            board = pcbnew.GetBoard()
+            board = pcbnew.GetBoard() if has_pcbnew else None
             if board:
                 board_file = board.GetFileName()
                 if board_file and board_file.endswith(".kicad_pcb"):
+                    board_dir = os.path.dirname(board_file)
                     pro_file = board_file.replace(".kicad_pcb", ".kicad_pro")
                     if os.path.isfile(pro_file):
                         project_dir = os.path.dirname(pro_file)
                     else:
-                        temp_dir = os.path.dirname(board_file)
-                        pro_files = [f for f in os.listdir(temp_dir) if f.endswith(".kicad_pro")]
+                        pro_files = [f for f in os.listdir(board_dir) if f.endswith(".kicad_pro")]
                         if pro_files:
-                            project_dir = temp_dir
+                            project_dir = board_dir
+                        else:
+                            parent = os.path.dirname(board_dir)
+                            if os.path.isdir(parent) and any(f.endswith(".kicad_pro") for f in os.listdir(parent)):
+                                project_dir = parent
+                            else:
+                                project_dir = board_dir
         except Exception as e:
             logger.debug(f"Failed to resolve board filename from pcbnew context: {e}")
 
@@ -2729,7 +2771,7 @@ class ExporterPlugin(_PluginBase):
 
         dialog = None
         try:
-            dialog = KiForgeStudioSettingsDialog(parent_window, project_dir)
+            dialog = KiForgeStudioSettingsDialog(parent_window, project_dir, pcb_file=board_file)
             dialog.ShowModal()
         except Exception as exc:
             logger.exception("KiForge Studio dialog failed to open.")

@@ -319,17 +319,17 @@ When export-parameter flags are omitted, KiForge merges defaults with project/gl
 
 ## Homebrew PDF renderers
 
-On your own machine the homebrew PDF needs **Pillow** and/or **PyQt6** — nothing
-else. wxPython always ships with KiCad, so wx + Pillow is the usual path, and
-PyQt6 adds a true-vector tier. A stock KiCad install has neither, which is why a
-fresh machine has no working tier at all.
+On your own machine the homebrew PDF needs **Pillow** — nothing
+else. wxPython always ships with KiCad, so wx + Pillow is the standard path.
+A stock KiCad install does not include Pillow, which is why a fresh install
+needs it added.
 
 `rsvg-convert` is **not** something you install. It is the last-resort tier for
-the headless Docker container the GitHub Action runs in, where Pillow and PyQt6
-are absent and wx has no display to open. On a desktop it is never reached.
+the headless Docker container the GitHub Action runs in, where Pillow is absent
+and wx has no display to open. On a desktop it is never reached.
 
 KiCad ships its own `pip`, and its `site-packages` is writable on a normal
-install, so both can be added to the exact interpreter KiCad renders with — no
+install, so Pillow can be added to the exact interpreter KiCad renders with — no
 virtualenv, no `--user`, no administrator rights:
 
 ```bash
