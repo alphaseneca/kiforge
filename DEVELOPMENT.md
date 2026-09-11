@@ -86,10 +86,11 @@ python3 tests/kicad_runtime_stub.py
 standard library plus `wx` and `pcbnew`, and those two come from KiCad itself —
 they cannot be installed from PyPI. `pcbnew` is not published there at all, and
 KiCad compiles its own wxWidgets, so a PyPI `wxPython` would be ABI-mismatched
-with the running KiCad rather than a working substitute. `PIL` is an
-optional PDF-rendering dependency, imported lazily inside the functions that use it
-and falling back when absent. That is why the compatibility problem is solved by
-supporting the whole interpreter range rather than by installing anything.
+with the running KiCad rather than a working substitute. `Pillow` is
+the dependency required for PDF rendering, which KiForge manages and installs
+automatically into KiCad's bundled Python on startup or via CLI bootstrap.
+That is why the compatibility problem is solved by supporting the whole
+interpreter range rather than manual environment setup.
 
 ```bash
 pip install ruff==0.16.6 && ruff check .

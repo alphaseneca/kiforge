@@ -3149,7 +3149,7 @@ HOMEBREW_PDF_RASTER_DPI_LADDER = (1200, 600)
 # accepts multiple input files and emits one page per file for PDF output (so it
 # is the only converter usable for the oversized-board multi-page fallback), and
 # it is the one PDF tier that works inside the shipped Docker Action image (no
-# PyQt6, no wx.App there) -- see the Dockerfile's librsvg2-bin.
+# wx.App there) -- see the Dockerfile's librsvg2-bin.
 #
 # Inkscape was deliberately dropped: it is a full desktop application, not a
 # converter, and expecting users to install one to export a PDF is not a
@@ -3709,7 +3709,7 @@ def export_svg_to_1200dpi_pdf(
     Render SVG file(s) into a true 1:1 scale 1200 DPI vector / high-res PDF.
 
     Accepts either a single SVG file path (1-page PDF) or a list of SVG paths
-    (multi-page PDF). Tiers are tried in order - PyQt6 vector, wxPython raster,
+    (multi-page PDF). Tiers are tried in order - wxPython + Pillow raster,
     then external CLI converters - and each tier removes its own partial output
     so a later tier (or the caller) never sees a half-written PDF.
 
@@ -3749,9 +3749,8 @@ def export_svg_to_1200dpi_pdf(
     #        some installs would get.
     #   CLI  rsvg-convert is common on Linux, absent as often as not
     #        elsewhere -- an upgrade when present, never depended on.
-    #   Qt   PyQt6 is not part of KiCad on any platform; it is available when
-    #        installed into KiCad's own interpreter (see install_pdf_renderer)
-    #        or when running under a system Python that has it (CLI/CD).
+    #   Pillow  Pillow is automatically installed into KiCad's Python if missing
+    #           (see install_pdf_renderer) and used by wxPython for raster PDF export.
     #
     # Every GUI-toolkit renderer is offered out-of-process first; the
     # in-process variants stay as a last resort for hosts where spawning the
@@ -3953,7 +3952,7 @@ class HomebrewPdfExportTask(ExportTask):
         """
         Install the PDF renderers on demand, the way iBOM installs its own.
 
-        KiCad ships neither Pillow nor PyQt6, and PCM has no way to declare or
+        KiCad does not ship Pillow, and PCM has no way to declare or
         install dependencies -- an addon package is a plain zip that KiCad
         extracts, with no install script and no hook (see the KiCad addon
         specification). The earliest code KiCad runs is this plugin's
