@@ -141,12 +141,8 @@ def setup_logger(output_dir=None):
     logger = logging.getLogger("KiForge")
     logger.setLevel(logging.DEBUG)
     
-    # Remove existing FileHandlers if the output_dir is specified (so we can redirect to the new path)
-    if output_dir:
-        for handler in list(logger.handlers):
-            if isinstance(handler, logging.FileHandler):
-                logger.removeHandler(handler)
-                handler.close()
+    # Remove existing FileHandlers if redirecting to a new path or resetting
+    close_file_handlers()
     
     # Check if console and file handlers already exist
     has_console = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in logger.handlers)
@@ -178,6 +174,20 @@ def setup_logger(output_dir=None):
             logging.warning(f"Could not create log file: {e}")
             
     return logger
+
+
+def close_file_handlers() -> None:
+    """Close and detach all file handlers attached to KiForge loggers."""
+    for name in ("KiForge", "KiForge.Core"):
+        log = logging.getLogger(name)
+        for handler in list(log.handlers):
+            if isinstance(handler, logging.FileHandler):
+                log.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+
 
 logger = logging.getLogger("KiForge.Core")
 
@@ -4571,15 +4581,7 @@ class ExportRunner:
                     try:
                         remaining = os.listdir(output_dir)
                         if not remaining or remaining == ["kiforge.log"]:
-                            logger = getattr(self.context, "logger", None)
-                            if logger:
-                                for h in list(logger.handlers):
-                                    if isinstance(h, logging.FileHandler):
-                                        try:
-                                            h.close()
-                                        except Exception:
-                                            pass
-                                        logger.removeHandler(h)
+                            close_file_handlers()
                             shutil.rmtree(output_dir, ignore_errors=True)
                     except OSError:
                         pass

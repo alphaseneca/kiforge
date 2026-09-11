@@ -63,6 +63,10 @@ def _without_github_actions_tag_env():
 
 
 class TestKiForgeCLI(unittest.TestCase):
+    def tearDown(self):
+        super().tearDown()
+        kiforge.close_file_handlers()
+
     def test_default_arguments(self):
         """Verify default values are correctly parsed when no arguments are provided."""
         args = kiforge.parse_cli_args([])
@@ -2390,50 +2394,53 @@ class TestKiForgeCLI(unittest.TestCase):
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            src_proj = os.path.join(os.path.dirname(__file__), "sample_project")
-            history_dir = os.path.join(tmp_dir, ".history")
-            os.makedirs(history_dir)
+            try:
+                src_proj = os.path.join(os.path.dirname(__file__), "sample_project")
+                history_dir = os.path.join(tmp_dir, ".history")
+                os.makedirs(history_dir)
 
-            hist_pcb = os.path.join(history_dir, "sample-rev1.kicad_pcb")
-            hist_sch = os.path.join(history_dir, "sample-rev1.kicad_sch")
-            root_pcb = os.path.join(tmp_dir, "sample.kicad_pcb")
-            root_sch = os.path.join(tmp_dir, "sample.kicad_sch")
-            root_pro = os.path.join(tmp_dir, "sample.kicad_pro")
+                hist_pcb = os.path.join(history_dir, "sample-rev1.kicad_pcb")
+                hist_sch = os.path.join(history_dir, "sample-rev1.kicad_sch")
+                root_pcb = os.path.join(tmp_dir, "sample.kicad_pcb")
+                root_sch = os.path.join(tmp_dir, "sample.kicad_sch")
+                root_pro = os.path.join(tmp_dir, "sample.kicad_pro")
 
-            shutil.copy2(os.path.join(src_proj, "sample.kicad_pcb"), hist_pcb)
-            shutil.copy2(os.path.join(src_proj, "sample.kicad_sch"), hist_sch)
-            shutil.copy2(os.path.join(src_proj, "sample.kicad_pcb"), root_pcb)
-            shutil.copy2(os.path.join(src_proj, "sample.kicad_sch"), root_sch)
-            shutil.copy2(os.path.join(src_proj, "sample.kicad_pro"), root_pro)
+                shutil.copy2(os.path.join(src_proj, "sample.kicad_pcb"), hist_pcb)
+                shutil.copy2(os.path.join(src_proj, "sample.kicad_sch"), hist_sch)
+                shutil.copy2(os.path.join(src_proj, "sample.kicad_pcb"), root_pcb)
+                shutil.copy2(os.path.join(src_proj, "sample.kicad_sch"), root_sch)
+                shutil.copy2(os.path.join(src_proj, "sample.kicad_pro"), root_pro)
 
-            ctx = kiforge.ExportContext(
-                tmp_dir,
-                "kiforge",
-                {"export_bom": True, "generate_cd": False},
-                pcb_file=hist_pcb,
-            )
-            self.assertTrue(ctx.resolve())
-            self.assertEqual(ctx.project_dir, history_dir)
-            self.assertEqual(ctx.pcb_file, os.path.abspath(hist_pcb))
-            self.assertEqual(ctx.sch_file, os.path.abspath(hist_sch))
-            self.assertEqual(ctx.output_dir, os.path.join(history_dir, "kiforge"))
+                ctx = kiforge.ExportContext(
+                    tmp_dir,
+                    "kiforge",
+                    {"export_bom": True, "generate_cd": False},
+                    pcb_file=hist_pcb,
+                )
+                self.assertTrue(ctx.resolve())
+                self.assertEqual(ctx.project_dir, history_dir)
+                self.assertEqual(ctx.pcb_file, os.path.abspath(hist_pcb))
+                self.assertEqual(ctx.sch_file, os.path.abspath(hist_sch))
+                self.assertEqual(ctx.output_dir, os.path.join(history_dir, "kiforge"))
 
-            real_cli = kiforge.get_kicad_cli_path()
-            if real_cli and os.path.isfile(real_cli):
-                runner = kiforge.ExportRunner(ctx)
-                res = runner.execute()
-                self.assertTrue(res)
-            else:
-                with patch.object(kiforge.ExportRunner, "_is_applicable", return_value=False):
+                real_cli = kiforge.get_kicad_cli_path()
+                if real_cli and os.path.isfile(real_cli):
                     runner = kiforge.ExportRunner(ctx)
-                    os.makedirs(ctx.output_dir, exist_ok=True)
-                    with open(os.path.join(ctx.output_dir, "mock_output.csv"), "w") as f:
-                        f.write("mock")
-                    self.assertTrue(runner.execute())
+                    res = runner.execute()
+                    self.assertTrue(res)
+                else:
+                    with patch.object(kiforge.ExportRunner, "_is_applicable", return_value=False):
+                        runner = kiforge.ExportRunner(ctx)
+                        os.makedirs(ctx.output_dir, exist_ok=True)
+                        with open(os.path.join(ctx.output_dir, "mock_output.csv"), "w") as f:
+                            f.write("mock")
+                        self.assertTrue(runner.execute())
 
-            self.assertTrue(os.path.isdir(ctx.output_dir))
-            # Root directory kiforge must NOT exist
-            self.assertFalse(os.path.exists(os.path.join(tmp_dir, "kiforge")))
+                self.assertTrue(os.path.isdir(ctx.output_dir))
+                # Root directory kiforge must NOT exist
+                self.assertFalse(os.path.exists(os.path.join(tmp_dir, "kiforge")))
+            finally:
+                kiforge.close_file_handlers()
 
 
 if __name__ == '__main__':
