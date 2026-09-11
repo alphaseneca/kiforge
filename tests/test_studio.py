@@ -1107,6 +1107,31 @@ class TestKiForgeStudio(unittest.TestCase):
         finally:
             dialog.Destroy()
 
+    def test_dialog_disables_export_button_while_export_running(self):
+        """Export button must stay disabled when an export is running, even if toggles change."""
+        pcb_path = os.path.join(self.test_dir, "test_board.kicad_pcb")
+        with open(pcb_path, "w", encoding="utf-8") as f:
+            f.write("(kicad_pcb (version 20240108) (generator kiforge_test))\n")
+
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir, pcb_file=pcb_path)
+        try:
+            self.assertTrue(dialog.btn_export.IsEnabled())
+            dialog._export_running = True
+            dialog._sync_export_button_state()
+            self.assertFalse(dialog.btn_export.IsEnabled())
+            self.assertEqual(dialog.btn_export.GetToolTipText(), "Export in progress...")
+
+            dialog.chk_gerbers.SetValue(False)
+            dialog._sync_export_button_state()
+            self.assertFalse(dialog.btn_export.IsEnabled())
+            self.assertEqual(dialog.btn_export.GetToolTipText(), "Export in progress...")
+
+            dialog._export_running = False
+            dialog._sync_export_button_state()
+            self.assertTrue(dialog.btn_export.IsEnabled())
+        finally:
+            dialog.Destroy()
+
 
 class TestStudioPalette(unittest.TestCase):
     """

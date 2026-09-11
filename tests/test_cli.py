@@ -2257,6 +2257,70 @@ class TestKiForgeCLI(unittest.TestCase):
                 self.assertFalse(res)
                 self.assertFalse(os.path.exists(out_step), "Partial step file should be deleted on abort")
 
+    def test_abort_cleanup_intermediate_and_created_files(self):
+        """Verify aborted exports clean intermediate mid-files and new artifacts while preserving pre-existing files."""
+        from unittest.mock import MagicMock
+        import logging
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_dir = os.path.join(tmp_dir, "export_out")
+            os.makedirs(out_dir, exist_ok=True)
+            pre_existing = os.path.join(out_dir, "existing_file.zip")
+            with open(pre_existing, "w") as f:
+                f.write("prior")
+
+            # Intermediate mid-files and a partial artifact written during the run
+            raw_bom = os.path.join(out_dir, "raw_bom.csv")
+            with open(raw_bom, "w") as f:
+                f.write("Ref,Value\nR1,10k\n")
+            raw_pos = os.path.join(out_dir, "raw_pos.csv")
+            with open(raw_pos, "w") as f:
+                f.write("Ref,PosX\nR1,10.0\n")
+            new_artifact = os.path.join(out_dir, "board_sch.pdf")
+            with open(new_artifact, "w") as f:
+                f.write("%PDF-partial")
+
+            mock_ctx = MagicMock()
+            mock_ctx.is_aborted.return_value = True
+            mock_ctx.output_dir = out_dir
+            mock_ctx.pcb_name = "board"
+            mock_ctx.temp_gerber_dir = None
+            mock_ctx._output_dir_existed_prior = True
+            mock_ctx._initial_output_files = {"existing_file.zip"}
+
+            runner = kiforge.ExportRunner(mock_ctx)
+            runner._cleanup_temp_dirs()
+
+            self.assertTrue(os.path.exists(pre_existing), "Pre-existing files must be preserved")
+            self.assertFalse(os.path.exists(raw_bom), "raw_bom.csv must be discarded on abort")
+            self.assertFalse(os.path.exists(raw_pos), "raw_pos.csv must be discarded on abort")
+            self.assertFalse(os.path.exists(new_artifact), "Newly created artifacts must be discarded on abort")
+
+        # Scenario: newly created directory with only log and intermediate file is pruned on abort
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_dir = os.path.join(tmp_dir, "new_out")
+            os.makedirs(out_dir, exist_ok=True)
+            log_path = os.path.join(out_dir, "kiforge.log")
+            with open(log_path, "w") as f:
+                f.write("log")
+            raw_bom = os.path.join(out_dir, "raw_bom.csv")
+            with open(raw_bom, "w") as f:
+                f.write("Ref,Value\n")
+
+            mock_ctx = MagicMock()
+            mock_ctx.is_aborted.return_value = True
+            mock_ctx.output_dir = out_dir
+            mock_ctx.pcb_name = "board"
+            mock_ctx.temp_gerber_dir = None
+            mock_ctx._output_dir_existed_prior = False
+            mock_ctx._initial_output_files = set()
+            mock_ctx.logger = logging.getLogger("test_abort_cleaner")
+
+            runner = kiforge.ExportRunner(mock_ctx)
+            runner._cleanup_temp_dirs()
+
+            self.assertFalse(os.path.exists(out_dir), "Newly created output dir should be pruned on abort")
+
     def test_export_context_with_direct_pcb_file(self):
         """When project_path is a .kicad_pcb file or pcb_file is explicitly provided,
         ExportContext resolves pcb_name, project_dir, and output_dir beside that file."""

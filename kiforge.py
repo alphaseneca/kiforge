@@ -1838,6 +1838,8 @@ class ExportContext:
         self.rotation_offsets = {}
         self.version_str = None
         self.warnings: list[str] = []
+        self._output_dir_existed_prior = False
+        self._initial_output_files = set()
         # Populated by SvgExportTask.run() when it plots the copper layers, so
         # HomebrewPdfExportTask can reuse that work instead of re-plotting and
         # re-merging the same sheet a second time. See export_copper_layers().
@@ -2011,6 +2013,14 @@ class ExportContext:
             self.output_dir = self.output_dir_name
         else:
             self.output_dir = os.path.join(self.project_dir, self.output_dir_name)
+        self._output_dir_existed_prior = os.path.isdir(self.output_dir)
+        if self._output_dir_existed_prior:
+            try:
+                self._initial_output_files = set(os.listdir(self.output_dir))
+            except OSError:
+                self._initial_output_files = set()
+        else:
+            self._initial_output_files = set()
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.temp_gerber_dir = os.path.join(self.output_dir, "temp_gerbers")
@@ -4513,19 +4523,79 @@ class ExportRunner:
         return True
 
     def _cleanup_temp_dirs(self):
-        """Cleans up temporary workspace directories and mid-process partial files on error or abort"""
+        """Clean up temporary directories, intermediate files, and aborted artifacts."""
         temp_dir = getattr(self.context, "temp_gerber_dir", None)
         if temp_dir and os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
             except Exception:
                 pass
-        if self.context.is_aborted() and self.context.output_dir and os.path.isdir(self.context.output_dir):
-            cleanup_partial_ibom_output(self.context.output_dir, self.context.pcb_name)
-            # Clean up any 0-byte or temporary partial artifacts left by an aborted step
+
+        output_dir = getattr(self.context, "output_dir", None)
+        if not output_dir or not os.path.isdir(output_dir):
+            return
+
+        mid_files = ("raw_bom.csv", "raw_pos.csv")
+
+        # Always discard intermediate raw files lingering in output directory
+        for mid in mid_files:
+            fpath = os.path.join(output_dir, mid)
+            if os.path.isfile(fpath):
+                _discard_file(fpath)
+
+        if self.context.is_aborted():
+            cleanup_partial_ibom_output(output_dir, self.context.pcb_name)
+
+            initial_files = getattr(self.context, "_initial_output_files", None)
+            if isinstance(initial_files, (set, list, tuple)):
+                initial_set = set(initial_files)
+                try:
+                    for fname in os.listdir(output_dir):
+                        fpath = os.path.join(output_dir, fname)
+                        if fname in mid_files or (fname not in initial_set and fname != "kiforge.log"):
+                            if os.path.isfile(fpath) or os.path.islink(fpath):
+                                _discard_file(fpath)
+                            elif os.path.isdir(fpath) and fpath != temp_dir:
+                                try:
+                                    shutil.rmtree(fpath)
+                                except Exception:
+                                    pass
+                        elif fname.startswith(self.context.pcb_name) and os.path.isfile(fpath):
+                            if os.path.getsize(fpath) == 0:
+                                _discard_file(fpath)
+                except OSError:
+                    pass
+
+                # If the folder was newly created and is empty or only holds the log, prune it
+                if not getattr(self.context, "_output_dir_existed_prior", True):
+                    try:
+                        remaining = os.listdir(output_dir)
+                        if not remaining or remaining == ["kiforge.log"]:
+                            logger = getattr(self.context, "logger", None)
+                            if logger:
+                                for h in list(logger.handlers):
+                                    if isinstance(h, logging.FileHandler):
+                                        try:
+                                            h.close()
+                                        except Exception:
+                                            pass
+                                        logger.removeHandler(h)
+                            shutil.rmtree(output_dir, ignore_errors=True)
+                    except OSError:
+                        pass
+            else:
+                try:
+                    for fname in os.listdir(output_dir):
+                        fpath = os.path.join(output_dir, fname)
+                        if os.path.isfile(fpath) and fname.startswith(self.context.pcb_name):
+                            if os.path.getsize(fpath) == 0:
+                                _discard_file(fpath)
+                except OSError:
+                    pass
+        else:
             try:
-                for fname in os.listdir(self.context.output_dir):
-                    fpath = os.path.join(self.context.output_dir, fname)
+                for fname in os.listdir(output_dir):
+                    fpath = os.path.join(output_dir, fname)
                     if os.path.isfile(fpath) and fname.startswith(self.context.pcb_name):
                         if os.path.getsize(fpath) == 0:
                             _discard_file(fpath)

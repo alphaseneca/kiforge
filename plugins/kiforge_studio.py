@@ -596,13 +596,7 @@ class _FlatCheckBox(wx.Panel):
             text_colour = _COLORS["text"]
         else:
             fill = _COLORS["input_bg"]
-            # _COLORS["border"] (63,63,70) reads as barely-there against the
-            # (24,24,27)/(39,39,42) panel background -- fine for a divider
-            # line, too faint for an interactive control's idle outline.
-            # _COLORS["muted"] is already the app's proven-visible dim
-            # foreground (used for labels), reused here rather than adding
-            # another one-off colour.
-            border = accent if (self._hover or focused) else _COLORS["muted"]
+            border = accent if focused else _COLORS["muted"]
             text_colour = _COLORS["text"]
 
         # Focus is shown as a bolder accent border directly on the glyph
@@ -888,7 +882,7 @@ class _FlatRadioButton(wx.Panel):
             dot = accent
             text_colour = _COLORS["text"]
         else:
-            border = accent if (self._hover or focused) else _COLORS["muted"]
+            border = accent if focused else _COLORS["muted"]
             dot = None
             text_colour = _COLORS["text"]
 
@@ -2473,7 +2467,10 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 for key in _EXPORT_TOGGLE_KEYS
                 if hasattr(self, self._export_checkbox_attr(key))
             )
-        if not has_pcb:
+        if getattr(self, "_export_running", False):
+            self.btn_export.Disable()
+            self.btn_export.SetToolTip("Export in progress...")
+        elif not has_pcb:
             self.btn_export.Disable()
             self.btn_export.SetToolTip("Disabled: no .kicad_pcb board file found")
         elif not has_outputs:
