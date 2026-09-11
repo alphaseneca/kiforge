@@ -1530,7 +1530,7 @@ def _build_subprocess_env(kicad_cli: str | None, project_dir: str | None = None)
 
         # Check if caller or parent process already defined a 3D models directory
         resolved_3d = None
-        for key in ("KICAD10_3DMODEL_DIR", "KISYS3DMOD", "KICAD11_3DMODEL_DIR", "KICAD12_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR"):
+        for key in ("KICAD10_3DMODEL_DIR", "KISYS3DMOD", "KICAD_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR"):
             val = env.get(key)
             if val and os.path.isdir(val):
                 resolved_3d = val
@@ -1542,8 +1542,7 @@ def _build_subprocess_env(kicad_cli: str | None, project_dir: str | None = None)
         if resolved_3d:
             if "KICAD10_3DMODEL_DIR" not in env:
                 env["KICAD10_3DMODEL_DIR"] = resolved_3d
-            # Alias across legacy (7, 8, 9), current (10), and forward major versions (11..16)
-            for alias in ["KISYS3DMOD"] + [f"KICAD{v}_3DMODEL_DIR" for v in range(7, 17)]:
+            for alias in ("KISYS3DMOD", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR", "KICAD7_3DMODEL_DIR"):
                 if alias not in env:
                     env[alias] = resolved_3d
 

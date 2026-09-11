@@ -6,7 +6,6 @@ USER root
 ARG KICAD_VERSION=10.0
 ENV KICAD_VERSION=${KICAD_VERSION}
 ENV KICAD10_3DMODEL_DIR=/usr/share/kicad/3dmodels
-ENV KICAD11_3DMODEL_DIR=/usr/share/kicad/3dmodels
 ENV KISYS3DMOD=/usr/share/kicad/3dmodels
 
 # Install python3-pip and InteractiveHtmlBom at build-time

@@ -2224,19 +2224,6 @@ class TestKiForgeCLI(unittest.TestCase):
                 self.assertIn(os.path.normpath(os.path.join(mac_app, "Contents", "MacOS", "kicad-cli")), cli_cands)
                 self.assertIn(os.path.normpath(os.path.join(mac_app, "Contents", "Frameworks", "Python.framework", "Versions", "Current", "bin", "python3")), py_cands)
 
-    def test_build_subprocess_env_aliases_future_versions(self):
-        """Verify _build_subprocess_env aliases 3D model paths forward to KICAD11..16_3DMODEL_DIR."""
-        from unittest.mock import patch
-
-        fake_cli = "/usr/bin/kicad-cli"
-        with tempfile.TemporaryDirectory() as tmp_proj:
-            with patch.object(kiforge, "_derive_system_3d_model_dir", return_value="/custom/3dmodels"):
-                env = kiforge._build_subprocess_env(fake_cli, tmp_proj)
-                self.assertEqual(env.get("KICAD10_3DMODEL_DIR"), "/custom/3dmodels")
-                self.assertEqual(env.get("KICAD11_3DMODEL_DIR"), "/custom/3dmodels")
-                self.assertEqual(env.get("KICAD12_3DMODEL_DIR"), "/custom/3dmodels")
-                self.assertEqual(env.get("KISYS3DMOD"), "/custom/3dmodels")
-
     def test_mid_process_abort_cleanup_in_export_runner_and_tasks(self):
         """Verify mid-process abort cleans up partial and 0-byte output files."""
         from unittest.mock import MagicMock, patch
