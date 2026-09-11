@@ -59,5 +59,3 @@ jobs:
             dist/packages.json
             dist/repository.json
             dist/resources.zip
-          overwrite: true
-          overwrite_files: true
