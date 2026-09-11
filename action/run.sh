@@ -12,6 +12,7 @@ set -euo pipefail
 action_path="${KIFORGE_ACTION_PATH:?KIFORGE_ACTION_PATH is required}"
 workspace="${KIFORGE_WORKSPACE:?KIFORGE_WORKSPACE is required}"
 project_path="${INPUT_PROJECT_PATH:-.}"
+pcb_file="${INPUT_PCB_FILE:-}"
 output_dir="${INPUT_OUTPUT_DIR:-kiforge}"
 kicad_version="${INPUT_KICAD_VERSION:-10.0}"
 
@@ -39,6 +40,9 @@ append_bool_toggle() {
 build_cli_args() {
   local -a args=()
   args+=("--project-path" "$project_path")
+  if [[ -n "$pcb_file" ]]; then
+    args+=("--pcb-file" "$pcb_file")
+  fi
   args+=("--output-dir" "$output_dir")
 
   # Export toggles (EXPORT_SETTING_KEYS)

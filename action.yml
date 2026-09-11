@@ -19,6 +19,10 @@ inputs:
     description: 'Relative path to the KiCad project directory (contains .kicad_pro)'
     required: true
     default: '.'
+  pcb_file:
+    description: 'Path to specific .kicad_pcb board file (e.g. from .history or backup)'
+    required: false
+    default: ''
   output_dir:
     description: 'Directory inside the workspace where outputs will be saved (relative to project_path)'
     required: false
@@ -105,6 +109,7 @@ runs:
         KIFORGE_ACTION_PATH: ${{ github.action_path }}
         KIFORGE_WORKSPACE: ${{ github.workspace }}
         INPUT_PROJECT_PATH: ${{ inputs.project_path }}
+        INPUT_PCB_FILE: ${{ inputs.pcb_file }}
         INPUT_OUTPUT_DIR: ${{ inputs.output_dir }}
         INPUT_EXPORT_3D: ${{ inputs.export_3d }}
         INPUT_EXPORT_SVG: ${{ inputs.export_svg }}

@@ -56,6 +56,7 @@ All inputs are optional. Every export is enabled by default. Set an input to `'f
 | Input | Description | Default |
 |---|---|---|
 | `project_path` | Relative path to your KiCad project directory (containing `.kicad_pro`) | `'.'` |
+| `pcb_file` | Path to specific `.kicad_pcb` board file (e.g. from `.history` or backup) | _(none)_ |
 | `output_dir` | Directory where output files are saved (relative to `project_path`) | `'kiforge'` |
 | `export_gerbers` | Export Gerber layer files (zipped) | `'true'` |
 | `export_drills` | Export drill files (included in Gerber ZIP) | `'true'` |
@@ -305,6 +306,9 @@ Examples:
 ```bash
 # JLC-oriented placement (top only, SMD, no DNP) and unoptimized STEP
 python kiforge.py --top --pos-smd-only --pos-exclude-dnp
+
+# Export a historical revision or specific board from .history
+python kiforge.py --pcb-file .history/sample-rev1.kicad_pcb
 
 # Bottom-side placement only
 python kiforge.py --bottom
