@@ -2190,18 +2190,19 @@ class TestKiForgeCLI(unittest.TestCase):
         from unittest.mock import patch
 
         fake_entries = ["10.0", "8.0", "11.0", "9.0", "not_a_version"]
+        win_env = {"ProgramFiles": r"C:\Program Files", "ProgramFiles(x86)": "", "ProgramW6432": ""}
         with patch.object(kiforge, "_get_platform_name", return_value="windows"):
-            with patch("os.environ.get", side_effect=lambda k: r"C:\Program Files" if k == "ProgramFiles" else None):
+            with patch.dict(os.environ, win_env):
                 with patch("os.path.isdir", return_value=True):
                     with patch("os.listdir", return_value=fake_entries):
                         dirs = kiforge._discover_kicad_install_dirs()
         expected_order = [
-            os.path.join(r"C:\Program Files", "KiCad", "11.0"),
-            os.path.join(r"C:\Program Files", "KiCad", "10.0"),
-            os.path.join(r"C:\Program Files", "KiCad", "9.0"),
-            os.path.join(r"C:\Program Files", "KiCad", "8.0"),
+            os.path.normpath(os.path.join(r"C:\Program Files", "KiCad", "11.0")),
+            os.path.normpath(os.path.join(r"C:\Program Files", "KiCad", "10.0")),
+            os.path.normpath(os.path.join(r"C:\Program Files", "KiCad", "9.0")),
+            os.path.normpath(os.path.join(r"C:\Program Files", "KiCad", "8.0")),
         ]
-        self.assertEqual(dirs[:4], expected_order)
+        self.assertEqual([os.path.normpath(p) for p in dirs[:4]], expected_order)
 
     def test_get_platform_kicad_cli_and_python_candidates(self):
         """Verify CLI and Python candidate generation for Windows, macOS, and Linux."""
@@ -2210,17 +2211,18 @@ class TestKiForgeCLI(unittest.TestCase):
         win_kicad = os.path.join(r"C:\Program Files", "KiCad", "10.0")
         with patch.object(kiforge, "_discover_kicad_install_dirs", return_value=[win_kicad]):
             with patch.object(kiforge, "_get_platform_name", return_value="windows"):
-                cli_cands = kiforge._get_platform_kicad_cli_candidates()
-                py_cands = kiforge._get_platform_kicad_python_candidates()
-                self.assertIn(os.path.join(win_kicad, "bin", "kicad-cli.exe"), cli_cands)
-                self.assertIn(os.path.join(win_kicad, "bin", "kicad-python.exe"), py_cands)
+                cli_cands = [os.path.normpath(p) for p in kiforge._get_platform_kicad_cli_candidates()]
+                py_cands = [os.path.normpath(p) for p in kiforge._get_platform_kicad_python_candidates()]
+                self.assertIn(os.path.normpath(os.path.join(win_kicad, "bin", "kicad-cli.exe")), cli_cands)
+                self.assertIn(os.path.normpath(os.path.join(win_kicad, "bin", "kicad-python.exe")), py_cands)
 
-        with patch.object(kiforge, "_discover_kicad_install_dirs", return_value=["/Applications/KiCad/KiCad.app"]):
+        mac_app = "/Applications/KiCad/KiCad.app"
+        with patch.object(kiforge, "_discover_kicad_install_dirs", return_value=[mac_app]):
             with patch.object(kiforge, "_get_platform_name", return_value="macos"):
-                cli_cands = kiforge._get_platform_kicad_cli_candidates()
-                py_cands = kiforge._get_platform_kicad_python_candidates()
-                self.assertIn("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli", cli_cands)
-                self.assertIn("/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3", py_cands)
+                cli_cands = [os.path.normpath(p) for p in kiforge._get_platform_kicad_cli_candidates()]
+                py_cands = [os.path.normpath(p) for p in kiforge._get_platform_kicad_python_candidates()]
+                self.assertIn(os.path.normpath(os.path.join(mac_app, "Contents", "MacOS", "kicad-cli")), cli_cands)
+                self.assertIn(os.path.normpath(os.path.join(mac_app, "Contents", "Frameworks", "Python.framework", "Versions", "Current", "bin", "python3")), py_cands)
 
     def test_build_subprocess_env_aliases_future_versions(self):
         """Verify _build_subprocess_env aliases 3D model paths forward to KICAD11..16_3DMODEL_DIR."""
@@ -2241,12 +2243,14 @@ class TestKiForgeCLI(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             zero_byte_file = os.path.join(tmp_dir, "board-step.step")
-            open(zero_byte_file, "w").close()
+            with open(zero_byte_file, "w") as f:
+                pass
             valid_file = os.path.join(tmp_dir, "board-bom.csv")
             with open(valid_file, "w") as f:
                 f.write("content")
             unrelated_zero = os.path.join(tmp_dir, "other.step")
-            open(unrelated_zero, "w").close()
+            with open(unrelated_zero, "w") as f:
+                pass
 
             mock_ctx = MagicMock()
             mock_ctx.is_aborted.return_value = True
