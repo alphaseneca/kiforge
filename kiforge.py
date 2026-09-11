@@ -2510,7 +2510,7 @@ class SchematicPdfExportTask(ExportTask):
                 "-o", output_pdf
             ]
             ok = self._run_subprocess(cmd, context)
-            if context.is_aborted():
+            if context.is_aborted() or not ok:
                 _discard_file(output_pdf)
                 return False
             return ok
@@ -3409,11 +3409,15 @@ def _export_pdf_via_wx(svg_paths: list[str], output_pdf_path: str, is_landscape:
                 if not bundle.IsOk():
                     raise ValueError(f"wx could not rasterize SVG: {sp}")
                 img = bundle.GetBitmap(size).ConvertToImage()
+                del bundle
                 pil_img = Image.frombuffer(
                     "RGB", (img.GetWidth(), img.GetHeight()), img.GetData(), "raw", "RGB", 0, 1
                 )
+                del img
                 frames.append(pil_img.convert("1", dither=Image.Dither.NONE))
-                del pil_img, img
+                del pil_img
+            if not frames:
+                raise ValueError("No frames rendered from SVG paths")
             frames[0].save(
                 output_pdf_path, "PDF", resolution=float(dpi),
                 save_all=True, append_images=frames[1:],
@@ -3440,8 +3444,8 @@ def _export_pdf_via_wx(svg_paths: list[str], output_pdf_path: str, is_landscape:
 
 
 # Worker run by _export_pdf_via_subprocess. It imports this very module in a
-# fresh interpreter and calls the in-process Qt tier from that process's own
-# main thread -- the only thread Qt allows a QGuiApplication to be built on --
+# fresh interpreter and calls the in-process wx tier from that process's own
+# main thread -- the only thread wx allows a wx.App to be built on --
 # so the rendering code has exactly one implementation rather than a duplicate
 # maintained for out-of-process use.
 # Holds the worker process's wx.App. wx tracks the "current" app weakly, so an
@@ -3475,6 +3479,7 @@ _PDF_WORKER_SRC = (
     "import json, sys;"
     "sys.path.insert(0, sys.argv[1]);"
     "import kiforge;"
+    "kiforge.add_package_dir_to_path();"
     "a = json.loads(sys.argv[2]);"
     "sys.exit(0 if kiforge._pdf_worker_main("
     "a['fn'], a['svgs'], a['out'], a['landscape']) else 1)"
@@ -3645,10 +3650,10 @@ def _run_on_gui_thread(fn, timeout: float = 180.0):
     Run ``fn()`` on the thread that owns the process's GUI event loop, and
     return its result.
 
-    Qt and wxPython may only construct or drive their application/window
+    wxPython may only construct or drive its application/window
     objects from the thread that owns the platform's native event loop -
-    Cocoa enforces this strictly on macOS, so calling ``QGuiApplication([])``
-    or wx's SVG rasterizer from a background thread can abort the whole host
+    Cocoa enforces this strictly on macOS, so calling wx's SVG rasterizer
+    from a background thread can abort the whole host
     process, not just this export. KiForge Studio always runs exports on a
     background worker thread (to keep the UI responsive), so every call into
     :func:`export_svg_to_1200dpi_pdf` from there needs marshaling; the CLI and
@@ -3729,7 +3734,7 @@ def export_svg_to_1200dpi_pdf(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_pdf_path)), exist_ok=True)
 
-    # The GUI-toolkit tiers construct/drive real Qt or wx application objects
+    # The GUI-toolkit tier constructs/drives real wx application objects
     # and must run on the GUI thread (see _run_on_gui_thread); the subprocess
     # tier has no such constraint and stays on the calling thread so it never
     # blocks Studio's UI while an external converter runs.
@@ -3762,10 +3767,10 @@ def export_svg_to_1200dpi_pdf(
         ("CLI converter",
          lambda: _export_pdf_via_cli(svg_paths, output_pdf_path, logger, should_abort), False),
     )
-    # Quality order above (vector Qt first) is the right default, but it is
-    # only a preference: when a GUI-thread tier would freeze a live UI, the
-    # subprocess tier -- which renders just as well and needs no GUI thread --
-    # is tried first instead, so Studio keeps animating and stays clickable.
+    # Subprocess tier first is the right default, but when a GUI-thread
+    # tier would freeze a live UI, the subprocess tier -- which renders
+    # just as well and needs no GUI thread -- is tried first instead, so
+    # Studio keeps animating and stays clickable.
     # Sorting on the tier's own "needs the GUI thread" flag keeps this a
     # property of the tiers rather than a second hand-maintained order.
     if _gui_thread_tier_would_block():

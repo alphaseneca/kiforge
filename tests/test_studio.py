@@ -685,7 +685,7 @@ class TestKiForgeStudio(unittest.TestCase):
     def test_export_pdf_marshals_gui_tier_off_main_thread(self):
         """
         Regression: Studio always renders the homebrew PDF from its export
-        worker thread. Qt/wx must never construct their application objects
+        worker thread. wx must never construct its application objects
         off the GUI thread (Cocoa aborts the process for this on macOS), so
         export_svg_to_1200dpi_pdf must marshal onto the wx main thread via
         wx.CallAfter and still return the correct result to the caller.

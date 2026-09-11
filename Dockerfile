@@ -11,7 +11,7 @@ ENV KISYS3DMOD=/usr/share/kicad/3dmodels
 # Install python3-pip and InteractiveHtmlBom at build-time
 COPY kiforge.py /tmp/kiforge.py
 # librsvg2-bin provides rsvg-convert, the headless SVG->PDF converter KiForge
-# falls back to for the homebrew etching PDF (no Qt/wx display needed).
+# falls back to for the homebrew etching PDF (no wx display needed).
 # InteractiveHtmlBom is pinned (not "latest") so a breaking or compromised
 # upstream release can't silently change or break every CD run -- keep this
 # version in sync with INTERACTIVE_HTML_BOM_PINNED_VERSION in kiforge.py.
