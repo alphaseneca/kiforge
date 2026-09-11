@@ -62,7 +62,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: https://github.com/actions/checkout@v4
+        uses: https://github.com/actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -526,7 +526,7 @@ jobs:
           PY
 
       - name: Attach files to release
-        uses: https://github.com/softprops/action-gh-release@v2
+        uses: https://github.com/softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.paths.outputs.tag }}
           files: |-

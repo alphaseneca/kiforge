@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: https://github.com/actions/checkout@v4
+        uses: https://github.com/actions/checkout@v7
 
       - name: Run KiForge
         uses: https://github.com/{{KIFORGE_ACTION_REF}}
@@ -43,7 +43,7 @@ jobs:
           bom_include_mfr_mpn: '{{BOM_INCLUDE_MFR_MPN}}'
 
       - name: Create release and upload assets
-        uses: https://github.com/softprops/action-gh-release@v2
+        uses: https://github.com/softprops/action-gh-release@v3
         with:
           tag_name: {{GITHUB_REF_NAME}}
           files: {{OUTPUT_DIR}}/*

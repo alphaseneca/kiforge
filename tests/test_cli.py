@@ -279,7 +279,7 @@ class TestKiForgeCLI(unittest.TestCase):
                 self.assertIn("pos_side: 'both'", content)
                 self.assertIn("pos_smd_only: 'true'", content)
                 self.assertIn(kiforge.KIFORGE_ACTION_REF, content)
-                self.assertIn("softprops/action-gh-release@v2", content)
+                self.assertIn("softprops/action-gh-release@v3", content)
                 self.assertIn("generate_release_notes: true", content)
                 self.assertIn("overwrite: true", content)
                 self.assertIn("overwrite_files: true", content)
@@ -295,7 +295,7 @@ class TestKiForgeCLI(unittest.TestCase):
                     f"https://github.com/{kiforge.KIFORGE_ACTION_REF}",
                     gitea_content,
                 )
-                self.assertIn("softprops/action-gh-release@v2", gitea_content)
+                self.assertIn("softprops/action-gh-release@v3", gitea_content)
                 self.assertNotIn("generate_release_notes", gitea_content)
                 self.assertIn("overwrite: true", gitea_content)
                 self.assertIn("overwrite_files: true", gitea_content)
