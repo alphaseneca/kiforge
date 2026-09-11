@@ -410,6 +410,20 @@ _CHECKBOX_GLYPH_SIZE = 16
 _CHECKBOX_GLYPH_RADIUS = 4
 
 
+def _checkmark_pen() -> "wx.Pen":
+    """
+    White stroke for the checkbox tick, with rounded ends.
+
+    The default butt cap and mitre join leave a 16px tick with two blunt
+    square ends and a notched outer corner where the two strokes meet, which
+    is what made the glyph look chipped rather than drawn.
+    """
+    pen = wx.Pen(wx.Colour(255, 255, 255), 2)
+    pen.SetCap(wx.CAP_ROUND)
+    pen.SetJoin(wx.JOIN_ROUND)
+    return pen
+
+
 class _FlatCheckBox(wx.Panel):
     """
     Fully custom-painted checkbox: no native OS chrome behind the label, so
@@ -434,6 +448,7 @@ class _FlatCheckBox(wx.Panel):
         self._pressed = False
         self._enabled = True
         self._has_focus = False
+        self._focus_from_pointer = False
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.SetBackgroundColour(parent.GetBackgroundColour() if parent else _COLORS["app_bg"])
 
@@ -457,7 +472,17 @@ class _FlatCheckBox(wx.Panel):
         return self._enabled
 
     def _on_set_focus(self, event):
-        self._has_focus = True
+        """
+        Draw a focus ring for keyboard focus only.
+
+        A ring after every mouse click is the "focus ring pollution" the
+        platform itself avoids: click a control on macOS and no ring appears,
+        Tab to it and one does. ``_focus_from_pointer`` is set by
+        :meth:`_on_left_down` immediately before ``SetFocus()``, so a click
+        still takes focus -- it just does not advertise it.
+        """
+        self._has_focus = not self._focus_from_pointer
+        self._focus_from_pointer = False
         self.Refresh()
         event.Skip()
 
@@ -472,8 +497,8 @@ class _FlatCheckBox(wx.Panel):
         radio kept an orange ring after its dot had correctly cleared.
         """
         self._has_focus = False
+        self._focus_from_pointer = False
         self.Refresh()
-        event.Skip()
         event.Skip()
 
     def _on_key_down(self, event):
@@ -499,6 +524,7 @@ class _FlatCheckBox(wx.Panel):
             return
         self._pressed = True
         self.CaptureMouse()
+        self._focus_from_pointer = True
         self.SetFocus()
         self.Refresh()
 
@@ -560,7 +586,10 @@ class _FlatCheckBox(wx.Panel):
             text_colour = _COLORS["muted"]
         elif self._checked:
             fill = accent
-            border = accent
+            # The glyph is already filled with the accent, so an accent border
+            # is invisible -- keyboard focus needs a colour that contrasts with
+            # the fill or Tab navigation has no visible position at all.
+            border = _COLORS["text"] if focused else accent
             text_colour = _COLORS["text"]
         else:
             fill = _COLORS["input_bg"]
@@ -608,7 +637,7 @@ class _FlatCheckBox(wx.Panel):
                 # checkmark stays centred and correctly scaled if
                 # _CHECKBOX_GLYPH_SIZE ever changes again.
                 g = _CHECKBOX_GLYPH_SIZE
-                gc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 2))
+                gc.SetPen(_checkmark_pen())
                 check = gc.CreatePath()
                 check.MoveToPoint(0.22 * g, box_y + 0.5 * g)
                 check.AddLineToPoint(0.42 * g, box_y + 0.72 * g)
@@ -630,7 +659,7 @@ class _FlatCheckBox(wx.Panel):
             dc.DrawRoundedRectangle(inner_inset, box_y + inner_inset, inner_w, inner_w, inner_radius)
             if self._checked:
                 g = _CHECKBOX_GLYPH_SIZE
-                dc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 2))
+                dc.SetPen(_checkmark_pen())
                 dc.DrawLine(int(0.22 * g), int(box_y + 0.5 * g), int(0.42 * g), int(box_y + 0.72 * g))
                 dc.DrawLine(int(0.42 * g), int(box_y + 0.72 * g), int(0.78 * g), int(box_y + 0.28 * g))
 
@@ -680,6 +709,7 @@ class _FlatRadioButton(wx.Panel):
         self._pressed = False
         self._enabled = True
         self._has_focus = False
+        self._focus_from_pointer = False
         self._group = group if group is not None else [self]
         if group is not None:
             group.append(self)
@@ -706,7 +736,17 @@ class _FlatRadioButton(wx.Panel):
         return self._enabled
 
     def _on_set_focus(self, event):
-        self._has_focus = True
+        """
+        Draw a focus ring for keyboard focus only.
+
+        A ring after every mouse click is the "focus ring pollution" the
+        platform itself avoids: click a control on macOS and no ring appears,
+        Tab to it and one does. ``_focus_from_pointer`` is set by
+        :meth:`_on_left_down` immediately before ``SetFocus()``, so a click
+        still takes focus -- it just does not advertise it.
+        """
+        self._has_focus = not self._focus_from_pointer
+        self._focus_from_pointer = False
         self.Refresh()
         event.Skip()
 
@@ -721,8 +761,8 @@ class _FlatRadioButton(wx.Panel):
         radio kept an orange ring after its dot had correctly cleared.
         """
         self._has_focus = False
+        self._focus_from_pointer = False
         self.Refresh()
-        event.Skip()
         event.Skip()
 
     def _on_key_down(self, event):
@@ -748,6 +788,7 @@ class _FlatRadioButton(wx.Panel):
             return
         self._pressed = True
         self.CaptureMouse()
+        self._focus_from_pointer = True
         self.SetFocus()
         self.Refresh()
 
@@ -946,6 +987,11 @@ class _ExportProgressDialog(wx.Dialog):
         self.btn_cancel = _FlatButton(self, "Cancel", min_width=88)
         self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
         row.Add(self.btn_cancel, 0)
+        # Escape and the titlebar close arrive here. While the export runs they
+        # mean "cancel", not "close": closing the window would leave the worker
+        # running with nothing left to report it. Once the result is up they
+        # mean the same thing as OK.
+        self.Bind(wx.EVT_CLOSE, self._on_close_request)
         sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, _SP_LG)
 
         self.SetSizer(sizer)
@@ -971,8 +1017,27 @@ class _ExportProgressDialog(wx.Dialog):
             except Exception:
                 logger.exception("Cancel request handler failed")
 
+    def _on_close_request(self, event):
+        """Escape or the titlebar close button."""
+        if self._finished:
+            self._on_dismiss(event)
+            return
+        self._on_cancel(event)
+        if event.CanVeto():
+            event.Veto()
+
     def _on_dismiss(self, event):
-        """OK on a finished export: close the dialog and release the owner's handle."""
+        """
+        OK on a finished export: end the modal loop _start_export is waiting in.
+
+        Destroying the window is the caller's job once ShowModal() has
+        returned -- a dialog cannot be deleted from inside its own event loop.
+        The non-modal branch exists for tests, which drive this dialog
+        directly without ever entering a loop.
+        """
+        if self.IsModal():
+            self.EndModal(wx.ID_OK)
+            return
         owner = self.GetParent()
         if owner is not None and getattr(owner, "_export_progress", None) is self:
             owner._export_progress = None
@@ -1005,9 +1070,6 @@ class _ExportProgressDialog(wx.Dialog):
         self.Layout()
         self.Fit()
         self.Update()
-        # The outcome is the thing the user is waiting for -- make sure it is
-        # not sitting behind Studio when it arrives.
-        self.Raise()
 
     def is_finished(self) -> bool:
         return self._finished
@@ -1322,36 +1384,23 @@ def _kicad_parent_window():
     return app.GetTopWindow() if app else None
 
 
-def _pump_ui_events(keep_enabled: "wx.Window | None" = None):
-    """
-    Keep wx/KiCad responsive while a background export is running.
-
-    ``wx.SafeYield()`` with no argument disables *every* top-level window for
-    the duration of the yield, and this runs on every poll tick. A click that
-    lands in one of those windows is discarded, so Cancel worked only when the
-    press happened to fall between ticks -- it read as flaky, then as dead.
-    Passing the window that must stay live keeps it clickable while still
-    blocking input to everything behind it, which is what "safe" is for.
-    """
-    app = wx.GetApp()
-    if app:
-        app.ProcessPendingEvents()
-    try:
-        wx.YieldIfNeeded()
-    except Exception:
-        pass
-    try:
-        if keep_enabled is not None and keep_enabled:
-            wx.SafeYield(keep_enabled)
-        else:
-            wx.SafeYield()
-    except Exception:
-        pass
-
-
 def _destroy_progress_dialog(progress):
+    """
+    Take the export progress dialog down from outside.
+
+    It runs its own modal loop, so it is *ended* rather than destroyed here:
+    deleting a window from inside the event loop it is running leaves wx
+    driving a loop for a dead object. The Destroy() belongs to whoever called
+    ShowModal(), once that call returns.
+    """
     if not progress:
         return
+    try:
+        if progress.IsModal():
+            progress.EndModal(wx.ID_CANCEL)
+            return
+    except Exception:
+        pass
     try:
         progress.Hide()
     except Exception:
@@ -2392,19 +2441,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         # The result dialog from the previous run stays up until dismissed, so
         # clear it before starting another export rather than leaking it.
         self._destroy_export_progress()
-        self._export_progress = _ExportProgressDialog(self, on_cancel=request_cancel)
-        self._export_progress.Show()
-        # Show() only queues the paint; on macOS the window stays blank until
-        # the event loop next idles, which a busy export can delay noticeably.
-        # Update() paints it now so the dialog is on screen before the worker
-        # starts competing for the loop.
-        self._export_progress.Update()
-        # A modeless child of a *modal* parent opens behind it, so the progress
-        # window ends up hidden under Studio and the export looks like it
-        # produced no feedback at all. Raise() is the fix that works for a
-        # dialog -- wxFRAME_FLOAT_ON_PARENT is a frame-only style and wxDialog
-        # silently strips it.
-        self._export_progress.Raise()
+        progress = _ExportProgressDialog(self, on_cancel=request_cancel)
+        self._export_progress = progress
 
         def export_worker():
             try:
@@ -2424,6 +2462,28 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_thread.start()
 
         self._export_timer.Start(75)
+
+        # Modal, and deliberately so. Studio itself runs under ShowModal(),
+        # which on macOS is an application-modal Cocoa session: a modeless
+        # child opened beneath it is drawn behind Studio and receives no mouse
+        # events at all -- Cancel and OK did nothing, and the window kept
+        # vanishing behind the one that spawned it. Hand-pumping events to keep
+        # it alive only traded that for a flicker, because wx.SafeYield()
+        # disables and re-enables every top-level window on each of the
+        # thirteen ticks a second the poll timer runs at.
+        #
+        # A nested modal loop is what wx provides for exactly this: the dialog
+        # is in front, it gets its own events, the poll timer below still
+        # fires, and the export stays on its worker thread throughout. This
+        # blocks until the dialog ends -- on Cancel once the worker unwinds, or
+        # on OK once the result has been shown in it.
+        try:
+            progress.ShowModal()
+        finally:
+            self._stop_export_timer()
+            if self._export_progress is progress:
+                self._export_progress = None
+            progress.Destroy()
 
     def _stop_export_timer(self):
         if self._export_timer and self._export_timer.IsRunning():
@@ -2462,9 +2522,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             state["cancelled"] = True
             context.cancel()
             self._export_join_deadline = min(self._export_join_deadline, time.time() + 20)
-
-        # Keep the progress dialog live: it owns Cancel.
-        _pump_ui_events(progress)
 
         if state["running"]:
             # Unconditional: the dialog decides whether this tick advances the
@@ -2509,17 +2566,25 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """Present the export result in the progress dialog that ran the export."""
         if not self:
             return
-        if state and context:
-            self._show_export_result(state, context, project_dir)
-        else:
-            self._destroy_export_progress()
         # Only close the whole Studio window when the user explicitly asked to
         # close it while an export was running (see on_close). A cancelled,
         # failed, or even successful export otherwise must leave Studio open
         # so the user can adjust settings and export again -- closing it here
         # unconditionally is what made Cancel look like it killed the plugin.
-        if self._export_close_after_finish and self.IsModal():
-            self.EndModal(wx.ID_CANCEL)
+        #
+        # The progress dialog's loop is nested inside Studio's, so it has to
+        # end first: ending the outer loop while the inner one is still running
+        # leaves wx unwinding them in the wrong order.
+        if self._export_close_after_finish:
+            self._destroy_export_progress()
+            if self.IsModal():
+                self.EndModal(wx.ID_CANCEL)
+            return
+
+        if state and context:
+            self._show_export_result(state, context, project_dir)
+        else:
+            self._destroy_export_progress()
 
     def _show_export_result(self, state, context, project_dir):
         """

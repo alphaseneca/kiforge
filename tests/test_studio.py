@@ -391,6 +391,104 @@ class TestKiForgeStudio(unittest.TestCase):
         finally:
             frame.Destroy()
 
+    def _glyph_edge_colour(self, control):
+        """
+        Drive a custom control's real _on_paint and sample its glyph outline.
+
+        Returns the leftmost inked pixel on the glyph's centre row, so the
+        same helper works for the checkbox's rounded rect (flush at x=0) and
+        the radio's inset circle.
+        """
+        size = control.GetSize()
+        bitmap = wx.Bitmap(size)
+        dc = wx.MemoryDC(bitmap)
+        # The control clears to its parent's colour, so the ground this
+        # compares against has to be that colour and not the palette default,
+        # or the very first column reads as ink on any other parent.
+        parent = control.GetParent()
+        background = parent.GetBackgroundColour() if parent else kiforge_studio._COLORS["app_bg"]
+        dc.SetBackground(wx.Brush(background))
+        dc.Clear()
+        real_dc = wx.AutoBufferedPaintDC
+        wx.AutoBufferedPaintDC = lambda _win: dc
+        try:
+            control._on_paint(None)
+        finally:
+            wx.AutoBufferedPaintDC = real_dc
+        dc.SelectObject(wx.NullBitmap)
+
+        image = bitmap.ConvertToImage()
+        row = size[1] // 2
+        ground = (background.Red(), background.Green(), background.Blue())
+        for column in range(kiforge_studio._CHECKBOX_GLYPH_SIZE):
+            pixel = (image.GetRed(column, row), image.GetGreen(column, row), image.GetBlue(column, row))
+            if max(abs(a - b) for a, b in zip(pixel, ground)) > 12:
+                return pixel
+        return ground
+
+    def _is_accent(self, pixel):
+        accent = kiforge_studio._COLORS["accent"]
+        return all(abs(a - b) < 30 for a, b in zip(pixel, (accent.Red(), accent.Green(), accent.Blue())))
+
+    def test_a_click_takes_focus_without_painting_a_focus_ring(self):
+        """
+        Regression: every clicked control kept an orange ring afterwards.
+
+        Clearing the ring when focus *left* was only half of it -- a control
+        that still holds focus was still drawing one, so the last thing
+        clicked on any tab stayed ringed. The platform's own answer is
+        focus-visible: click a control on macOS and no ring appears, Tab to it
+        and one does. Measured through the controls' own paint code rather
+        than asserted on the flag, because the flag is not what the user sees.
+        """
+        frame = wx.Frame(None)
+        try:
+            for factory in (kiforge_studio._FlatCheckBox, kiforge_studio._FlatRadioButton):
+                control = factory(frame, label="Gerbers")
+                control.SetSize((160, 24))
+                # Isolate the flag from real focus delivery: whether a hidden
+                # frame's child can actually take focus varies by platform and
+                # is not what this is testing.
+                control.SetFocus = lambda: None
+
+                press = wx.MouseEvent(wx.wxEVT_LEFT_DOWN)
+                press.SetPosition(wx.Point(8, 12))
+                control._on_left_down(press)
+                if control.HasCapture():
+                    control.ReleaseMouse()
+                control._pressed = False
+                self.assertTrue(control._focus_from_pointer, factory.__name__)
+
+                control._on_set_focus(wx.FocusEvent(wx.wxEVT_SET_FOCUS))
+                control._hover = False
+                self.assertFalse(
+                    self._is_accent(self._glyph_edge_colour(control)),
+                    f"{factory.__name__} still paints a focus ring after a click",
+                )
+
+                control._on_kill_focus(wx.FocusEvent(wx.wxEVT_KILL_FOCUS))
+                control._on_set_focus(wx.FocusEvent(wx.wxEVT_SET_FOCUS))
+                self.assertTrue(
+                    self._is_accent(self._glyph_edge_colour(control)),
+                    f"{factory.__name__} gives keyboard focus no visible position",
+                )
+        finally:
+            frame.Destroy()
+
+    def test_checked_glyph_still_shows_keyboard_focus(self):
+        """A checked box is filled with the accent, so an accent focus border is invisible."""
+        frame = wx.Frame(None)
+        try:
+            control = kiforge_studio._FlatCheckBox(frame, label="Gerbers")
+            control.SetSize((160, 24))
+            control.SetValue(True)
+            idle = self._glyph_edge_colour(control)
+            control._on_set_focus(wx.FocusEvent(wx.wxEVT_SET_FOCUS))
+            focused = self._glyph_edge_colour(control)
+            self.assertNotEqual(idle, focused, "keyboard focus is invisible on a checked box")
+        finally:
+            frame.Destroy()
+
     def test_background_click_hands_focus_to_the_container(self):
         """
         Clicking blank background must move focus off a custom-painted control,
@@ -591,7 +689,14 @@ class TestKiForgeStudio(unittest.TestCase):
         off the GUI thread (Cocoa aborts the process for this on macOS), so
         export_svg_to_1200dpi_pdf must marshal onto the wx main thread via
         wx.CallAfter and still return the correct result to the caller.
+
+        Needs a renderer tier that can actually produce a PDF; with none
+        installed there is nothing to marshal and the failure would be about
+        the environment, not about threading.
         """
+        if kiforge.missing_pdf_renderer_packages() and not shutil.which("rsvg-convert"):
+            self.skipTest("no PDF renderer available (Pillow/PyQt6/rsvg-convert all missing)")
+
         front_svg = os.path.join(self.test_dir, "f.svg")
         back_svg = os.path.join(self.test_dir, "b.svg")
         merged_svg = os.path.join(self.test_dir, "m.svg")
@@ -805,6 +910,51 @@ class TestKiForgeStudio(unittest.TestCase):
         finally:
             dialog._export_running = False
             dialog.Destroy()
+
+    def test_progress_dialog_runs_its_own_modal_loop(self):
+        """
+        The progress dialog is modal because Studio is.
+
+        Studio runs under ShowModal(), which on macOS is an application-modal
+        Cocoa session: a modeless child opened beneath it is drawn behind
+        Studio and receives no mouse events at all, so Cancel and OK did
+        nothing and the window kept disappearing behind the one that spawned
+        it. Hand-pumping events to keep it alive only traded that for a
+        flicker, since wx.SafeYield() disables and re-enables every top-level
+        window on each poll tick. This checks the dialog really enters a modal
+        loop and that OK is what leaves it.
+        """
+        progress = kiforge_studio._ExportProgressDialog(None)
+        try:
+            def finish():
+                progress.show_result("Export complete. Saved to /kiforge.")
+                wx.CallLater(10, lambda: progress._on_dismiss(None))
+
+            wx.CallLater(10, finish)
+            self.assertEqual(progress.ShowModal(), wx.ID_OK)
+            self.assertFalse(progress.IsModal())
+        finally:
+            progress.Destroy()
+
+    def test_destroy_progress_dialog_ends_the_loop_rather_than_deleting_it(self):
+        """A window cannot be deleted from inside the event loop it is running."""
+        progress = MagicMock()
+        progress.IsModal.return_value = True
+        kiforge_studio._destroy_progress_dialog(progress)
+        progress.EndModal.assert_called_once()
+        progress.Destroy.assert_not_called()
+
+    def test_escape_during_an_export_cancels_instead_of_closing(self):
+        """Closing the window mid-export would leave the worker running unreported."""
+        progress = kiforge_studio._ExportProgressDialog(None)
+        try:
+            event = wx.CloseEvent(wx.wxEVT_CLOSE_WINDOW)
+            event.SetCanVeto(True)
+            progress._on_close_request(event)
+            self.assertTrue(progress.was_cancelled())
+            self.assertTrue(event.GetVeto())
+        finally:
+            progress.Destroy()
 
     def test_progress_dialog_cancel_does_not_close_studio(self):
         """
