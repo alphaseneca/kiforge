@@ -61,6 +61,60 @@ jobs:
       - name: Check interpreter compatibility rules
         run: ruff check .
 
+  # The unit tests mock pip, so nothing verified that a real install actually
+  # lands in the interpreter we aimed at. This does it for real, on every
+  # platform: build a throwaway interpreter, install into *that* one, and check
+  # the package became importable there and not here. Pillow only -- PyQt6 is a
+  # ~100 MB download and exercises the same code path.
+  renderer-install:
+    name: PDF renderer install (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    needs: import-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.9', '3.12']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install a renderer into a target interpreter
+        shell: python
+        run: |
+          import subprocess, sys, os, venv, pathlib
+
+          target_dir = pathlib.Path("target-env").resolve()
+          venv.create(target_dir, with_pip=True)
+          bindir = "Scripts" if os.name == "nt" else "bin"
+          exe = str(target_dir / bindir / ("python.exe" if os.name == "nt" else "python"))
+
+          sys.path.insert(0, ".")
+          import kiforge
+
+          missing = kiforge.missing_pdf_renderer_packages(["Pillow"], python_exe=exe)
+          assert missing == ["Pillow"], f"probe should see a bare venv as missing: {missing}"
+
+          ok, message = kiforge.install_pdf_renderer(["Pillow"], python_exe=exe)
+          assert ok, message
+          print(message)
+
+          after = kiforge.missing_pdf_renderer_packages(["Pillow"], python_exe=exe)
+          assert after == [], f"still missing after install: {after}"
+
+          # It must have landed in the target, not in the interpreter that ran this.
+          probe = subprocess.run(
+              [exe, "-c", "import PIL, sys; print(PIL.__file__)"],
+              capture_output=True, text=True, check=True,
+          )
+          assert str(target_dir) in probe.stdout, probe.stdout
+          print("landed in the target interpreter:", probe.stdout.strip())
+
   unit-tests:
     name: Python unit tests (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}

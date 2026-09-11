@@ -3014,6 +3014,34 @@ PDF_RENDERER_INSTALL_TIMEOUT_SEC = 600
 # The distribution name is not always the import name.
 PDF_RENDERER_IMPORT_NAMES = {"Pillow": "PIL"}
 
+# Extra ``pip install`` flags to try, in order, for one renderer package. Each
+# attempt is judged by whether the target interpreter can import the package
+# afterwards -- never by pip's exit code, which is why this is a ladder rather
+# than a single command:
+#
+#   --user                   KiCad's own site-packages is not always writable
+#                            (a system-wide install, a managed .app under
+#                            /Applications); the user site always is.
+#   --break-system-packages  PEP 668 environments refuse --user outright.
+#   --force-reinstall        pip answers "Requirement already satisfied" from
+#                            metadata on disk, not from what imports. An
+#                            orphaned .dist-info -- left behind by a
+#                            half-removed package or an interrupted upgrade --
+#                            turns every install into a no-op while the import
+#                            keeps failing, so the next export finds the same
+#                            package missing and installs it again, forever.
+PDF_RENDERER_PIP_ATTEMPTS = (
+    ("--user",),
+    ("--user", "--break-system-packages"),
+    ("--user", "--force-reinstall"),
+)
+
+# Packages this process has already tried every attempt on and failed to make
+# importable. Retrying a genuinely broken install on every export adds minutes
+# to each run and ends the same way; the export still warns and names the
+# remedy, and restarting KiCad clears this.
+_RENDERER_INSTALL_FAILED = set()
+
 
 def _probe_missing_in_interpreter(exe: str, wanted, import_names):
     """
@@ -3057,17 +3085,18 @@ def missing_pdf_renderer_packages(packages=None, *, python_exe=None) -> list[str
     import_names = [PDF_RENDERER_IMPORT_NAMES.get(name, name) for name in wanted]
     target = python_exe or PathResolver.get_kicad_python_path()
 
+    # Always ask the target interpreter itself. There is no safe shortcut for
+    # "it is this same interpreter, check in-process": a virtualenv's
+    # bin/python is a symlink to its base, so comparing resolved paths
+    # collapses two genuinely different environments onto one and answers for
+    # the wrong site-packages. One short subprocess is cheaper than being
+    # wrong, and this runs once per export.
     if target and os.path.isfile(target):
-        try:
-            same = os.path.realpath(target) == os.path.realpath(sys.executable or "")
-        except OSError:
-            same = False
-        if not same:
-            probed = _probe_missing_in_interpreter(target, wanted, import_names)
-            if probed is not None:
-                return probed
+        probed = _probe_missing_in_interpreter(target, wanted, import_names)
+        if probed is not None:
+            return probed
 
-    # Same interpreter as this process, or the probe could not run.
+    # No usable target, or the probe could not run at all.
     import importlib.util
 
     missing = []
@@ -3079,6 +3108,46 @@ def missing_pdf_renderer_packages(packages=None, *, python_exe=None) -> list[str
         if not found:
             missing.append(name)
     return missing
+
+
+def _pip_install_until_importable(exe: str, package: str, log) -> tuple[bool, str]:
+    """
+    Install one package into ``exe`` and confirm that interpreter can import it.
+
+    Walks :data:`PDF_RENDERER_PIP_ATTEMPTS` and stops at the first attempt the
+    target interpreter can actually import the result of. pip's exit code is
+    deliberately not the test -- a no-op install over orphaned metadata exits 0
+    and leaves the import broken.
+
+    Returns:
+        ``(ok, detail)``, where ``detail`` describes the last failure.
+    """
+    detail = "pip produced no output"
+    for flags in PDF_RENDERER_PIP_ATTEMPTS:
+        argv = [exe, "-m", "pip", "install", "--disable-pip-version-check", *flags, package]
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=PDF_RENDERER_INSTALL_TIMEOUT_SEC,
+                startupinfo=_subprocess_startupinfo(),
+            )
+        except FileNotFoundError:
+            return False, f"{exe} has no usable pip module."
+        except subprocess.TimeoutExpired:
+            return False, "Installation timed out. Check the network and try again."
+        except OSError as exc:
+            return False, f"Installation could not start: {exc}"
+
+        if not missing_pdf_renderer_packages([package], python_exe=exe):
+            return True, ""
+
+        lines = (result.stderr or result.stdout or "").strip().splitlines()
+        detail = lines[-1] if lines else f"pip exited with {result.returncode}"
+        log.info("pip install %s %s left %s still unable to import it.",
+                 " ".join(flags), package, exe)
+    return False, detail
 
 
 def install_pdf_renderer(packages=None, *, python_exe=None, log=None):
@@ -3097,30 +3166,23 @@ def install_pdf_renderer(packages=None, *, python_exe=None, log=None):
     if not exe or not os.path.isfile(exe):
         return False, f"Could not locate KiCad's Python interpreter (resolved: {exe!r})."
 
-    argv = [exe, "-m", "pip", "install", "--disable-pip-version-check", *wanted]
-    (log or logger).info("Installing PDF renderers into %s: %s", exe, ", ".join(wanted))
-    try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=PDF_RENDERER_INSTALL_TIMEOUT_SEC,
-            startupinfo=_subprocess_startupinfo(),
-        )
-    except FileNotFoundError:
-        return False, f"{exe} has no usable pip module."
-    except subprocess.TimeoutExpired:
-        return False, "Installation timed out. Check the network and try again."
-    except OSError as exc:
-        return False, f"Installation could not start: {exc}"
+    log = log or logger
+    log.info("Installing PDF renderers into %s: %s", exe, ", ".join(wanted))
 
-    if result.returncode == 0:
-        return True, f"Installed {', '.join(wanted)} into KiCad's Python."
+    failed = []
+    detail = ""
+    for name in wanted:
+        ok, attempt_detail = _pip_install_until_importable(exe, name, log)
+        if not ok:
+            failed.append(name)
+            detail = attempt_detail
 
-    detail = (result.stderr or result.stdout or "").strip().splitlines()
-    tail = detail[-1] if detail else f"pip exited with {result.returncode}"
-    (log or logger).warning("PDF renderer install failed: %s", tail)
-    return False, f"Installation failed: {tail}"
+    if failed:
+        log.warning("PDF renderer install failed for %s: %s", ", ".join(failed), detail)
+        return False, f"Installation failed for {', '.join(failed)}: {detail}"
+
+    where = "KiCad's Python" if python_exe is None else exe
+    return True, f"Installed {', '.join(wanted)} into {where}."
 
 
 def _discard_file(path: str) -> None:
@@ -3366,7 +3428,8 @@ def _export_pdf_via_subprocess(
             if proc.stderr is not None:
                 err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
             logger.debug(
-                "%s subprocess PDF export unavailable or failed: %s" % tier_func,
+                "%s subprocess PDF export unavailable or failed: %s",
+                tier_func,
                 err.splitlines()[-1] if err else proc.returncode,
             )
         _discard_file(output_pdf_path)
@@ -3778,7 +3841,10 @@ class HomebrewPdfExportTask(ExportTask):
         py_exe = context.kicad_python
         if not py_exe:
             return
-        missing = missing_pdf_renderer_packages(python_exe=py_exe)
+        missing = [
+            name for name in missing_pdf_renderer_packages(python_exe=py_exe)
+            if name not in _RENDERER_INSTALL_FAILED
+        ]
         if not missing:
             return
 
@@ -3791,7 +3857,7 @@ class HomebrewPdfExportTask(ExportTask):
         # PyQt6 is a ~100 MB download and the only feedback during it is this
         # label, so "Installing PyQt6 (2 of 2)" beats a single frozen message
         # covering both.
-        base = [py_exe, "-m", "pip", "install", "--user"]
+        base = [py_exe, "-m", "pip", "install", "--disable-pip-version-check"]
         total = len(missing)
         for index, name in enumerate(missing, start=1):
             if context.is_aborted():
@@ -3800,16 +3866,26 @@ class HomebrewPdfExportTask(ExportTask):
                 step = f" ({index} of {total})" if total > 1 else ""
                 context.progress_callback(None, None, f"Installing {name}{step}\u2026")
 
-            ok = self._run_subprocess(base + [name], context)
-            if not ok and not context.is_aborted():
-                # Same escalation as IbomExportTask: externally-managed
-                # environments (PEP 668) refuse a plain --user install.
-                context.logger.info("pip install failed for %s. Retrying with --break-system-packages...", name)
-                ok = self._run_subprocess(base + ["--break-system-packages", name], context)
+            # Same ladder as install_pdf_renderer, but driven through the
+            # cancellable runner so progress reports and Cancel keep working
+            # during a ~100 MB download. An attempt counts only when the
+            # target interpreter can import the package afterwards: pip exits
+            # 0 on "Requirement already satisfied" even when the files it is
+            # satisfied by are gone, which is what made every export reinstall
+            # the same two packages and still fail to render.
+            installed = False
+            for flags in PDF_RENDERER_PIP_ATTEMPTS:
+                self._run_subprocess(base + list(flags) + [name], context)
+                if context.is_aborted():
+                    return
+                if not missing_pdf_renderer_packages([name], python_exe=py_exe):
+                    installed = True
+                    break
 
-            if ok:
+            if installed:
                 context.logger.info("Installed homebrew PDF renderer: %s", name)
             else:
+                _RENDERER_INSTALL_FAILED.add(name)
                 context.logger.warning("Could not install homebrew PDF renderer: %s", name)
 
         if context.progress_callback and not context.is_aborted():

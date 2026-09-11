@@ -1731,10 +1731,13 @@ class TestKiForgeCLI(unittest.TestCase):
         """
         from unittest.mock import MagicMock, patch
 
-        captured = {}
+        # Every subprocess the install makes is recorded, not just the last:
+        # it runs the target interpreter twice per attempt -- once for pip and
+        # once to ask that interpreter whether the package now imports.
+        calls = []
 
         def fake_run(argv, **kwargs):
-            captured["argv"] = argv
+            calls.append(argv)
             return MagicMock(returncode=0, stdout="", stderr="")
 
         with patch.object(kiforge.PathResolver, "get_kicad_python_path",
@@ -1743,9 +1746,10 @@ class TestKiForgeCLI(unittest.TestCase):
                 ok, message = kiforge.install_pdf_renderer(["Pillow"])
 
         self.assertTrue(ok, message)
-        self.assertEqual(captured["argv"][:4],
-                         [sys.executable, "-m", "pip", "install"])
-        self.assertIn("Pillow", captured["argv"])
+        pip_calls = [argv for argv in calls if argv[1:4] == ["-m", "pip", "install"]]
+        self.assertEqual(len(pip_calls), 1, calls)
+        self.assertEqual(pip_calls[0][0], sys.executable)
+        self.assertIn("Pillow", pip_calls[0])
 
     def test_install_pdf_renderer_reports_failure_without_raising(self):
         """A failed install degrades to the existing tier fallbacks, never a crash."""
@@ -1764,6 +1768,68 @@ class TestKiForgeCLI(unittest.TestCase):
             ok, message = kiforge.install_pdf_renderer(["Pillow"])
         self.assertFalse(ok)
         self.assertIn("Could not locate", message)
+
+    def test_install_pdf_renderer_forces_over_orphaned_metadata(self):
+        """
+        pip exiting 0 is not proof the interpreter can import the package.
+
+        A leftover .dist-info with no package directory next to it makes pip
+        answer "Requirement already satisfied" and write nothing, so the
+        import still fails -- and the next export finds the same package
+        missing and installs it again, forever. The ladder has to escalate to
+        --force-reinstall and judge every attempt by the import.
+        """
+        from unittest.mock import MagicMock, patch
+
+        state = {"forced": False}
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["-m", "pip", "install"]:
+                if "--force-reinstall" in argv:
+                    state["forced"] = True
+                return MagicMock(returncode=0, stdout="Requirement already satisfied", stderr="")
+            # The probe: PIL imports only once the files were actually written.
+            return MagicMock(returncode=0, stdout="" if state["forced"] else "PIL\n", stderr="")
+
+        with patch.object(kiforge.PathResolver, "get_kicad_python_path",
+                          return_value=sys.executable):
+            with patch("subprocess.run", side_effect=fake_run):
+                ok, message = kiforge.install_pdf_renderer(["Pillow"])
+
+        self.assertTrue(ok, message)
+        pip_calls = [argv for argv in calls if argv[1:4] == ["-m", "pip", "install"]]
+        self.assertEqual(len(pip_calls), len(kiforge.PDF_RENDERER_PIP_ATTEMPTS), pip_calls)
+        self.assertIn("--force-reinstall", pip_calls[-1])
+
+    def test_renderer_install_is_attempted_once_per_session(self):
+        """
+        A renderer that will not install must not be retried on every export.
+
+        Re-running the whole pip ladder each time adds minutes to every export
+        and ends with the same warning; run() still names the remedy, and
+        restarting KiCad clears the memo.
+        """
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ctx = self._make_export_context(tmp_dir)
+            ctx.kicad_python = sys.executable
+            ctx.progress_callback = None
+            task = kiforge.HomebrewPdfExportTask()
+            kiforge._RENDERER_INSTALL_FAILED.discard("Pillow")
+            try:
+                with patch("kiforge.missing_pdf_renderer_packages", return_value=["Pillow"]), \
+                     patch.object(task, "_run_subprocess", return_value=False) as mock_run:
+                    task._ensure_renderer_installed(ctx)
+                    attempts = mock_run.call_count
+                    self.assertEqual(attempts, len(kiforge.PDF_RENDERER_PIP_ATTEMPTS))
+
+                    task._ensure_renderer_installed(ctx)
+                    self.assertEqual(mock_run.call_count, attempts)
+            finally:
+                kiforge._RENDERER_INSTALL_FAILED.discard("Pillow")
 
     def test_cli_tier_is_rsvg_only(self):
         """
