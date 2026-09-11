@@ -976,7 +976,7 @@ class _ExportProgressDialog(wx.Dialog):
         self.lbl_message.SetForegroundColour(_COLORS["text"])
         sizer.Add(self.lbl_message, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, _SP_LG)
 
-        sizer.AddSpacer(_SP_MD)
+        self._gauge_spacer = sizer.AddSpacer(_SP_MD)
         self.gauge = wx.Gauge(self, range=100, size=(-1, _SP_SM))
         sizer.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, _SP_LG)
 
@@ -995,7 +995,7 @@ class _ExportProgressDialog(wx.Dialog):
         sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, _SP_LG)
 
         self.SetSizer(sizer)
-        self.SetMinSize((340, 116))
+        self.SetMinSize((340, -1))
         self.Fit()
         self.CentreOnParent()
 
@@ -1005,8 +1005,12 @@ class _ExportProgressDialog(wx.Dialog):
         self._cancelled = True
         self._message = "Cancelling…"
         self.lbl_message.SetLabel(self._message)
+        self.gauge.Hide()
+        if hasattr(self, "_gauge_spacer") and self._gauge_spacer is not None:
+            self._gauge_spacer.Show(False)
         self.btn_cancel.Disable()
         self.Layout()
+        self.Fit()
         # Paint "Cancelling..." now rather than whenever the loop next idles,
         # and abort the export straight away instead of waiting for the poll
         # timer to notice was_cancelled().
@@ -1041,6 +1045,8 @@ class _ExportProgressDialog(wx.Dialog):
         owner = self.GetParent()
         if owner is not None and getattr(owner, "_export_progress", None) is self:
             owner._export_progress = None
+            if hasattr(owner, "btn_export"):
+                owner.btn_export.Enable()
         self.Hide()
         self.Destroy()
 
@@ -1056,7 +1062,12 @@ class _ExportProgressDialog(wx.Dialog):
         self._finished = True
         self._message = message
         self.lbl_message.SetLabel(message)
-        self.gauge.SetValue(100 if complete else 0)
+        if not complete or self._cancelled:
+            self.gauge.Hide()
+            if hasattr(self, "_gauge_spacer") and self._gauge_spacer is not None:
+                self._gauge_spacer.Show(False)
+        else:
+            self.gauge.SetValue(100)
         self.btn_cancel.SetLabel("OK")
         self.btn_cancel.Enable()
         # Green confirms the run finished; a failure or cancellation keeps the
@@ -2484,6 +2495,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             if self._export_progress is progress:
                 self._export_progress = None
             progress.Destroy()
+            if hasattr(self, "btn_export"):
+                self.btn_export.Enable()
 
     def _stop_export_timer(self):
         if self._export_timer and self._export_timer.IsRunning():
@@ -2494,6 +2507,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         progress = self._export_progress
         self._export_progress = None
         _destroy_progress_dialog(progress)
+        if hasattr(self, "btn_export"):
+            self.btn_export.Enable()
 
     def _poll_export_progress(self, event):
         state = self._export_state
@@ -2558,8 +2573,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_state = None
         self._export_context = None
         self._export_project_dir = None
-        if hasattr(self, "btn_export"):
-            self.btn_export.Enable()
         wx.CallAfter(self._finish_export_ui, state, context, project_dir)
 
     def _finish_export_ui(self, state, context, project_dir):

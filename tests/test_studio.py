@@ -873,6 +873,7 @@ class TestKiForgeStudio(unittest.TestCase):
         """
         dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
         try:
+            dialog.btn_export.Disable()
             dialog._export_running = True
             dialog._export_close_after_finish = False
             dialog._export_state = {
@@ -899,14 +900,22 @@ class TestKiForgeStudio(unittest.TestCase):
             progress.update(80, "Running: Packaging Gerbers...")
             self.assertEqual(progress.lbl_message.GetLabel(), "Cancelling…")
 
-            # worker finally exits -> dialog closes and Studio returns to idle
+            # worker finally exits -> dialog shows "Export cancelled." with OK button
             dialog._export_state['running'] = False
             thread.is_alive.return_value = False
             dialog._poll_export_progress(None)
             wx.Yield()
             self.assertFalse(dialog._export_running)
+            self.assertFalse(dialog.btn_export.IsEnabled(),
+                             "Export button must stay disabled while result dialog is open")
+            self.assertEqual(progress.lbl_message.GetLabel(), "Export cancelled.")
+            self.assertFalse(progress.gauge.IsShown(),
+                             "Progress bar must not be visible on cancelled export")
+
+            # user clicks OK -> dialog is dismissed and Studio returns to idle
+            progress._on_dismiss(None)
             self.assertTrue(dialog.btn_export.IsEnabled(),
-                            "Export must be usable again once the export stops")
+                            "Export must be usable again once OK is clicked")
         finally:
             dialog._export_running = False
             dialog.Destroy()
@@ -965,6 +974,7 @@ class TestKiForgeStudio(unittest.TestCase):
         """
         dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
         try:
+            dialog.btn_export.Disable()
             dialog._export_running = True
             dialog._export_close_after_finish = False
             dialog._export_state = {
@@ -991,6 +1001,7 @@ class TestKiForgeStudio(unittest.TestCase):
         """The Close button, unlike progress-dialog Cancel, must still close Studio."""
         dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
         try:
+            dialog.btn_export.Disable()
             dialog._export_running = True
             dialog._export_close_after_finish = False
             dialog._export_state = {'cancelled': False}
