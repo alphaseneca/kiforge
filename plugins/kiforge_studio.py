@@ -1435,14 +1435,15 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     ``wx.Timer``.
     """
     
-    def __init__(self, parent, project_dir=None, pcb_file=None):
+    def __init__(self, parent, project_dir=None, board_file=None, pcb_file=None):
         """
-        Initializes the settings dialog window.
-        
+        Initialize the KiForge Studio configuration dialog.
+
         Args:
-            parent: The parent wxWindow or None if running standalone.
-            project_dir (str, optional): Pre-resolved project root folder.
-            pcb_file (str, optional): Path to active .kicad_pcb board file.
+            parent: Parent wx.Window or None when running in standalone mode.
+            project_dir (str, optional): Pre-resolved project directory or board file path.
+            board_file (str, optional): Path to active .kicad_pcb board file.
+            pcb_file (str, optional): Backward-compatible alias for board_file.
         """
         super(KiForgeStudioSettingsDialog, self).__init__(
             parent, 
@@ -1455,7 +1456,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         refresh_palette()
         self.Bind(wx.EVT_SYS_COLOUR_CHANGED, self._on_system_colour_changed)
         self.project_dir = project_dir
-        self.pcb_file = pcb_file
+        self.board_file = os.path.abspath(board_file or pcb_file) if (board_file or pcb_file) else None
+        self.pcb_file = self.board_file
         self.settings = kiforge.load_merged_settings(project_dir)
         self._export_timer = None
         self._export_state = None
@@ -2201,7 +2203,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_homebrew_pdf.SetValue(self._export_setting('export_homebrew_pdf'))
         self.txt_output_dir.SetValue(self.settings.get('output_dir', 'kiforge'))
         self.chk_generate_cd.SetValue(
-            self._export_setting('generate_cd', self.settings.get('generate_ci', True))
+            self._export_setting('generate_cd', True)
         )
         self._set_preset_choice(self._detect_active_preset())
         self._sync_drill_checkbox_state()
@@ -2276,7 +2278,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         }
 
     def _sync_drill_checkbox_state(self):
-        """Drill export is required whenever Gerbers are enabled."""
+        """
+        Synchronize drill export state with Gerber manufacturing requirements.
+
+        Because Gerber production archives bundle drill and NC drill files
+        together, drill export is engaged and locked whenever Gerber export
+        is selected.
+        """
         if self.chk_gerbers.IsChecked():
             self.chk_drills.SetValue(True)
             self.chk_drills.Disable()
@@ -2284,76 +2292,87 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self.chk_drills.Enable()
 
     def _sync_svg_pdf_checkbox_state(self):
-        """Homebrew PDF is generated from the Copper SVG layers, so Copper SVG
-        export is required whenever Homebrew PDF is enabled -- lock it on
-        (checked, disabled) rather than let the two drift out of sync."""
+        """
+        Synchronize Copper SVG export state with Homebrew PDF requirements.
+
+        Homebrew etching and mask PDF generation rasterizes directly from
+        copper layer SVGs, requiring SVG export to remain active while Homebrew
+        PDF export is selected.
+        """
         if self.chk_homebrew_pdf.IsChecked():
             self.chk_svg.SetValue(True)
             self.chk_svg.Disable()
         else:
             self.chk_svg.Enable()
 
-    def _resolve_active_files(self) -> tuple[str | None, str | None]:
-        """Resolve active (.kicad_pcb, .kicad_sch) file paths for current project or pcb_file."""
+    def _resolve_project_source_files(self) -> tuple[str | None, str | None]:
+        """
+        Locate the active printed circuit board and schematic source files.
+
+        Resolves the primary board path from an explicitly provided board target,
+        a direct board path supplied as the project directory, or by scanning
+        the project directory for a top-level board file (.kicad_pcb).
+
+        When a board file is identified, schematic lookup is strictly isolated
+        to the containing directory to preserve project revisions and maintain
+        design coherence.
+
+        Returns:
+            tuple[str | None, str | None]: Absolute paths to (board_file, schematic_file).
+        """
         board_file = None
         sch_file = None
-        if self.pcb_file and os.path.isfile(self.pcb_file):
-            board_file = os.path.abspath(self.pcb_file)
+        board_target = self.board_file or self.pcb_file
+
+        if board_target and os.path.isfile(board_target):
+            board_file = os.path.abspath(board_target)
         elif self.project_dir and os.path.isfile(self.project_dir) and self.project_dir.endswith(".kicad_pcb"):
             board_file = os.path.abspath(self.project_dir)
         elif self.project_dir and os.path.isdir(self.project_dir):
             try:
-                pcb_files = [
+                pcb_candidates = [
                     os.path.join(self.project_dir, f)
                     for f in os.listdir(self.project_dir)
                     if f.endswith(".kicad_pcb") and not f.startswith(".") and not f.startswith("~")
                 ]
-                if pcb_files:
-                    pcb_files.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
-                    board_file = os.path.abspath(pcb_files[0])
+                if pcb_candidates:
+                    pcb_candidates.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
+                    board_file = os.path.abspath(pcb_candidates[0])
             except OSError:
                 pass
 
         if board_file:
             board_dir = os.path.dirname(board_file)
             base_name = os.path.splitext(os.path.basename(board_file))[0]
-            candidate = os.path.join(board_dir, f"{base_name}.kicad_sch")
-            if os.path.isfile(candidate):
-                sch_file = candidate
+            matched_sch = os.path.join(board_dir, f"{base_name}.kicad_sch")
+            if os.path.isfile(matched_sch):
+                sch_file = matched_sch
             elif os.path.isdir(board_dir):
                 try:
-                    sch_files = [
+                    sch_candidates = [
                         os.path.join(board_dir, f)
                         for f in os.listdir(board_dir)
                         if f.endswith(".kicad_sch") and not f.startswith(".") and not f.startswith("~")
                     ]
-                    if sch_files:
-                        sch_files.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
-                        sch_file = os.path.abspath(sch_files[0])
+                    if sch_candidates:
+                        sch_candidates.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
+                        sch_file = os.path.abspath(sch_candidates[0])
                 except OSError:
                     pass
 
-        if not sch_file and self.project_dir and os.path.isdir(self.project_dir):
-            try:
-                sch_files = [
-                    os.path.join(self.project_dir, f)
-                    for f in os.listdir(self.project_dir)
-                    if f.endswith(".kicad_sch") and not f.startswith(".") and not f.startswith("~")
-                ]
-                if sch_files:
-                    sch_files.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
-                    sch_file = os.path.abspath(sch_files[0])
-            except OSError:
-                pass
-
         return board_file, sch_file
+
+    _resolve_active_files = _resolve_project_source_files
 
     def _sync_file_availability_state(self):
         """
-        Dynamically enable/disable UI controls based on available files.
-        When schematic is absent, disable schematic-dependent controls (Schematic PDF, BOM).
+        Update UI control availability based on active project source files.
+
+        Disables schematic-dependent outputs (Schematic PDF, Bill of Materials,
+        and MPN fields) when exporting from a standalone board file without an
+        accompanying schematic.
         """
-        board_file, sch_file = self._resolve_active_files()
+        board_file, sch_file = self._resolve_project_source_files()
         has_sch = bool(sch_file and os.path.isfile(sch_file))
         sch_missing = bool(board_file and not has_sch)
 
@@ -2384,10 +2403,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._sync_export_button_state()
 
     def _sync_export_button_state(self, has_outputs: bool | None = None):
-        """Enable or disable the Export button based on board file and output selections."""
+        """
+        Update the Export button state based on board file presence and selected outputs.
+
+        Disables the button if no board file exists or if no output targets are selected.
+        """
         if not hasattr(self, "btn_export"):
             return
-        board_file, _ = self._resolve_active_files()
+        board_file, _ = self._resolve_project_source_files()
         has_pcb = bool(board_file and os.path.isfile(board_file))
         if has_outputs is None:
             has_outputs = any(
@@ -2406,14 +2429,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self.btn_export.SetToolTip("")
 
     def on_gerbers_toggled(self, event):
-        """Keep drill export aligned with Gerber export requirements."""
+        """Synchronize drill export state and refresh export summary on Gerber toggle."""
         if event is not None and hasattr(event, "Skip"):
             event.Skip()
         self._sync_drill_checkbox_state()
         self.on_export_checkbox_changed(event)
 
     def on_homebrew_pdf_toggled(self, event):
-        """Keep Copper SVG export aligned with Homebrew PDF requirements."""
+        """Synchronize Copper SVG export state and refresh export summary on Homebrew PDF toggle."""
         if event is not None and hasattr(event, "Skip"):
             event.Skip()
         self._sync_svg_pdf_checkbox_state()
@@ -2886,7 +2909,7 @@ class ExporterPlugin(_PluginBase):
 
         dialog = None
         try:
-            dialog = KiForgeStudioSettingsDialog(parent_window, project_dir, pcb_file=board_file)
+            dialog = KiForgeStudioSettingsDialog(parent_window, project_dir, board_file=board_file)
             dialog.ShowModal()
         except Exception as exc:
             logger.exception("KiForge Studio dialog failed to open.")

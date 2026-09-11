@@ -52,7 +52,7 @@ jobs:
 ## All Available Inputs
 
 All inputs are optional. Every export is enabled by default. Set an input to `'false'` to disable it.
-Canonical input names are **kebab-case** (matching CLI flags); legacy `snake_case` aliases (`project_path`, `output_dir`, etc.) are supported for backwards compatibility.
+All inputs use **kebab-case**, matching CLI flags 1:1.
 
 | Input | Description | Default |
 |---|---|---|

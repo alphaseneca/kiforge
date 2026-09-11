@@ -131,7 +131,7 @@ policy](https://dev-docs.kicad.org/en/rules-guidelines/code-style/index.html):
   rather than relying on presence.
 - **Naming conventions across interfaces**:
   - **CLI flags**: always kebab-case (`--pcb-file`, `--project-path`, `--output-dir`, `--export-gerbers`).
-  - **GitHub Action inputs**: canonical names are kebab-case (`pcb-file`, `project-path`, `output-dir`, `export-gerbers`), matching CLI flags. Always maintain backwards-compatible `snake_case` aliases (`pcb_file`, `project_path`, `output_dir`) in `action.yml` and runner mappings.
+  - **GitHub Action inputs**: kebab-case (`pcb-file`, `project-path`, `output-dir`, `export-gerbers`), matching CLI flags 1:1.
   - **Python code & internals**: PEP 8 snake_case (`pcb_file`, `project_path`, `output_dir`).
 
 ## 6. Failure must be visible
