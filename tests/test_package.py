@@ -151,15 +151,18 @@ class TestPackagePlugin(unittest.TestCase):
     def test_package_manifest_validation_requires_tags(self):
         """Build must fail when metadata.json omits required PCM v2 fields."""
         manifest_path = package_plugin.PACKAGE_MANIFEST_PATH
-        original = manifest_path.read_text(encoding="utf-8")
+        # Bytes, not text: read_text() collapses the file's CRLF endings to
+        # \n and write_text() does not put them back, so this "restore" left a
+        # tracked file rewritten every time the suite ran.
+        original = manifest_path.read_bytes()
         try:
-            data = json.loads(original)
+            data = json.loads(original.decode("utf-8"))
             data.pop("tags", None)
             manifest_path.write_text(json.dumps(data, indent=4) + "\n", encoding="utf-8")
             with self.assertRaises(SystemExit):
                 package_plugin._load_package_manifest()
         finally:
-            manifest_path.write_text(original, encoding="utf-8")
+            manifest_path.write_bytes(original)
 
     def test_package_manifest_official_submission_fields(self):
         """Committed metadata.json includes author and PCM resource links."""
