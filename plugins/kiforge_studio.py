@@ -40,8 +40,7 @@ import logging
 # pyrefly: ignore [missing-import]
 import wx
 
-# Try importing pcbnew. If it's not available (e.g. running in standard Python shell),
-# handle it gracefully for standalone mode.
+# pcbnew is only available inside KiCad; absent in standalone and test runs.
 try:
     # pyrefly: ignore [missing-import]
     import pcbnew
@@ -89,17 +88,8 @@ def _snap_to_grid(value: int, step: int = _SP_XS) -> int:
     """Round a pixel dimension to the nearest step of the 4pt grid."""
     return max(step, int(round(value / step)) * step)
 # Palette -------------------------------------------------------------------
-# Two mirrored Zinc ramps, chosen from the OS appearance at dialog open.
-#
-# Studio used to hardcode the dark ramp only. On a Mac running light mode that
-# produced a dark dialog under a *light* system title bar, with every natively
-# drawn element -- title bar, scrollbars, file dialogs, selection highlights --
-# still light, and any text left at a system colour rendering dark-on-dark. The
-# window looked broken and parts of it were unreadable. Windows users rarely saw
-# it because the KiCad default there is dark.
-#
-# Both ramps must define exactly the same keys; a test enforces that, because a
-# missing key would raise inside a paint handler where exceptions are swallowed.
+# Two mirrored Zinc ramps (dark / light) selected from the OS appearance at dialog open.
+# Both ramps must define exactly the same keys; a missing key raises inside a paint handler.
 _DARK_PALETTE = {
     "app_bg": wx.Colour(24, 24, 27),
     "surface": wx.Colour(39, 39, 42),
@@ -130,9 +120,7 @@ _LIGHT_PALETTE = {
     "success": wx.Colour(22, 163, 74),
 }
 
-# Every widget reads _COLORS inside a paint handler, never at import time, so
-# the active palette is applied by mutating this dict in place -- all existing
-# lookups pick the change up with no call-site edits and no stale references.
+# Mutated in place by refresh_palette() so all paint-handler lookups pick up the change without call-site edits.
 _COLORS = dict(_DARK_PALETTE)
 
 # Tab glyphs are tinted to one flat colour, so the dark ramp's near-white tint
@@ -160,10 +148,7 @@ _MSG_ICON_COLORS_BY_MODE = {
     },
 }
 
-# Live severity colours, swapped in place by refresh_palette() exactly as
-# _COLORS is. Defined here, beside the table it mirrors and above the function
-# that mutates it, so the palette block is self-contained: a forward reference
-# would only surface as a NameError at import, which KiCad's loader swallows.
+# Mutated in place by refresh_palette() alongside _COLORS; initialised here to keep the palette block self-contained.
 _MSG_ICON_COLORS = dict(_MSG_ICON_COLORS_BY_MODE["dark"])
 
 _palette_mode = "dark"
@@ -237,6 +222,7 @@ class _FlatButton(wx.Panel):
     """Flat filled button with rounded corners; paints consistently on Windows and Linux."""
 
     def __init__(self, parent, label: str, *, primary: bool = False, min_width: int = 0):
+        """Initialise flat button with text label, appearance style, and minimum width."""
         super().__init__(parent, style=wx.BORDER_NONE)
         self._label = label
         self._primary = primary
@@ -266,21 +252,25 @@ class _FlatButton(wx.Panel):
         self.Refresh()
 
     def GetLabel(self) -> str:
+        """Return the painted label string."""
         return self._label
 
     def _on_enter(self, event):
+        """Handle mouse enter event to update hover appearance."""
         if self._enabled:
             self._hover = True
             self.Refresh()
         event.Skip()
 
     def _on_leave(self, event):
+        """Handle mouse leave event to clear hover state."""
         self._hover = False
         self._pressed = False
         self.Refresh()
         event.Skip()
 
     def _on_left_down(self, event):
+        """Handle left mouse button press and capture mouse input."""
         if not self._enabled:
             return
         self._pressed = True
@@ -288,6 +278,7 @@ class _FlatButton(wx.Panel):
         self.Refresh()
 
     def _on_left_up(self, event):
+        """Handle left mouse button release and fire button event if released inside."""
         if not self._enabled:
             return
         if self.HasCapture():
@@ -319,6 +310,7 @@ class _FlatButton(wx.Panel):
         self.Refresh()
 
     def _on_paint(self, event):
+        """Paint flat rounded button with border, fill tone, and centered label."""
         dc = wx.AutoBufferedPaintDC(self)
         width, height = self.GetSize()
         parent = self.GetParent()
@@ -398,11 +390,13 @@ class _FlatButton(wx.Panel):
         dc.DrawText(self._label, (width - tw) // 2, (height - th) // 2)
 
     def Enable(self, enable=True):
+        """Enable or disable button interaction and refresh visual style."""
         self._enabled = bool(enable)
         self.Refresh()
         return super().Enable(enable)
 
     def Disable(self):
+        """Disable button interaction."""
         return self.Enable(False)
 
 
@@ -441,6 +435,7 @@ class _FlatCheckBox(wx.Panel):
     """
 
     def __init__(self, parent, label: str = ""):
+        """Initialise custom-painted checkbox with text label and default unchecked state."""
         super().__init__(parent, style=wx.BORDER_NONE)
         self._label = label
         self._checked = False
@@ -469,6 +464,7 @@ class _FlatCheckBox(wx.Panel):
         self.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
 
     def AcceptsFocus(self):
+        """Return True if enabled to allow keyboard focus navigation."""
         return self._enabled
 
     def _on_set_focus(self, event):
@@ -502,24 +498,28 @@ class _FlatCheckBox(wx.Panel):
         event.Skip()
 
     def _on_key_down(self, event):
+        """Toggle checkbox state when Space key is pressed."""
         if self._enabled and event.GetKeyCode() in (wx.WXK_SPACE, wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             self._toggle()
         else:
             event.Skip()
 
     def _on_enter(self, event):
+        """Update hover highlight state on mouse enter."""
         if self._enabled:
             self._hover = True
             self.Refresh()
         event.Skip()
 
     def _on_leave(self, event):
+        """Clear hover and pressed states on mouse leave."""
         self._hover = False
         self._pressed = False
         self.Refresh()
         event.Skip()
 
     def _on_left_down(self, event):
+        """Capture mouse input and flag pressed state on left down."""
         if not self._enabled:
             return
         self._pressed = True
@@ -529,6 +529,7 @@ class _FlatCheckBox(wx.Panel):
         self.Refresh()
 
     def _on_left_up(self, event):
+        """Release mouse and toggle check state if released within control bounds."""
         if not self._enabled:
             return
         if self.HasCapture():
@@ -558,6 +559,7 @@ class _FlatCheckBox(wx.Panel):
         self.Refresh()
 
     def _toggle(self):
+        """Toggle checked state and fire wx.EVT_CHECKBOX event."""
         self._checked = not self._checked
         self.Refresh()
         event = wx.CommandEvent(wx.EVT_CHECKBOX.typeId, self.GetId())
@@ -566,6 +568,7 @@ class _FlatCheckBox(wx.Panel):
         wx.PostEvent(self, event)
 
     def _on_paint(self, event):
+        """Paint custom square checkbox glyph, focus ring, checkmark, and text label."""
         dc = wx.AutoBufferedPaintDC(self)
         width, height = self.GetSize()
         parent = self.GetParent()
@@ -671,21 +674,26 @@ class _FlatCheckBox(wx.Panel):
 
     # --- wx.CheckBox-compatible API ---
     def IsChecked(self) -> bool:
+        """Return True if checkbox is checked."""
         return self._checked
 
     def GetValue(self) -> bool:
+        """Return current boolean state."""
         return self._checked
 
     def SetValue(self, value: bool) -> None:
+        """Set checkbox boolean value and refresh."""
         self._checked = bool(value)
         self.Refresh()
 
     def Enable(self, enable=True):
+        """Enable or disable control interaction and repaint."""
         self._enabled = bool(enable)
         self.Refresh()
         return super().Enable(enable)
 
     def Disable(self):
+        """Disable control interaction."""
         return self.Enable(False)
 
 
@@ -702,6 +710,7 @@ class _FlatRadioButton(wx.Panel):
     """
 
     def __init__(self, parent, label: str = "", group: list | None = None):
+        """Initialise custom-painted radio button and link to peer group."""
         super().__init__(parent, style=wx.BORDER_NONE)
         self._label = label
         self._selected = False
@@ -733,6 +742,7 @@ class _FlatRadioButton(wx.Panel):
         self.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
 
     def AcceptsFocus(self):
+        """Return True if enabled to allow keyboard focus navigation."""
         return self._enabled
 
     def _on_set_focus(self, event):
@@ -766,24 +776,28 @@ class _FlatRadioButton(wx.Panel):
         event.Skip()
 
     def _on_key_down(self, event):
+        """Handle Space and Enter key presses to select radio option."""
         if self._enabled and event.GetKeyCode() in (wx.WXK_SPACE, wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             self._select()
         else:
             event.Skip()
 
     def _on_enter(self, event):
+        """Update hover appearance on mouse enter."""
         if self._enabled:
             self._hover = True
             self.Refresh()
         event.Skip()
 
     def _on_leave(self, event):
+        """Clear hover and pressed state on mouse leave."""
         self._hover = False
         self._pressed = False
         self.Refresh()
         event.Skip()
 
     def _on_left_down(self, event):
+        """Capture mouse input and flag pressed state on mouse down."""
         if not self._enabled:
             return
         self._pressed = True
@@ -793,6 +807,7 @@ class _FlatRadioButton(wx.Panel):
         self.Refresh()
 
     def _on_left_up(self, event):
+        """Release mouse capture and apply radio selection if released inside."""
         if not self._enabled:
             return
         if self.HasCapture():
@@ -851,6 +866,7 @@ class _FlatRadioButton(wx.Panel):
         wx.PostEvent(self, event)
 
     def _on_paint(self, event):
+        """Paint custom circular radio glyph, focus ring, selected dot, and text label."""
         dc = wx.AutoBufferedPaintDC(self)
         width, height = self.GetSize()
         parent = self.GetParent()
@@ -926,6 +942,7 @@ class _FlatRadioButton(wx.Panel):
 
     # --- wx.RadioButton-compatible API ---
     def GetValue(self) -> bool:
+        """Return True if radio button is selected."""
         return self._selected
 
     def SetValue(self, value: bool) -> None:
@@ -937,11 +954,13 @@ class _FlatRadioButton(wx.Panel):
             self.Refresh()
 
     def Enable(self, enable=True):
+        """Enable or disable interaction and repaint control."""
         self._enabled = bool(enable)
         self.Refresh()
         return super().Enable(enable)
 
     def Disable(self):
+        """Disable interaction."""
         return self.Enable(False)
 
 
@@ -949,6 +968,7 @@ class _ExportProgressDialog(wx.Dialog):
     """Non-modal export progress window following the system appearance."""
 
     def __init__(self, parent, on_cancel=None):
+        """Initialise export progress dialog with gauge, message label, and cancel button."""
         super().__init__(
             parent,
             title="KiForge",
@@ -1000,6 +1020,7 @@ class _ExportProgressDialog(wx.Dialog):
         self.CentreOnParent()
 
     def _on_cancel(self, event):
+        """Handle cancel button click and notify cancel callback."""
         if self._cancelled:
             return
         self._cancelled = True
@@ -1083,9 +1104,11 @@ class _ExportProgressDialog(wx.Dialog):
         self.Update()
 
     def is_finished(self) -> bool:
+        """Return True if the export task completed."""
         return self._finished
 
     def was_cancelled(self) -> bool:
+        """Return True if the user cancelled the export."""
         return self._cancelled
 
     def update(self, value: int, message: str | None) -> None:
@@ -1164,6 +1187,7 @@ class _KiForgeMessageDialog(wx.Dialog):
     """Themed message dialog following the system appearance, used in place of wx.MessageBox."""
 
     def __init__(self, parent, message: str, title: str, kind: str, buttons: str):
+        """Initialise themed message dialog matching active appearance ramp."""
         super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE)
         # Can be raised without the settings dialog ever opening (an export
         # failure from the toolbar), so it resolves the palette itself.
@@ -1220,6 +1244,7 @@ class _KiForgeMessageDialog(wx.Dialog):
         wx.CallAfter(default_btn.SetFocus)
 
     def _add_buttons(self, btn_row: wx.BoxSizer, buttons: str) -> "_FlatButton":
+        """Populate the action button row based on buttons configuration."""
         if buttons == "yes_no":
             btn_no = _FlatButton(self, "No", min_width=80)
             btn_no.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_NO))
@@ -1499,6 +1524,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     def _check_dependencies_async(self):
         """Check and install missing PDF renderer dependencies (Pillow) in the background."""
         def worker():
+            """Background worker thread for checking and installing missing PDF renderers."""
             try:
                 target_python = kiforge.PathResolver.get_kicad_python_path()
                 if not target_python or not os.path.isfile(target_python):
@@ -1538,6 +1564,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         event.Skip()
 
     def init_ui(self):
+        """Assemble Studio header, tabbed settings notebook, and footer controls."""
         self.SetBackgroundColour(_COLORS["app_bg"])
         main_sizer = wx.BoxSizer(wx.VERTICAL)
         main_sizer.Add(self._build_header_panel(), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, _SP_LG)
@@ -1590,6 +1617,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             return
 
         def worker():
+            """Background worker thread for prefetching tab icon SVGs from CDN."""
             for name in missing:
                 if kiforge.read_cached_tab_icon_svg(name):
                     continue
@@ -1615,7 +1643,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self.notebook.SetPageImage(index, index)
 
     def _bind_keyboard_shortcuts(self):
+        """Bind Ctrl+1/2/3 tab switching and Enter export shortcut."""
         def on_char_hook(event):
+            """Hook keyboard events for Ctrl+1/2/3 tab switching and Enter export."""
             if event.GetModifiers() == wx.MOD_CONTROL:
                 key = event.GetKeyCode()
                 tab_keys = {ord("1"): 0, ord("2"): 1, ord("3"): 2}
@@ -1634,12 +1664,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.Bind(wx.EVT_CHAR_HOOK, on_char_hook)
 
     def _separator(self, parent) -> wx.Panel:
+        """Create a 1px horizontal separator line matching border palette tone."""
         line = wx.Panel(parent, size=(-1, 1))
         line.SetBackgroundColour(_COLORS["border"])
         line.SetMinSize((-1, 1))
         return line
 
     def _style_panel(self, panel: wx.Panel, *, surface: bool = True) -> None:
+        """Apply palette background colour and background click focus clearing to panel."""
         panel.SetBackgroundColour(_COLORS["surface"] if surface else _COLORS["app_bg"])
         self._clear_focus_on_background_click(panel)
 
@@ -1664,16 +1696,19 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         target = focus_target or event_source
 
         def _on_click(event):
+            """Clear focus from custom painted control on background panel click."""
             target.SetFocusIgnoringChildren()
             event.Skip()
 
         event_source.Bind(wx.EVT_LEFT_DOWN, _on_click)
 
     def _style_text(self, label: wx.StaticText, *, muted: bool = False) -> wx.StaticText:
+        """Apply palette foreground colour to static text label."""
         label.SetForegroundColour(_COLORS["muted"] if muted else _COLORS["text"])
         return label
 
     def _style_input(self, ctrl: wx.TextCtrl) -> wx.TextCtrl:
+        """Apply palette colours and caret styling to text input control."""
         ctrl.SetBackgroundColour(_COLORS["input_bg"])
         ctrl.SetForegroundColour(_COLORS["input_fg"])
         try:
@@ -1683,6 +1718,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return ctrl
 
     def _section_label(self, parent, text: str) -> wx.StaticText:
+        """Construct a section header label with standard muted styling."""
         lbl = wx.StaticText(parent, label=text)
         lbl.SetForegroundColour(_COLORS["muted"])
         font = lbl.GetFont()
@@ -1692,6 +1728,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return lbl
 
     def _muted_label(self, parent, text: str, wrap: int | None = None) -> wx.StaticText:
+        """Construct a muted description label with optional wrapping."""
         lbl = wx.StaticText(parent, label=text)
         self._style_text(lbl, muted=True)
         if wrap:
@@ -1700,6 +1737,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return lbl
 
     def _build_header_panel(self):
+        """Build the top dialog banner containing the brand glyph and title."""
         banner = wx.Panel(self)
         self._style_panel(banner, surface=False)
         sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -1719,6 +1757,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return banner
 
     def _build_export_tab(self):
+        """Build the primary Outputs tab with export checkboxes and presets."""
         page = wx.Panel(self.notebook)
         self._style_panel(page, surface=False)
         scroll = wx.ScrolledWindow(page, style=wx.VSCROLL)
@@ -1779,6 +1818,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.notebook.AddPage(page, "Export")
 
     def _build_advanced_tab(self):
+        """Build the Advanced tab containing positioning and 3D model settings."""
         page = wx.Panel(self.notebook)
         self._style_panel(page, surface=False)
         scroll = wx.ScrolledWindow(page, style=wx.VSCROLL)
@@ -1854,6 +1894,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.notebook.AddPage(page, "Advanced")
 
     def _build_releases_tab(self):
+        """Build the Continuous Delivery tab with workflow options."""
         page = wx.Panel(self.notebook)
         self._style_panel(page, surface=False)
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -1876,6 +1917,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.notebook.AddPage(page, "Releases")
 
     def _build_footer_panel(self):
+        """Build the bottom action bar with summary text and export button."""
         footer = wx.Panel(self)
         footer.SetBackgroundColour(_COLORS["footer_bg"])
         self._clear_focus_on_background_click(footer)
@@ -1898,9 +1940,11 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return footer
 
     def _refresh_scroll_layout(self):
+        """Refresh scrolled window layout to adjust to container dimension changes."""
         self.Layout()
 
     def on_settings_menu(self, event):
+        """Display popup menu for loading, saving, or resetting configuration."""
         menu = wx.Menu()
         item_save_project = menu.Append(wx.ID_ANY, "Save for this project")
         item_save_global = menu.Append(wx.ID_ANY, "Save as global default")
@@ -1917,6 +1961,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         menu.Destroy()
 
     def _selected_preset_index(self) -> int:
+        """Return the index of the currently active preset or -1 for custom."""
         for idx, rb in enumerate(self._preset_radios):
             if rb.GetValue():
                 return idx
@@ -1948,6 +1993,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.on_export_setting_changed(event)
 
     def _apply_export_preset(self, preset_id: str):
+        """Apply preset output settings to checkboxes and update dependant UI controls."""
         preset = EXPORT_PRESETS.get(preset_id)
         if not preset:
             return
@@ -1981,6 +2027,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self._applying_preset = False
 
     def _set_preset_choice(self, preset_id: str):
+        """Select the corresponding preset radio button."""
         labels = [pid for pid, _ in EXPORT_PRESET_CHOICES]
         if preset_id in labels:
             idx = labels.index(preset_id)
@@ -1988,6 +2035,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 self._preset_radios[idx].SetValue(True)
 
     def _detect_active_preset(self) -> str:
+        """Identify preset matching active export checkbox combination, or return 'custom'."""
         current = {key: getattr(self, self._export_checkbox_attr(key)).IsChecked() for key in _EXPORT_TOGGLE_KEYS}
         current["format_jlc"] = self._export_setting("format_jlc")
         for preset_id, values in EXPORT_PRESETS.items():
@@ -1997,6 +2045,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
 
     @staticmethod
     def _export_checkbox_attr(export_key: str) -> str:
+        """Return the checkbox attribute name corresponding to the export setting key."""
         mapping = {
             "export_gerbers": "chk_gerbers",
             "export_drills": "chk_drills",
@@ -2012,6 +2061,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return mapping[export_key]
 
     def _update_export_summary(self):
+        """Update footer summary text to reflect enabled outputs."""
         enabled = []
         labels = {
             "export_gerbers": "Gerbers",
@@ -2068,6 +2118,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         parent.Layout()
 
     def _on_dialog_resize(self, event):
+        """Adjust dialog layout and text wrapping on window resize."""
         self._apply_export_summary()
         if event is not None:
             event.Skip()
@@ -2117,6 +2168,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return content + chrome
 
     def _fit_dialog_to_screen(self):
+        """Constrain dialog dimensions to fit comfortably within display bounds."""
         try:
             display_w, display_h = wx.DisplaySize()
         except Exception:
@@ -2140,6 +2192,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.txt_output_dir.Bind(wx.EVT_TEXT, self.on_export_setting_changed)
 
     def on_export_setting_changed(self, event):
+        """Handle export toggle changes, update summary, and trigger debounced CD sync."""
         if event is not None and hasattr(event, "Skip"):
             event.Skip()
         if self._initializing:
@@ -2148,13 +2201,16 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._schedule_cd_sync()
 
     def _schedule_cd_sync(self):
+        """Start debounced timer to regenerate CD workflow files."""
         if hasattr(self, "_cd_sync_timer"):
             self._cd_sync_timer.Start(500, oneShot=True)
 
     def on_cd_sync_timer(self, event):
+        """Execute silent CD workflow synchronization on timer expiry."""
         self._sync_cd_workflows_silent()
 
     def _sync_cd_workflows_silent(self):
+        """Silently write updated release workflow files if project and CD toggle are active."""
         # Future: skip auto-regeneration once CD files exist (mid-project lifecycle).
         if not self.chk_generate_cd.IsChecked():
             return
@@ -2239,6 +2295,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         return params
 
     def _apply_export_params_to_ui(self):
+        """Populate Advanced tab input widgets from active export parameters."""
         side_map = {"both": 0, "front": 1, "back": 2}
         self.choice_pos_side.SetSelection(side_map.get(self._export_param("pos_side", "both"), 0))
         self.chk_pos_smd_only.SetValue(bool(self._export_param("pos_smd_only", True)))
@@ -2361,8 +2418,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                     pass
 
         return board_file, sch_file
-
-    _resolve_active_files = _resolve_project_source_files
 
     def _sync_file_availability_state(self):
         """
@@ -2578,6 +2633,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         }
 
         def progress_callback(step_index, total_steps, message):
+            """Relay export progress updates to worker state dict."""
             if state.get("cancelled"):
                 return False
             if step_index is not None and total_steps is not None and total_steps > 0:
@@ -2629,6 +2685,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._export_progress = progress
 
         def export_worker():
+            """Background thread executing the core KiForge export pipeline."""
             try:
                 logger.info("Starting background export worker thread...")
                 success = kiforge.run_export(context=context)
@@ -2672,10 +2729,12 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 self.btn_export.Enable()
 
     def _stop_export_timer(self):
+        """Stop active progress poll timer if running."""
         if self._export_timer and self._export_timer.IsRunning():
             self._export_timer.Stop()
 
     def _destroy_export_progress(self):
+        """Stop timer, dismiss progress dialog, and re-enable export button."""
         self._stop_export_timer()
         progress = self._export_progress
         self._export_progress = None
@@ -2684,6 +2743,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self.btn_export.Enable()
 
     def _poll_export_progress(self, event):
+        """Poll background export worker thread and update progress dialog state."""
         state = self._export_state
         context = self._export_context
         progress = self._export_progress
@@ -2735,6 +2795,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._finish_export_progress()
 
     def _finish_export_progress(self):
+        """Clean up worker thread state and schedule UI presentation of results."""
         if not self._export_running:
             return
         state = self._export_state

@@ -187,17 +187,9 @@ KIFORGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 # Release plugin zips pin this to alphaseneca/kiforge@<tag> at package time (see package_plugin.py).
 KIFORGE_ACTION_REF = "alphaseneca/kiforge@main"
 
-# InteractiveHtmlBom is a third-party package, not maintained by KiForge, with two
-# unrelated install sites that must both stay pinned to this same version:
-#   - Dockerfile: a mandatory, deterministic build-time dependency for the CD Action
-#     image -- always installed, every build, never conditional.
-#   - InteractiveBomTask (below): a local-machine-only convenience install, run just
-#     once if a user's own KiCad Python environment doesn't already have it. This
-#     path is not expected to run at all in the CD Action -- the Docker image has it
-#     baked in already.
-# Unpinned, a breaking or compromised upstream release would silently change or break
-# both. Bump deliberately after testing a newer version; keep the Dockerfile's own
-# pin (InteractiveHtmlBom==...) in sync by hand -- it can't import this constant.
+# InteractiveHtmlBom version is pinned in two places: Dockerfile (build-time) and
+# InteractiveBomTask (local install fallback). Bump deliberately after testing; keep
+# both in sync manually — the Dockerfile cannot import this constant.
 INTERACTIVE_HTML_BOM_PINNED_VERSION = "2.11.2"
 
 # ---------------------------------------------------------------------------
@@ -276,6 +268,7 @@ def resolve_bom_fields(export_params: dict | None = None) -> dict:
         exclude.add("MPN")
 
     def _filter(csv_str: str) -> str:
+        """Strip excluded sourcing columns from a comma-separated BOM fields string."""
         return ",".join(t.strip() for t in csv_str.split(",") if t.strip() not in exclude)
 
     return {
@@ -737,6 +730,7 @@ def get_gitignore_template_path():
 
 
 def _cd_option_str(options: dict, key: str, default: bool = True) -> str:
+    """Return ``'true'`` or ``'false'`` for a boolean CD workflow option."""
     return "true" if options.get(key, default) else "false"
 
 
@@ -882,12 +876,14 @@ TAB_ICON_TINT_COLOUR = "#e4e4e7"
 
 
 def tab_icon_cache_dir() -> str:
+    """Return the icon cache directory path, creating it if absent."""
     path = os.path.join(os.path.dirname(get_global_settings_path()), "icon_cache")
     os.makedirs(path, exist_ok=True)
     return path
 
 
 def _tab_icon_cache_path(tab_name: str) -> str:
+    """Return the cached SVG file path for ``tab_name``."""
     return os.path.join(tab_icon_cache_dir(), f"{tab_name}.svg")
 
 
@@ -954,6 +950,7 @@ def _https_context() -> ssl.SSLContext | None:
 
 
 def read_cached_tab_icon_svg(tab_name: str) -> bytes | None:
+    """Return a cached SVG for ``tab_name`` from disk, or ``None`` if absent or invalid."""
     path = _tab_icon_cache_path(tab_name)
     if not os.path.isfile(path):
         return None
@@ -967,6 +964,7 @@ def read_cached_tab_icon_svg(tab_name: str) -> bytes | None:
 
 
 def write_cached_tab_icon_svg(tab_name: str, data: bytes) -> None:
+    """Write ``data`` to the icon disk cache for ``tab_name``; silently skips non-SVG content."""
     if not data.strip().startswith(b"<svg"):
         return
     try:
@@ -977,6 +975,7 @@ def write_cached_tab_icon_svg(tab_name: str, data: bytes) -> None:
 
 
 def download_tab_icon_svg(tab_name: str) -> bytes | None:
+    """Fetch the Material Symbols SVG for ``tab_name`` from the CDN; caches the result on success."""
     icon_id = TAB_ICON_CDN.get(tab_name)
     if not icon_id:
         return None
@@ -1038,6 +1037,7 @@ def prepare_tab_icon_svg(svg_data: bytes, colour: str = TAB_ICON_TINT_COLOUR) ->
 
 
 def _coerce_setting_value(default, value):
+    """Coerce ``value`` to bool when the default is bool and the value is a string."""
     if isinstance(default, bool) and isinstance(value, str):
         return value.lower() == "true"
     return value
@@ -1269,6 +1269,7 @@ def stage_ibom_project_copy(context: "ExportContext") -> tuple[str, str]:
 
 
 def _load_settings_file(path: str) -> dict:
+    """Load and return a JSON settings file at ``path``."""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -1755,10 +1756,7 @@ class PathResolver:
             # pyrefly: ignore [missing-import]
             import pcbnew
             exe = sys.executable
-            # Inside the KiCad GUI, sys.executable is the 'kicad' app binary, not a
-            # Python interpreter — running '<kicad> -c ...' would launch the GUI and
-            # hang forever. Use it only if it is actually python; otherwise derive the
-            # real bundled interpreter from sys.prefix.
+            # sys.executable inside KiCad GUI is the 'kicad' app binary, not Python; derive from sys.prefix instead.
             if exe and os.path.basename(exe).lower().startswith("python"):
                 return exe
             for name in ("python3", "python"):
@@ -1814,6 +1812,7 @@ class ExportContext:
     """
     
     def __init__(self, project_path: str, output_dir_name: str, options: dict, progress_callback=None, pcb_file: str | None = None):
+        """Initialise export context with project paths, output settings, and options."""
         self.project_path = os.path.abspath(project_path)
         self.output_dir_name = output_dir_name
         self.options = options
@@ -2048,6 +2047,7 @@ class JLCPCBFormatter:
 
     @staticmethod
     def _row_value(row: dict, *keys: str) -> str:
+        """Return the first non-blank value found in ``row`` for any of ``keys``, or ``''``."""
         for key in keys:
             value = row.get(key, "")
             if value is not None and str(value).strip():
@@ -2056,6 +2056,7 @@ class JLCPCBFormatter:
 
     @staticmethod
     def _is_dnp(row: dict) -> bool:
+        """Return True when the row's DNP field indicates a do-not-populate component."""
         dnp = JLCPCBFormatter._row_value(row, "${DNP}", "DNP")
         return dnp.lower() in ("1", "dnp", "true", "yes")
 
@@ -2069,6 +2070,7 @@ class JLCPCBFormatter:
 
     @staticmethod
     def _normalize_layer(side: str) -> str:
+        """Normalise a raw layer/side string to ``'Top'`` or ``'Bottom'``."""
         normalized = side.strip().lower()
         if normalized in ("bottom", "back", "b.cu", "b", "bot"):
             return "Bottom"
@@ -2216,6 +2218,7 @@ class ExportTask:
     """
     
     def __init__(self, name: str):
+        """Initialise export task with a user-facing display name."""
         self.name = name
 
     def is_applicable(self, context: ExportContext) -> bool:
@@ -2391,26 +2394,32 @@ class GerberExportTask(ExportTask):
     """Export JLC manufacturing gerber layers to ``temp_gerbers/`` via kicad-cli."""
 
     def __init__(self):
+        """Initialise with the display name ``'Exporting Gerber Layers'``."""
         super().__init__("Exporting Gerber Layers")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when gerber export is enabled and a board file is available."""
         return context.options.get("export_gerbers", True) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Invoke kicad-cli to export gerber layers; return True on success."""
         return self._run_subprocess(build_gerber_export_cmd(context), context)
 
 
 class DrillExportTask(ExportTask):
     """Export JLC-aligned Excellon drill files; runs when drills or gerbers are enabled."""
     def __init__(self):
+        """Initialise with the display name ``'Exporting Drill Files'``."""
         super().__init__("Exporting Drill Files")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when drills or gerbers are enabled and a board file is available."""
         drills_requested = context.options.get("export_drills", True)
         gerbers_requested = context.options.get("export_gerbers", True)
         return (drills_requested or gerbers_requested) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Invoke kicad-cli to export Excellon drill files; return True on success."""
         return self._run_subprocess(build_drill_export_cmd(context), context)
 
 
@@ -2423,12 +2432,15 @@ class PlacementExportTask(ExportTask):
     and drill-file origin — matching standard manufacturing scripts.
     """
     def __init__(self):
+        """Initialise with the display name ``'Exporting Position Data'``."""
         super().__init__("Exporting Position Data")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when position export is enabled and a board file is available."""
         return context.options.get("export_pos", True) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Build and invoke the kicad-cli pos export command; return True on success."""
         raw_pos_path = os.path.join(context.output_dir, "raw_pos.csv")
         cmd = [
             context.kicad_cli, "pcb", "export", "pos",
@@ -2457,12 +2469,15 @@ class BomExportTask(ExportTask):
     empty columns.
     """
     def __init__(self):
+        """Initialise with the display name ``'Exporting Bill of Materials'``."""
         super().__init__("Exporting Bill of Materials")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when BOM export is enabled and a schematic file is available."""
         return context.options.get("export_bom", True) and bool(context.sch_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Invoke kicad-cli to export the BOM CSV; return True on success."""
         raw_bom_path = os.path.join(context.output_dir, "raw_bom.csv")
         resolved = resolve_bom_fields(context.options)
         cmd = [
@@ -2478,12 +2493,15 @@ class BomExportTask(ExportTask):
 class SchematicPdfExportTask(ExportTask):
     """Export schematic to ``{pcb_name}_sch.pdf``; optional staged title-block rev sync."""
     def __init__(self):
+        """Initialise with the display name ``'Exporting Schematic PDF'``."""
         super().__init__("Exporting Schematic PDF")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when schematic PDF export is enabled and a schematic file is available."""
         return context.options.get("export_sch_pdf", True) and bool(context.sch_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Export schematic PDF via kicad-cli with title block version synchronization."""
         output_pdf = os.path.join(context.output_dir, f"{context.pcb_name}_sch.pdf")
         sch_input = context.sch_file
         temp_dir = None
@@ -2528,9 +2546,11 @@ class Step3dExportTask(ExportTask):
     Treats non-fatal KiCad model warnings as partial success when a STEP file exists.
     """
     def __init__(self):
+        """Initialise with the display name ``'Exporting STEP 3D Model'``."""
         super().__init__("Exporting STEP 3D Model")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when STEP export is enabled and a board file is available."""
         return context.options.get("export_step", True) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
@@ -2563,12 +2583,15 @@ class Render3dExportTask(ExportTask):
          due to VRML (.wrl) mesh incompatibility, missing 3D models, or headless environment.
     """
     def __init__(self):
+        """Initialise with the display name ``'Rendering 3D Views'``."""
         super().__init__("Rendering 3D Views")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when 3D render is enabled and a board file is available."""
         return context.options.get("export_3d", True) and bool(context.pcb_file)
 
     def _render_view(self, context: ExportContext, output_png: str, rotate_str: str, view_label: str) -> bool:
+        """Render one view (front or back) with raytracing; falls back to rasterizer on failure."""
         primary_flags = [
             "--preset", RENDER_3D_DEFAULTS["preset"], "--floor",
             "--zoom", str(RENDER_3D_DEFAULTS["zoom"]),
@@ -2626,6 +2649,7 @@ class Render3dExportTask(ExportTask):
         return False
 
     def run(self, context: ExportContext) -> bool:
+        """Render front and back 3D views using raytracing with rasterizer fallback."""
         front_png = os.path.join(context.output_dir, f"{context.pcb_name}_3d_front.png")
         ok_front = self._render_view(context, front_png, "0,0,0", "Front")
         if not ok_front:
@@ -2663,6 +2687,7 @@ def parse_svg_dimensions(svg_path: str) -> tuple[float, float, float, float]:
         h_str = root.attrib.get("height", "")
 
         def parse_len(val):
+            """Convert an SVG length string with unit (mm, in, pt, cm) to float millimeters."""
             if not val:
                 return None
             val = str(val).strip().lower()
@@ -3676,11 +3701,9 @@ def _run_on_gui_thread(fn, timeout: float = 180.0):
     outcome = {}
 
     def _invoke():
-        # If the wait below already timed out, the caller has moved on to the
-        # next tier (or given up) and may already be reading/deleting
-        # output_pdf_path. Running fn() now would write to that same path
-        # behind the caller's back, silently clobbering whatever a later tier
-        # produced - so skip it entirely once abandoned.
+        """Execute the target function on the wx event loop and capture its outcome."""
+        # Skip if the caller already moved on (timed out); running now would
+        # clobber output written by a later tier behind the caller's back.
         if abandoned.is_set():
             return
         try:
@@ -3691,9 +3714,8 @@ def _run_on_gui_thread(fn, timeout: float = 180.0):
             done.set()
 
     wx.CallAfter(_invoke)
-    # Bounded, not indefinite: if the GUI thread's event loop never picks the
-    # callback up (dialog destroyed, app quitting), the worker must not hang
-    # forever -- it falls through and the caller tries the next tier instead.
+    # Bounded wait: if the event loop never picks up the callback the worker
+    # falls through and the caller tries the next tier instead of hanging.
     if not done.wait(timeout=timeout):
         abandoned.set()
         raise TimeoutError(f"GUI thread did not become available to render the PDF within {timeout:.0f}s")
@@ -3734,45 +3756,22 @@ def export_svg_to_1200dpi_pdf(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_pdf_path)), exist_ok=True)
 
-    # The GUI-toolkit tier constructs/drives real wx application objects
-    # and must run on the GUI thread (see _run_on_gui_thread); the subprocess
-    # tier has no such constraint and stays on the calling thread so it never
-    # blocks Studio's UI while an external converter runs.
+    # GUI-toolkit tiers must run on the GUI thread; subprocess tiers run on the
+    # calling thread so they never block Studio's UI while an external converter runs.
     def _sub(fn_name):
+        """Return a lambda that invokes ``fn_name`` out-of-process via ``_export_pdf_via_subprocess``."""
         return lambda: _export_pdf_via_subprocess(
             fn_name, svg_paths, output_pdf_path, is_landscape, logger, python_exe, should_abort)
 
-    # Ordered by what is actually guaranteed to be there, not by what is
-    # nicest when it happens to be installed:
-    #
-    #   wx   KiCad ships wxPython for its own GUI on Windows, Linux and macOS
-    #        alike, so this tier is available wherever the plugin can run at
-    #        all. It rasterizes, which is the right trade here: the output is
-    #        a 1200 DPI sheet meant to be printed for etching, and every
-    #        machine producing byte-comparable artwork matters more for a
-    #        manufacturing file than an occasional vector upgrade that only
-    #        some installs would get.
-    #   CLI  rsvg-convert is common on Linux, absent as often as not
-    #        elsewhere -- an upgrade when present, never depended on.
-    #   Pillow  Pillow is automatically installed into KiCad's Python if missing
-    #           (see install_pdf_renderer) and used by wxPython for raster PDF export.
-    #
-    # Every GUI-toolkit renderer is offered out-of-process first; the
-    # in-process variants stay as a last resort for hosts where spawning the
-    # worker is impossible (no usable interpreter, restricted environment),
-    # and are the only tiers that can block the GUI thread.
+    # Tier order: wx+Pillow subprocess first (always available where the plugin runs),
+    # then in-process wx (blocks GUI thread — last resort), then CLI converters.
     tiers = (
         ("wx+Pillow (subprocess)", _sub("_export_pdf_via_wx"), False),
         ("wx+Pillow", lambda: _export_pdf_via_wx(svg_paths, output_pdf_path, is_landscape, logger), True),
         ("CLI converter",
          lambda: _export_pdf_via_cli(svg_paths, output_pdf_path, logger, should_abort), False),
     )
-    # Subprocess tier first is the right default, but when a GUI-thread
-    # tier would freeze a live UI, the subprocess tier -- which renders
-    # just as well and needs no GUI thread -- is tried first instead, so
-    # Studio keeps animating and stays clickable.
-    # Sorting on the tier's own "needs the GUI thread" flag keeps this a
-    # property of the tiers rather than a second hand-maintained order.
+    # When a GUI-thread tier would freeze a live UI, sort subprocess tiers first.
     if _gui_thread_tier_would_block():
         tiers = tuple(sorted(tiers, key=lambda t: t[2]))
 
@@ -3874,12 +3873,15 @@ class SvgExportTask(ExportTask):
     """Export front/back copper SVGs and merged A4 homebrew sheet (``{pcb_name}_front.svg``, ``{pcb_name}_back.svg``, ``{pcb_name}_homebrew.svg``)."""
 
     def __init__(self):
+        """Initialise with display name ``'Exporting Copper SVGs'``."""
         super().__init__("Exporting Copper SVGs")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when SVG export is enabled and a board file is available."""
         return context.options.get("export_svg", True) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Plot copper layer SVGs and assemble the merged A4 homebrew sheet."""
         front_path, back_path, cropped = export_copper_layers(self, context, context.output_dir)
         if not front_path and not back_path:
             return False
@@ -3915,9 +3917,11 @@ class HomebrewPdfExportTask(ExportTask):
     """Export 1200 DPI homebrew etching & mask PDF (``{pcb_name}_homebrew.pdf``)."""
 
     def __init__(self):
+        """Initialise with the display name ``'Exporting Homebrew PDF'``."""
         super().__init__("Exporting Homebrew PDF")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when homebrew PDF export is enabled and a board file is available."""
         return context.options.get("export_homebrew_pdf", True) and bool(context.pcb_file)
 
     def _resolve_layers(self, context: ExportContext, temp_dir: str) -> tuple[str | None, str | None, bool]:
@@ -4021,6 +4025,7 @@ class HomebrewPdfExportTask(ExportTask):
             context.progress_callback(None, None, "Exporting Homebrew PDF\u2026")
 
     def run(self, context: ExportContext) -> bool:
+        """Render high-resolution 1200 DPI PDF for DIY etching and homebrew masks."""
         self._ensure_renderer_installed(context)
         homebrew_pdf = os.path.join(context.output_dir, f"{context.pcb_name}_homebrew.pdf")
         # The merged sheet only belongs in the output folder when the user asked
@@ -4119,9 +4124,11 @@ class InteractiveBomTask(ExportTask):
     """
 
     def __init__(self):
+        """Initialise with the display name ``'Exporting Interactive HTML BOM'``."""
         super().__init__("Exporting Interactive HTML BOM")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when iBOM export is enabled and a board file is available."""
         return context.options.get("export_ibom", True) and bool(context.pcb_file)
 
     def _ibom_importable(self, py_exe: str, context: ExportContext) -> bool:
@@ -4149,6 +4156,7 @@ class InteractiveBomTask(ExportTask):
         return True
 
     def run(self, context: ExportContext) -> bool:
+        """Generate Interactive HTML BOM report with embedded tracks, nets, and metadata."""
         if context.is_aborted():
             return False
 
@@ -4273,12 +4281,15 @@ class GerberPackTask(ExportTask):
     """Zip ``temp_gerbers/`` into ``{pcb_name}_gerbers.zip`` and remove the staging dir."""
 
     def __init__(self):
+        """Initialise with the display name ``'Zipping Gerber and Drill files'``."""
         super().__init__("Zipping Gerber and Drill files")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when gerbers or drills are enabled and a board file is available."""
         return (context.options.get("export_gerbers", True) or context.options.get("export_drills", True)) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Zip the temp gerber staging directory into the output folder; return True on success."""
         if os.path.exists(context.temp_gerber_dir) and os.listdir(context.temp_gerber_dir):
             gerber_zip_path = os.path.join(context.output_dir, f"{context.pcb_name}_gerbers.zip")
             try:
@@ -4307,12 +4318,15 @@ class BomOutputTask(ExportTask):
     """Rename KiCad BOM export to a versioned filename (unedited KiCad CSV)."""
 
     def __init__(self):
+        """Initialise with the display name ``'Finalizing Bill of Materials'``."""
         super().__init__("Finalizing Bill of Materials")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when BOM export is enabled and a schematic file is available."""
         return context.options.get("export_bom", True) and bool(context.sch_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Rename ``raw_bom.csv`` to a versioned filename; return True on success."""
         raw_bom_path = os.path.join(context.output_dir, "raw_bom.csv")
         versioned_bom_path = os.path.join(context.output_dir, f"{context.pcb_name}_bom.csv")
         if not os.path.exists(raw_bom_path):
@@ -4334,12 +4348,15 @@ class PosOutputTask(ExportTask):
     """Rename KiCad placement export to a versioned filename (unedited KiCad CSV)."""
 
     def __init__(self):
+        """Initialise with the display name ``'Finalizing Component Placement'``."""
         super().__init__("Finalizing Component Placement")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when position export is enabled and a board file is available."""
         return context.options.get("export_pos", True) and bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Rename ``raw_pos.csv`` to a versioned filename; return True on success."""
         raw_pos_path = os.path.join(context.output_dir, "raw_pos.csv")
         versioned_pos_path = os.path.join(context.output_dir, f"{context.pcb_name}_pos.csv")
         if not os.path.exists(raw_pos_path):
@@ -4361,9 +4378,11 @@ class JlcFormatTask(ExportTask):
     """Produce JLC-ready BOM/CPL from KiCad CSV exports."""
 
     def __init__(self):
+        """Initialise with the display name ``'Generating JLCPCB BOM/CPL'``."""
         super().__init__("Generating JLCPCB BOM/CPL")
 
     def is_applicable(self, context: ExportContext) -> bool:
+        """Return True when JLC formatting is enabled and BOM or position output is active."""
         if not context.options.get("format_jlc", True):
             return False
         if not (context.options.get("export_bom", True) or context.options.get("export_pos", True)):
@@ -4371,6 +4390,7 @@ class JlcFormatTask(ExportTask):
         return bool(context.pcb_file)
 
     def run(self, context: ExportContext) -> bool:
+        """Invoke JLC CSV formatter; return True on success."""
         if context.is_aborted():
             return False
         return format_jlc_exports(context)
@@ -4388,13 +4408,15 @@ class ExportRunner:
     failures add warnings and do not stop the run unless every step fails or the
     user cancels via :meth:`ExportContext.cancel`.
     """
-    
+
     def __init__(self, context: ExportContext):
+        """Initialise the runner and build the task pipeline from ``context``."""
         self.context = context
         self.tasks = []
         self._initialize_pipeline()
 
     def _initialize_pipeline(self):
+        """Register the ordered list of export tasks for this pipeline run."""
         # 1. Main CLI export commands
         self.tasks.append(GerberExportTask())
         self.tasks.append(DrillExportTask())
