@@ -812,6 +812,50 @@ def get_global_settings_path() -> str:
     return os.path.join(xdg, "kiforge", "settings.json")
 
 
+def get_package_dir() -> str:
+    """
+    Return the directory KiForge installs Python packages into as a last resort.
+
+    Only reached when pip will not use the user site. A distribution whose
+    Python is externally managed (PEP 668) refuses ``--user`` outright, and the
+    flag that overrides that refusal lifts the guard for the whole environment
+    -- for a plugin that wants two optional packages, that is a much larger
+    promise than the situation calls for. A directory KiForge owns and nothing
+    else reads cannot shadow a distribution package, and uninstalling it is
+    deleting the folder.
+
+    Data, not configuration, so it does not live beside settings.json on Linux.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get(
+            "XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")
+        )
+    return os.path.join(base, "kiforge", "packages")
+
+
+def package_dir_path_snippet() -> str:
+    """
+    Python source that puts :func:`get_package_dir` on ``sys.path``.
+
+    Prefixed to every ``-c`` snippet KiForge runs in another interpreter, so a
+    package installed there is importable without altering that interpreter's
+    own configuration. Appended rather than inserted: a copy already in the
+    interpreter's real site-packages is the better one and keeps winning.
+    """
+    return "import sys\nsys.path.append(%r)\n" % get_package_dir()
+
+
+def add_package_dir_to_path() -> None:
+    """Put :func:`get_package_dir` on this process's own ``sys.path``."""
+    directory = get_package_dir()
+    if os.path.isdir(directory) and directory not in sys.path:
+        sys.path.append(directory)
+
+
 # ---------------------------------------------------------------------------
 # Studio tab icons (wx-free — cache, CDN fetch, SVG tint for dark UI)
 # ---------------------------------------------------------------------------
@@ -1107,8 +1151,7 @@ def build_ibom_subprocess_command(python_executable: str) -> list[str]:
     while allowing us to call wx.DisableAsserts() beforehand to suppress blocking C++
     wxWidgets debug dialogs/alerts in debug/assertion-enabled builds of KiCad.
     """
-    code = (
-        "import sys\n"
+    code = package_dir_path_snippet() + (
         "try:\n"
         "    import wx\n"
         "    wx.DisableAsserts()\n"
@@ -3014,27 +3057,58 @@ PDF_RENDERER_INSTALL_TIMEOUT_SEC = 600
 # The distribution name is not always the import name.
 PDF_RENDERER_IMPORT_NAMES = {"Pillow": "PIL"}
 
-# Extra ``pip install`` flags to try, in order, for one renderer package. Each
-# attempt is judged by whether the target interpreter can import the package
-# afterwards -- never by pip's exit code, which is why this is a ladder rather
-# than a single command:
-#
-#   --user                   KiCad's own site-packages is not always writable
-#                            (a system-wide install, a managed .app under
-#                            /Applications); the user site always is.
-#   --break-system-packages  PEP 668 environments refuse --user outright.
-#   --force-reinstall        pip answers "Requirement already satisfied" from
-#                            metadata on disk, not from what imports. An
-#                            orphaned .dist-info -- left behind by a
-#                            half-removed package or an interrupted upgrade --
-#                            turns every install into a no-op while the import
-#                            keeps failing, so the next export finds the same
-#                            package missing and installs it again, forever.
-PDF_RENDERER_PIP_ATTEMPTS = (
-    ("--user",),
-    ("--user", "--break-system-packages"),
-    ("--user", "--force-reinstall"),
-)
+def _is_virtual_environment(exe: str) -> bool:
+    """
+    Whether ``exe`` is a virtual environment's interpreter.
+
+    Asking the interpreter is the only reliable test: a venv's ``bin/python``
+    is a symlink to its base, so nothing about the path distinguishes them.
+    """
+    code = "import sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)"
+    try:
+        result = subprocess.run(
+            [exe, "-c", code],
+            capture_output=True,
+            timeout=30,
+            startupinfo=_subprocess_startupinfo(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def pip_install_attempts(python_exe: str) -> list[list[str]]:
+    """
+    Return the extra ``pip install`` flags to try, in order, for one package.
+
+    Every attempt is judged by whether ``python_exe`` can import the package
+    afterwards -- never by pip's exit code -- which is what makes this a ladder
+    rather than a single command:
+
+    ``--user``
+        KiCad's own site-packages is not always writable (a system-wide
+        install, a managed .app under /Applications), and writing into the
+        bundle would be undone by the next KiCad upgrade anyway. Dropped for a
+        virtual environment, which is self-contained and from which pip
+        refuses ``--user`` outright.
+    ``--force-reinstall``
+        pip answers "Requirement already satisfied" from metadata on disk, not
+        from what imports. An orphaned .dist-info -- left by a half-removed
+        package or an interrupted upgrade -- turns every install into a no-op
+        while the import keeps failing, so the next export finds the same
+        package missing and installs it again, forever.
+    ``--target``
+        For an externally-managed interpreter (PEP 668), which refuses both of
+        the above. See :func:`get_package_dir` for why this rather than
+        ``--break-system-packages``.
+    """
+    scope = [] if _is_virtual_environment(python_exe) else ["--user"]
+    return [
+        scope,
+        scope + ["--force-reinstall"],
+        ["--target", get_package_dir(), "--upgrade"],
+    ]
+
 
 # Packages this process has already tried every attempt on and failed to make
 # importable. Retrying a genuinely broken install on every export adds minutes
@@ -3050,8 +3124,8 @@ def _probe_missing_in_interpreter(exe: str, wanted, import_names):
     Returns the missing distribution names, or None when the probe could not
     run at all so the caller can fall back to an in-process check.
     """
-    code = (
-        "import importlib.util, sys\n"
+    code = package_dir_path_snippet() + (
+        "import importlib.util\n"
         "print('\\n'.join(n for n in sys.argv[1:] "
         "if importlib.util.find_spec(n) is None))"
     )
@@ -3114,7 +3188,7 @@ def _pip_install_until_importable(exe: str, package: str, log) -> tuple[bool, st
     """
     Install one package into ``exe`` and confirm that interpreter can import it.
 
-    Walks :data:`PDF_RENDERER_PIP_ATTEMPTS` and stops at the first attempt the
+    Walks :func:`pip_install_attempts` and stops at the first attempt the
     target interpreter can actually import the result of. pip's exit code is
     deliberately not the test -- a no-op install over orphaned metadata exits 0
     and leaves the import broken.
@@ -3123,7 +3197,7 @@ def _pip_install_until_importable(exe: str, package: str, log) -> tuple[bool, st
         ``(ok, detail)``, where ``detail`` describes the last failure.
     """
     detail = "pip produced no output"
-    for flags in PDF_RENDERER_PIP_ATTEMPTS:
+    for flags in pip_install_attempts(exe):
         argv = [exe, "-m", "pip", "install", "--disable-pip-version-check", *flags, package]
         try:
             result = subprocess.run(
@@ -3216,6 +3290,7 @@ def _export_pdf_via_qt(svg_paths: list[str], output_pdf_path: str, is_landscape:
     # process when it cannot. setdefault so an explicit QT_QPA_PLATFORM still
     # wins for anyone who has a reason to choose differently.
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    add_package_dir_to_path()
     from PyQt6 import QtCore, QtGui, QtSvg
 
     app = QtGui.QGuiApplication.instance()
@@ -3257,6 +3332,7 @@ def _export_pdf_via_qt(svg_paths: list[str], output_pdf_path: str, is_landscape:
 
 def _export_pdf_via_wx(svg_paths: list[str], output_pdf_path: str, is_landscape: bool, logger) -> bool:
     """Tier 2 - high-resolution 1-bit raster PDF through wxPython's SVG rasterizer."""
+    add_package_dir_to_path()
     import wx
     from PIL import Image
 
@@ -3874,8 +3950,8 @@ class HomebrewPdfExportTask(ExportTask):
             # satisfied by are gone, which is what made every export reinstall
             # the same two packages and still fail to render.
             installed = False
-            for flags in PDF_RENDERER_PIP_ATTEMPTS:
-                self._run_subprocess(base + list(flags) + [name], context)
+            for flags in pip_install_attempts(py_exe):
+                self._run_subprocess(base + flags + [name], context)
                 if context.is_aborted():
                     return
                 if not missing_pdf_renderer_packages([name], python_exe=py_exe):
@@ -3995,6 +4071,30 @@ class InteractiveBomTask(ExportTask):
     def is_applicable(self, context: ExportContext) -> bool:
         return context.options.get("export_ibom", True) and bool(context.pcb_file)
 
+    def _ibom_importable(self, py_exe: str, context: ExportContext) -> bool:
+        """
+        Ask the target interpreter whether it can import InteractiveHtmlBom.
+
+        find_spec rather than a real import: loading the module pulls in
+        pcbnew, which can raise a blocking C++ assertion dialog in an
+        assertion-enabled KiCad build.
+        """
+        code = package_dir_path_snippet() + (
+            "import importlib.util\n"
+            "sys.exit(0 if importlib.util.find_spec('InteractiveHtmlBom') else 1)"
+        )
+        try:
+            subprocess.run(
+                [py_exe, "-c", code],
+                check=True,
+                capture_output=True,
+                env=context.env,
+                startupinfo=context.startupinfo,
+            )
+        except (subprocess.CalledProcessError, OSError):
+            return False
+        return True
+
     def run(self, context: ExportContext) -> bool:
         if context.is_aborted():
             return False
@@ -4002,72 +4102,38 @@ class InteractiveBomTask(ExportTask):
         ibom_available = False
         ibom_run_cmd = []
         py_exe = context.kicad_python
-        
-        # Verify InteractiveHtmlBom is available without executing/loading it (avoids pcbnew C++ assertion dialog)
-        try:
-            subprocess.run(
-                [py_exe, "-c", "import sys, importlib.util; sys.exit(0 if importlib.util.find_spec('InteractiveHtmlBom') else 1)"],
-                check=True,
-                capture_output=True,
-                env=context.env,
-                startupinfo=context.startupinfo
-            )
+
+        if self._ibom_importable(py_exe, context):
             ibom_available = True
             ibom_run_cmd = build_ibom_subprocess_command(py_exe)
             context.logger.info("InteractiveHtmlBom successfully verified in python environment.")
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        else:
             if context.is_aborted():
                 return False
-            context.logger.info("InteractiveHtmlBom not found/working in target Python environment. Attempting to install via pip...")
+            context.logger.info(
+                "InteractiveHtmlBom not found/working in target Python environment. "
+                "Attempting to install via pip..."
+            )
             if context.progress_callback:
-                context.progress_callback(None, None, "Installing InteractiveHtmlBom dependency...")
-            
-            pip_success = False
-            err_output = ""
-            
-            ibom_pinned = f"InteractiveHtmlBom=={INTERACTIVE_HTML_BOM_PINNED_VERSION}"
-            if not context.is_aborted():
-                pip_success = self._run_subprocess(
-                    [py_exe, "-m", "pip", "install", "--user", ibom_pinned],
-                    context,
-                )
-            if not pip_success and not context.is_aborted():
-                context.logger.info("Standard pip install failed. Retrying with --break-system-packages...")
-                pip_success = self._run_subprocess(
-                    [
-                        py_exe,
-                        "-m",
-                        "pip",
-                        "install",
-                        "--user",
-                        "--break-system-packages",
-                        ibom_pinned,
-                    ],
-                    context,
-                )
-            if context.is_aborted():
-                return False
-            if not pip_success:
-                err_output = "pip install failed"
+                context.progress_callback(None, None, "Installing InteractiveHtmlBom\u2026")
 
-            if pip_success:
-                try:
-                    # Verify installation again using find_spec (without executing)
-                    subprocess.run(
-                        [py_exe, "-c", "import sys, importlib.util; sys.exit(0 if importlib.util.find_spec('InteractiveHtmlBom') else 1)"],
-                        check=True,
-                        capture_output=True,
-                        env=context.env,
-                        startupinfo=context.startupinfo
-                    )
+            # The same ladder the PDF renderers use (see pip_install_attempts),
+            # judged the same way: pip's exit code says nothing about whether
+            # the interpreter can import what it just claimed to install.
+            pinned = f"InteractiveHtmlBom=={INTERACTIVE_HTML_BOM_PINNED_VERSION}"
+            base = [py_exe, "-m", "pip", "install", "--disable-pip-version-check"]
+            for flags in pip_install_attempts(py_exe):
+                self._run_subprocess(base + flags + [pinned], context)
+                if context.is_aborted():
+                    return False
+                if self._ibom_importable(py_exe, context):
                     ibom_available = True
                     ibom_run_cmd = build_ibom_subprocess_command(py_exe)
                     context.logger.info("InteractiveHtmlBom successfully installed and verified via pip.")
-                except Exception as verify_err:
-                    context.logger.warning(f"Failed to verify InteractiveHtmlBom after installation: {verify_err}")
+                    break
             else:
-                context.logger.warning(f"Failed to install InteractiveHtmlBom via pip. Error details:\n{err_output.strip()}")
-                
+                context.logger.warning("Failed to install InteractiveHtmlBom via pip.")
+
         if not ibom_available:
             if shutil.which("generate_interactive_bom"):
                 ibom_available = True

@@ -115,6 +115,41 @@ jobs:
           assert str(target_dir) in probe.stdout, probe.stdout
           print("landed in the target interpreter:", probe.stdout.strip())
 
+      - name: Install a renderer into KiForge's own package directory
+        shell: python
+        run: |
+          # The last rung of the ladder, for an externally-managed interpreter
+          # that refuses every in-environment install (PEP 668). The rung
+          # itself is unit-tested; what only a real run can check is that the
+          # directory and the sys.path snippet agree on every platform.
+          import subprocess, sys, pathlib
+
+          sys.path.insert(0, ".")
+          import kiforge
+
+          package_dir = pathlib.Path("kiforge-packages").resolve()
+          kiforge.get_package_dir = lambda: str(package_dir)
+
+          flags = kiforge.pip_install_attempts(sys.executable)[-1]
+          assert flags[0] == "--target", flags
+          subprocess.run(
+              [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+               *flags, "Pillow"],
+              check=True,
+          )
+
+          assert (package_dir / "PIL").is_dir(), sorted(p.name for p in package_dir.iterdir())
+
+          # -s disables the user site, so the only thing that can satisfy this
+          # import is the snippet's directory. The snippet appends rather than
+          # inserts, so without it a copy already on the interpreter's own path
+          # would answer and prove nothing.
+          snippet = kiforge.package_dir_path_snippet() + "import PIL; print(PIL.__file__)"
+          probe = subprocess.run([sys.executable, "-s", "-c", snippet],
+                                 capture_output=True, text=True, check=True)
+          assert str(package_dir) in probe.stdout, probe.stdout
+          print("importable from KiForge's package directory:", probe.stdout.strip())
+
   unit-tests:
     name: Python unit tests (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}

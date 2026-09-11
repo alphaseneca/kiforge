@@ -68,10 +68,26 @@ block KiCad's startup on a network download.
 
 So a missing package is resolved **where it is first needed**, inside the export
 task, through the cancellable `_run_subprocess` runner so progress reports and
-Cancel keep working. `IbomExportTask` established the pattern and
-`HomebrewPdfExportTask._ensure_renderer_installed` follows it: `--user` first,
-then `--user --break-system-packages` for PEP 668 environments, best-effort, and
-the failure path names the remedy.
+Cancel keep working. `IbomExportTask` and
+`HomebrewPdfExportTask._ensure_renderer_installed` share one ladder,
+`pip_install_attempts()`: `--user`, then `--user --force-reinstall`, then
+`--target get_package_dir()`. Best-effort, and the failure path names the
+remedy.
+
+Two rules the ladder exists to enforce:
+
+- **Success is the import, never pip's exit code.** pip answers "Requirement
+  already satisfied" from metadata on disk, so an orphaned `.dist-info` makes
+  every install a silent no-op while the import keeps failing — and the next
+  export tries again, forever. Re-probe the target interpreter after each
+  attempt.
+- **Never `--break-system-packages`.** It lifts PEP 668's guard for the whole
+  environment; a plugin wanting two optional packages should not be making
+  that promise. `--target get_package_dir()` writes into a directory KiForge
+  owns and nothing else reads, so it cannot shadow a distribution package and
+  uninstalling is deleting the folder. Every interpreter KiForge drives is
+  told about it — `package_dir_path_snippet()` for a `-c` snippet,
+  `add_package_dir_to_path()` in-process.
 
 Install into **KiCad's interpreter**, not the running one. Inside the KiCad GUI
 `sys.executable` is the application binary, not Python — use

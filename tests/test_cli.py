@@ -1800,8 +1800,61 @@ class TestKiForgeCLI(unittest.TestCase):
 
         self.assertTrue(ok, message)
         pip_calls = [argv for argv in calls if argv[1:4] == ["-m", "pip", "install"]]
-        self.assertEqual(len(pip_calls), len(kiforge.PDF_RENDERER_PIP_ATTEMPTS), pip_calls)
+        self.assertEqual(len(pip_calls), 2, pip_calls)
         self.assertIn("--force-reinstall", pip_calls[-1])
+
+    def test_install_falls_back_to_kiforge_package_dir(self):
+        """
+        An externally-managed interpreter refuses --user and a plain install alike.
+
+        PEP 668 is the case --break-system-packages exists for; the last rung
+        has to get the package installed without lifting that guard, which
+        means writing it somewhere KiForge owns and telling the interpreter
+        about it.
+        """
+        from unittest.mock import MagicMock, patch
+
+        calls = []
+        state = {"targeted": False}
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["-m", "pip", "install"]:
+                if "--target" in argv:
+                    state["targeted"] = True
+                    return MagicMock(returncode=0, stdout="", stderr="")
+                return MagicMock(returncode=1, stdout="",
+                                 stderr="error: externally-managed-environment")
+            return MagicMock(returncode=0, stdout="" if state["targeted"] else "PIL\n", stderr="")
+
+        with patch.object(kiforge.PathResolver, "get_kicad_python_path",
+                          return_value=sys.executable):
+            with patch("subprocess.run", side_effect=fake_run):
+                ok, message = kiforge.install_pdf_renderer(["Pillow"])
+
+        self.assertTrue(ok, message)
+        pip_calls = [argv for argv in calls if argv[1:4] == ["-m", "pip", "install"]]
+        self.assertEqual(len(pip_calls), 3, pip_calls)
+        self.assertIn("--target", pip_calls[-1])
+        self.assertIn(kiforge.get_package_dir(), pip_calls[-1])
+
+    def test_pip_ladder_never_breaks_system_packages(self):
+        """
+        The last resort is a KiForge-owned directory, not a global override.
+
+        --break-system-packages lifts PEP 668's guard for the whole
+        environment, which is a far larger promise than a plugin wanting two
+        optional packages should be making. --target writes into a directory
+        nothing else reads, so it cannot shadow a distribution package, and
+        every interpreter KiForge drives is told about that directory.
+        """
+        attempts = kiforge.pip_install_attempts(sys.executable)
+        self.assertFalse(
+            any("--break-system-packages" in flags for flags in attempts),
+            attempts,
+        )
+        self.assertEqual(attempts[-1][:2], ["--target", kiforge.get_package_dir()])
+        self.assertIn(kiforge.get_package_dir(), kiforge.package_dir_path_snippet())
 
     def test_renderer_install_is_attempted_once_per_session(self):
         """
@@ -1824,7 +1877,7 @@ class TestKiForgeCLI(unittest.TestCase):
                      patch.object(task, "_run_subprocess", return_value=False) as mock_run:
                     task._ensure_renderer_installed(ctx)
                     attempts = mock_run.call_count
-                    self.assertEqual(attempts, len(kiforge.PDF_RENDERER_PIP_ATTEMPTS))
+                    self.assertEqual(attempts, len(kiforge.pip_install_attempts(sys.executable)))
 
                     task._ensure_renderer_installed(ctx)
                     self.assertEqual(mock_run.call_count, attempts)
