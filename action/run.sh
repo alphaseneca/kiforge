@@ -13,6 +13,7 @@ action_path="${KIFORGE_ACTION_PATH:?KIFORGE_ACTION_PATH is required}"
 workspace="${KIFORGE_WORKSPACE:?KIFORGE_WORKSPACE is required}"
 project_path="${INPUT_PROJECT_PATH:-.}"
 output_dir="${INPUT_OUTPUT_DIR:-kiforge}"
+kicad_version="${INPUT_KICAD_VERSION:-10.0}"
 
 # KiForge builds and runs the official kicad/kicad Docker image, so this Action
 # needs a Linux runner with a working Docker daemon (e.g. `runs-on: ubuntu-latest`,
@@ -98,8 +99,8 @@ detect_runner_container_id() {
 
 mapfile -d '' -t cli_args < <(build_cli_args)
 
-echo "Building KiForge Docker image..."
-docker build -t kiforge:latest "$action_path"
+echo "Building KiForge Docker image for KiCad ${kicad_version}..."
+docker build --build-arg KICAD_VERSION="$kicad_version" -t "kiforge:${kicad_version}" "$action_path"
 
 echo "Running KiForge exporter..."
 # Do NOT pass KICAD10_3DMODEL_DIR / KISYS3DMOD / KIPRJMOD through from the
@@ -126,7 +127,7 @@ if container_id="$(detect_runner_container_id)"; then
     "${docker_env[@]}" \
     --volumes-from "$container_id" \
     -w "$workspace" \
-    kiforge:latest \
+    "kiforge:${kicad_version}" \
     /bin/bash /action/kiforge.sh "${cli_args[@]}"
 else
   echo "Running on host; mounting workspace at /workspace."
@@ -135,7 +136,7 @@ else
     "${docker_env[@]}" \
     -v "${workspace}:/workspace" \
     -w /workspace \
-    kiforge:latest \
+    "kiforge:${kicad_version}" \
     /bin/bash /action/kiforge.sh "${cli_args[@]}"
 fi
 

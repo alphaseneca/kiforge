@@ -2182,6 +2182,103 @@ class TestKiForgeCLI(unittest.TestCase):
                 self.assertTrue(kiforge.export_svg_to_1200dpi_pdf(merged_svg, pdf_path))
                 self.assertGreater(os.path.getsize(pdf_path), 0)
 
+    def test_discover_kicad_install_dirs_windows_sorting_and_forward_compatibility(self):
+        """
+        Verify Windows discovery scans version folders dynamically, sorting descending
+        so the highest version (e.g. 11.0, 10.0, 9.0) takes precedence without any upper cap.
+        """
+        from unittest.mock import patch
+
+        fake_entries = ["10.0", "8.0", "11.0", "9.0", "not_a_version"]
+        with patch.object(kiforge, "_get_platform_name", return_value="windows"):
+            with patch("os.environ.get", side_effect=lambda k: r"C:\Program Files" if k == "ProgramFiles" else None):
+                with patch("os.path.isdir", return_value=True):
+                    with patch("os.listdir", return_value=fake_entries):
+                        dirs = kiforge._discover_kicad_install_dirs()
+        expected_order = [
+            os.path.join(r"C:\Program Files", "KiCad", "11.0"),
+            os.path.join(r"C:\Program Files", "KiCad", "10.0"),
+            os.path.join(r"C:\Program Files", "KiCad", "9.0"),
+            os.path.join(r"C:\Program Files", "KiCad", "8.0"),
+        ]
+        self.assertEqual(dirs[:4], expected_order)
+
+    def test_get_platform_kicad_cli_and_python_candidates(self):
+        """Verify CLI and Python candidate generation for Windows, macOS, and Linux."""
+        from unittest.mock import patch
+
+        win_kicad = os.path.join(r"C:\Program Files", "KiCad", "10.0")
+        with patch.object(kiforge, "_discover_kicad_install_dirs", return_value=[win_kicad]):
+            with patch.object(kiforge, "_get_platform_name", return_value="windows"):
+                cli_cands = kiforge._get_platform_kicad_cli_candidates()
+                py_cands = kiforge._get_platform_kicad_python_candidates()
+                self.assertIn(os.path.join(win_kicad, "bin", "kicad-cli.exe"), cli_cands)
+                self.assertIn(os.path.join(win_kicad, "bin", "kicad-python.exe"), py_cands)
+
+        with patch.object(kiforge, "_discover_kicad_install_dirs", return_value=["/Applications/KiCad/KiCad.app"]):
+            with patch.object(kiforge, "_get_platform_name", return_value="macos"):
+                cli_cands = kiforge._get_platform_kicad_cli_candidates()
+                py_cands = kiforge._get_platform_kicad_python_candidates()
+                self.assertIn("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli", cli_cands)
+                self.assertIn("/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3", py_cands)
+
+    def test_build_subprocess_env_aliases_future_versions(self):
+        """Verify _build_subprocess_env aliases 3D model paths forward to KICAD11..16_3DMODEL_DIR."""
+        from unittest.mock import patch
+
+        fake_cli = "/usr/bin/kicad-cli"
+        with tempfile.TemporaryDirectory() as tmp_proj:
+            with patch.object(kiforge, "_derive_system_3d_model_dir", return_value="/custom/3dmodels"):
+                env = kiforge._build_subprocess_env(fake_cli, tmp_proj)
+                self.assertEqual(env.get("KICAD10_3DMODEL_DIR"), "/custom/3dmodels")
+                self.assertEqual(env.get("KICAD11_3DMODEL_DIR"), "/custom/3dmodels")
+                self.assertEqual(env.get("KICAD12_3DMODEL_DIR"), "/custom/3dmodels")
+                self.assertEqual(env.get("KISYS3DMOD"), "/custom/3dmodels")
+
+    def test_mid_process_abort_cleanup_in_export_runner_and_tasks(self):
+        """Verify mid-process abort cleans up partial and 0-byte output files."""
+        from unittest.mock import MagicMock, patch
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zero_byte_file = os.path.join(tmp_dir, "board-step.step")
+            open(zero_byte_file, "w").close()
+            valid_file = os.path.join(tmp_dir, "board-bom.csv")
+            with open(valid_file, "w") as f:
+                f.write("content")
+            unrelated_zero = os.path.join(tmp_dir, "other.step")
+            open(unrelated_zero, "w").close()
+
+            mock_ctx = MagicMock()
+            mock_ctx.is_aborted.return_value = True
+            mock_ctx.output_dir = tmp_dir
+            mock_ctx.pcb_name = "board"
+            mock_ctx.temp_gerber_dir = None
+
+            runner = kiforge.ExportRunner(mock_ctx)
+            runner._cleanup_temp_dirs()
+
+            self.assertFalse(os.path.exists(zero_byte_file), "0-byte partial artifact starting with pcb_name should be discarded")
+            self.assertTrue(os.path.exists(valid_file), "Non-empty artifact should be retained")
+            self.assertTrue(os.path.exists(unrelated_zero), "Unrelated file not starting with pcb_name should not be touched")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_step = os.path.join(tmp_dir, "board.step")
+            with open(out_step, "w") as f:
+                f.write("partial step data")
+            task = kiforge.Step3dExportTask()
+            mock_ctx = MagicMock()
+            mock_ctx.is_aborted.return_value = True
+            mock_ctx.kicad_cli = "kicad-cli"
+            mock_ctx.pcb_file = "board.kicad_pcb"
+            mock_ctx.output_dir = tmp_dir
+            mock_ctx.pcb_name = "board"
+            mock_ctx.step_subst_models = True
+
+            with patch.object(task, "_run_subprocess", return_value=False):
+                res = task.run(mock_ctx)
+                self.assertFalse(res)
+                self.assertFalse(os.path.exists(out_step), "Partial step file should be deleted on abort")
+
 
 if __name__ == '__main__':
     unittest.main()

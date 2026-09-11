@@ -1528,74 +1528,196 @@ def _build_subprocess_env(kicad_cli: str | None, project_dir: str | None = None)
         # works identically on every OS and CI environment.
         env["KIPRJMOD"] = abs_proj
 
-        if "KICAD10_3DMODEL_DIR" not in env:
-            # KICAD10_3DMODEL_DIR names KiCad's own official 3D library and
-            # must never be pointed at a project's own folder instead:
-            # standard footprints (resistors, caps, connectors, ...) resolve
-            # their models relative to exactly this variable, so conflating
-            # it with a project-local models directory silently breaks them
-            # whenever no real system library is found. Project-bundled
-            # models should use ${KIPRJMOD}-relative paths instead (above).
-            system_3d_dir = _derive_system_3d_model_dir(kicad_cli)
-            if system_3d_dir:
-                env["KICAD10_3DMODEL_DIR"] = system_3d_dir
+        # Check if caller or parent process already defined a 3D models directory
+        resolved_3d = None
+        for key in ("KICAD10_3DMODEL_DIR", "KISYS3DMOD", "KICAD11_3DMODEL_DIR", "KICAD12_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR"):
+            val = env.get(key)
+            if val and os.path.isdir(val):
+                resolved_3d = val
+                break
 
-        resolved_3d = env.get("KICAD10_3DMODEL_DIR", "")
+        if not resolved_3d:
+            resolved_3d = _derive_system_3d_model_dir(kicad_cli)
+
         if resolved_3d:
-            for alias in ("KISYS3DMOD", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR", "KICAD7_3DMODEL_DIR"):
+            if "KICAD10_3DMODEL_DIR" not in env:
+                env["KICAD10_3DMODEL_DIR"] = resolved_3d
+            # Alias across legacy (7, 8, 9), current (10), and forward major versions (11..16)
+            for alias in ["KISYS3DMOD"] + [f"KICAD{v}_3DMODEL_DIR" for v in range(7, 17)]:
                 if alias not in env:
                     env[alias] = resolved_3d
 
     return env
 
 
-def _derive_system_3d_model_dir(kicad_cli: str | None) -> str | None:
-    """
-    Locate KiCad's official 3D model library.
+# ---------------------------------------------------------------------------
+# Platform and installation discovery helpers
+# ---------------------------------------------------------------------------
 
-    Derives the path from the resolved ``kicad_cli`` binary's own install
-    layout first, so it works for any install location or KiCad point release
-    -- not just the version numbers hardcoded in the fallback list below,
-    which only apply when ``kicad_cli`` has no usable directory to derive from
-    (e.g. resolved purely from PATH).
+def _get_platform_name() -> str:
+    """Return normalized platform identifier ('windows', 'macos', or 'linux')."""
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return "linux"
+
+
+def _discover_kicad_install_dirs() -> list[str]:
     """
+    Discover KiCad installation directories across Windows, macOS, and Linux.
+
+    Dynamically scans for installed KiCad versions sorted descending so the newest
+    version takes priority, with no maximum version cap.
+    """
+    plat = _get_platform_name()
+    dirs: list[str] = []
+
+    if plat == "windows":
+        roots: list[str] = []
+        for var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            val = os.environ.get(var)
+            if val and os.path.isdir(val) and val not in roots:
+                roots.append(val)
+        if not roots:
+            roots = [r"C:\Program Files", r"C:\Program Files (x86)"]
+
+        discovered: list[tuple[tuple[int, ...], str]] = []
+        for root in roots:
+            kicad_root = os.path.join(root, "KiCad")
+            if not os.path.isdir(kicad_root):
+                continue
+            try:
+                for entry in os.listdir(kicad_root):
+                    dir_path = os.path.join(kicad_root, entry)
+                    if not os.path.isdir(dir_path):
+                        continue
+                    m = re.match(r"^(\d+(?:\.\d+)*)", entry)
+                    if m:
+                        try:
+                            ver = tuple(int(x) for x in m.group(1).split("."))
+                            discovered.append((ver, dir_path))
+                        except ValueError:
+                            pass
+            except OSError:
+                pass
+
+        discovered.sort(key=lambda x: x[0], reverse=True)
+        dirs = [d for _, d in discovered]
+        for fb in (
+            os.path.join(r"C:\Program Files", "KiCad", "10.0"),
+            os.path.join(r"C:\Program Files", "KiCad", "9.0"),
+            os.path.join(r"C:\Program Files", "KiCad", "8.0"),
+        ):
+            if fb not in dirs:
+                dirs.append(fb)
+
+    elif plat == "macos":
+        candidates = [
+            "/Applications/KiCad/KiCad.app",
+            "/Applications/KiCad.app",
+        ]
+        try:
+            for entry in sorted(os.listdir("/Applications"), reverse=True):
+                if entry.startswith("KiCad") and entry.endswith(".app"):
+                    cand = os.path.join("/Applications", entry)
+                    if cand not in candidates and os.path.isdir(cand):
+                        candidates.append(cand)
+        except OSError:
+            pass
+        dirs = candidates
+
+    else:
+        dirs = ["/usr", "/usr/local", "/opt/kicad"]
+
+    return dirs
+
+
+def _get_platform_kicad_cli_candidates() -> list[str]:
+    """Return candidate executable paths for kicad-cli across all platforms."""
+    plat = _get_platform_name()
     candidates: list[str] = []
+
+    if plat == "windows":
+        for d in _discover_kicad_install_dirs():
+            candidates.append(os.path.join(d, "bin", "kicad-cli.exe"))
+    elif plat == "macos":
+        for d in _discover_kicad_install_dirs():
+            candidates.append(os.path.join(d, "Contents", "MacOS", "kicad-cli"))
+    else:
+        for d in _discover_kicad_install_dirs():
+            candidates.append(os.path.join(d, "bin", "kicad-cli"))
+
+    return candidates
+
+
+def _get_platform_kicad_python_candidates() -> list[str]:
+    """Return candidate executable paths for KiCad Python interpreter across platforms."""
+    plat = _get_platform_name()
+    candidates: list[str] = []
+
+    if plat == "windows":
+        names = ("kicad-python.exe", "python.exe", "pythonw.exe")
+        for d in _discover_kicad_install_dirs():
+            bin_dir = os.path.join(d, "bin")
+            for name in names:
+                candidates.append(os.path.join(bin_dir, name))
+    elif plat == "macos":
+        for d in _discover_kicad_install_dirs():
+            candidates.append(
+                os.path.join(d, "Contents", "Frameworks", "Python.framework", "Versions", "Current", "bin", "python3")
+            )
+            for name in ("kicad-python", "python3", "python"):
+                candidates.append(os.path.join(d, "Contents", "MacOS", name))
+    else:
+        for d in _discover_kicad_install_dirs():
+            bin_dir = os.path.join(d, "bin")
+            for name in ("kicad-python", "python3", "python"):
+                candidates.append(os.path.join(bin_dir, name))
+
+    return candidates
+
+
+def _get_platform_3d_model_candidates(kicad_cli: str | None = None) -> list[str]:
+    """Return candidate paths for KiCad system 3D models across platforms."""
+    plat = _get_platform_name()
+    candidates: list[str] = []
+
+    # 1. Derive relative to kicad_cli if known
     if kicad_cli and os.path.isabs(kicad_cli):
         bin_dir = os.path.dirname(kicad_cli)
-        if sys.platform == "darwin":
+        if plat == "macos":
             # .../KiCad.app/Contents/MacOS/kicad-cli -> .../Contents/SharedSupport/3dmodels
             candidates.append(os.path.normpath(os.path.join(bin_dir, "..", "SharedSupport", "3dmodels")))
         else:
             # .../<prefix>/bin/kicad-cli[.exe] -> .../<prefix>/share/kicad/3dmodels
             candidates.append(os.path.normpath(os.path.join(bin_dir, "..", "share", "kicad", "3dmodels")))
 
-    if sys.platform == "win32":
-        candidates += [
-            r"C:\Program Files\KiCad\10.0\share\kicad\3dmodels",
-            r"C:\Program Files\KiCad\9.0\share\kicad\3dmodels",
-            r"C:\Program Files\KiCad\8.0\share\kicad\3dmodels",
-        ]
-    elif sys.platform == "darwin":
-        # KiCad's own documented default search paths on macOS (see the
-        # KICAD*_3DMODEL_DIR default-path threads on forum.kicad.info): a
-        # system-wide supplementary directory under Application Support, and
-        # the library bundled inside the app itself. The official .dmg
-        # installs the app bundle at this fixed path (not directly under
-        # /Applications like most macOS apps); the SharedSupport candidate
-        # mirrors the bin_dir-relative one derived above from kicad-cli's own
-        # resolved location.
-        candidates += [
-            "/Library/Application Support/kicad/3dmodels",
-            "/Applications/KiCad/KiCad.app/Contents/SharedSupport/3dmodels",
-        ]
+    # 2. Platform-specific standard installation locations
+    if plat == "windows":
+        for d in _discover_kicad_install_dirs():
+            candidates.append(os.path.join(d, "share", "kicad", "3dmodels"))
+    elif plat == "macos":
+        candidates.append("/Library/Application Support/kicad/3dmodels")
+        for d in _discover_kicad_install_dirs():
+            candidates.append(os.path.join(d, "Contents", "SharedSupport", "3dmodels"))
     else:
-        candidates += [
-            "/usr/share/kicad/3dmodels",
-            "/usr/local/share/kicad/3dmodels",
-            "/usr/share/kicad/modules/packages3d",
-        ]
+        for d in _discover_kicad_install_dirs():
+            candidates.append(os.path.join(d, "share", "kicad", "3dmodels"))
+        candidates.append("/usr/share/kicad/modules/packages3d")
 
-    for path in candidates:
+    return candidates
+
+
+def _derive_system_3d_model_dir(kicad_cli: str | None) -> str | None:
+    """
+    Locate KiCad's official 3D model library across platforms.
+
+    Derives the path from the resolved ``kicad_cli`` binary's install layout first,
+    falling back to dynamically discovered platform directories without an upper
+    version cap.
+    """
+    for path in _get_platform_3d_model_candidates(kicad_cli):
         if os.path.isdir(path):
             return path
     return None
@@ -1621,18 +1743,8 @@ class PathResolver:
         if cli_path:
             return cli_path
             
-        if sys.platform == 'win32':
-            candidates = [
-                r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe",
-                r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe",
-                r"C:\Program Files\KiCad\8.0\bin\kicad-cli.exe",
-            ]
-            for path in candidates:
-                if os.path.isfile(path):
-                    return path
-        elif sys.platform == 'darwin':
-            path = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"
-            if os.path.isfile(path):
+        for path in _get_platform_kicad_cli_candidates():
+            if os.path.isfile(path) and (sys.platform == "win32" or os.access(path, os.X_OK)):
                 return path
                 
         return "kicad-cli"
@@ -1661,42 +1773,19 @@ class PathResolver:
         except ImportError:
             pass
 
-        if sys.platform == 'win32':
-            candidates = ['kicad-python.exe', 'python.exe', 'pythonw.exe']
-        else:
-            candidates = ['kicad-python', 'python3', 'python']
-
         # 2. Try to find relative to resolved kicad-cli path
         kicad_cli = PathResolver.get_kicad_cli_path()
         if kicad_cli and os.path.isabs(kicad_cli):
             cli_dir = os.path.dirname(kicad_cli)
-            for name in candidates:
+            for name in ("kicad-python.exe", "python.exe", "pythonw.exe", "kicad-python", "python3", "python"):
                 path = os.path.join(cli_dir, name)
-                if os.path.isfile(path) and os.access(path, os.X_OK):
+                if os.path.isfile(path) and (sys.platform == "win32" or os.access(path, os.X_OK)):
                     return path
 
         # 3. Try standard installation directories
-        if sys.platform == 'win32':
-            dirs = [
-                r"C:\Program Files\KiCad\10.0\bin",
-                r"C:\Program Files\KiCad\9.0\bin",
-                r"C:\Program Files\KiCad\8.0\bin",
-            ]
-            for d in dirs:
-                for name in candidates:
-                    path = os.path.join(d, name)
-                    if os.path.isfile(path):
-                        return path
-        elif sys.platform == 'darwin':
-            paths = [
-                "/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3",
-                "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-python",
-                "/Applications/KiCad/KiCad.app/Contents/MacOS/python3",
-                "/Applications/KiCad/KiCad.app/Contents/MacOS/python",
-            ]
-            for path in paths:
-                if os.path.isfile(path):
-                    return path
+        for path in _get_platform_kicad_python_candidates():
+            if os.path.isfile(path) and (sys.platform == "win32" or os.access(path, os.X_OK)):
+                return path
 
         return sys.executable
 
@@ -2400,7 +2489,11 @@ class SchematicPdfExportTask(ExportTask):
                 sch_input,
                 "-o", output_pdf
             ]
-            return self._run_subprocess(cmd, context)
+            ok = self._run_subprocess(cmd, context)
+            if context.is_aborted():
+                _discard_file(output_pdf)
+                return False
+            return ok
         finally:
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -2429,6 +2522,9 @@ class Step3dExportTask(ExportTask):
         cmd.extend(["-f", "-o", output_step, context.pcb_file])
         if self._run_subprocess(cmd, context):
             return True
+        if context.is_aborted():
+            _discard_file(output_step)
+            return False
         if os.path.isfile(output_step) and os.path.getsize(output_step) > 0:
             context.add_warning(
                 f"{self.name} finished with warnings; a partial STEP file was still saved."
@@ -4438,15 +4534,24 @@ class ExportRunner:
         return True
 
     def _cleanup_temp_dirs(self):
-        """Cleans up temporary workspace directories on error or abort"""
+        """Cleans up temporary workspace directories and mid-process partial files on error or abort"""
         temp_dir = getattr(self.context, "temp_gerber_dir", None)
         if temp_dir and os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
             except Exception:
                 pass
-        if self.context.is_aborted() and self.context.output_dir:
+        if self.context.is_aborted() and self.context.output_dir and os.path.isdir(self.context.output_dir):
             cleanup_partial_ibom_output(self.context.output_dir, self.context.pcb_name)
+            # Clean up any 0-byte or temporary partial artifacts left by an aborted step
+            try:
+                for fname in os.listdir(self.context.output_dir):
+                    fpath = os.path.join(self.context.output_dir, fname)
+                    if os.path.isfile(fpath) and fname.startswith(self.context.pcb_name):
+                        if os.path.getsize(fpath) == 0:
+                            _discard_file(fpath)
+            except OSError:
+                pass
 
 
 def generate_cd_files(project_dir: str, output_dir_name: str, options: dict) -> tuple[str, bool]:

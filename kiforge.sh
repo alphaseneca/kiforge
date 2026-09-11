@@ -26,7 +26,7 @@ fi
 # Action and local docker-compose runs funnel through this one entrypoint --
 # one place owns "does this container have the 3D library", regardless of
 # how it was invoked.
-_3d_model_dir="${KICAD10_3DMODEL_DIR:-/usr/share/kicad/3dmodels}"
+_3d_model_dir="${KICAD_3DMODEL_DIR:-${KICAD10_3DMODEL_DIR:-${KICAD11_3DMODEL_DIR:-${KISYS3DMOD:-/usr/share/kicad/3dmodels}}}}"
 if [ -d "$_3d_model_dir" ] && find "$_3d_model_dir" -maxdepth 1 -iname '*.3dshapes' -print -quit | grep -q .; then
     echo "KiForge: 3D model library already present at ${_3d_model_dir}, skipping download."
 elif [ "$(id -u)" -ne 0 ]; then
