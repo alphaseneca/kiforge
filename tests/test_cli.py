@@ -1712,13 +1712,20 @@ class TestKiForgeCLI(unittest.TestCase):
 
     def test_missing_pdf_renderer_packages_maps_distribution_names(self):
         """Pillow imports as PIL; a name mismatch must not report it missing."""
+        from unittest.mock import patch
+
         self.assertEqual(kiforge.PDF_RENDERER_PACKAGES, ("Pillow", "PyQt6"))
-        missing = kiforge.missing_pdf_renderer_packages(["Pillow"])
-        try:
-            import PIL  # noqa: F401
-            self.assertEqual(missing, [])
-        except ImportError:
-            self.assertEqual(missing, ["Pillow"])
+        with patch.object(kiforge, "_probe_missing_in_interpreter") as mock_probe:
+            mock_probe.return_value = ["Pillow"]
+            self.assertEqual(
+                kiforge.missing_pdf_renderer_packages(["Pillow"], python_exe=sys.executable),
+                ["Pillow"],
+            )
+            mock_probe.return_value = []
+            self.assertEqual(
+                kiforge.missing_pdf_renderer_packages(["Pillow"], python_exe=sys.executable),
+                [],
+            )
 
     def test_install_pdf_renderer_targets_kicads_own_interpreter(self):
         """
@@ -1854,7 +1861,9 @@ class TestKiForgeCLI(unittest.TestCase):
             attempts,
         )
         self.assertEqual(attempts[-1][:2], ["--target", kiforge.get_package_dir()])
-        self.assertIn(kiforge.get_package_dir(), kiforge.package_dir_path_snippet())
+        ns = {}
+        exec(kiforge.package_dir_path_snippet(), ns)
+        self.assertIn(kiforge.get_package_dir(), ns["sys"].path)
 
     def test_renderer_install_is_attempted_once_per_session(self):
         """
@@ -1926,6 +1935,15 @@ class TestKiForgeCLI(unittest.TestCase):
             import PyQt6  # noqa: F401
         except Exception:
             self.skipTest("PyQt6 not available in this interpreter")
+
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import os; os.environ['QT_QPA_PLATFORM'] = 'offscreen'; "
+             "from PyQt6 import QtGui; app = QtGui.QGuiApplication([])"],
+            capture_output=True,
+        )
+        if probe.returncode != 0:
+            self.skipTest("PyQt6 offscreen platform plugin cannot initialize on this host")
 
         with tempfile.TemporaryDirectory() as tmp:
             svg = os.path.join(tmp, "sheet.svg")

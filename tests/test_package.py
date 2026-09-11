@@ -288,6 +288,7 @@ class TestPackagePlugin(unittest.TestCase):
                 spec = importlib.util.spec_from_file_location("kiforge", root_kiforge)
                 mod = importlib.util.module_from_spec(spec)
                 sys.modules["kiforge"] = mod
+                spec.loader.exec_module(mod)
 
 
 if __name__ == "__main__":
