@@ -306,7 +306,7 @@ are excluded from the Gerber ZIP.
 | `resolve_jlc_gerber_layers()` | Manufacturing + user drawing/comment layers present on the board |
 | `build_gerber_export_cmd()` / `build_drill_export_cmd()` | JLC-aligned `kicad-cli` argv for gerber/drill tasks |
 
-Legacy flat export keys and `generate_ci` are still read for backward compatibility.
+Saved configuration uses nested `exports` and `export_params` structures.
 
 CD workflow generation and `.gitignore` updates read editable files from `templates/` (shipped beside the installed `kiforge.py` in the plugin zip). Edit `templates/kiforge.gitignore`, `templates/github-release.yml`, and `templates/gitea-release.yml` in the repo — never duplicate them under `plugins/templates/` in git.
 

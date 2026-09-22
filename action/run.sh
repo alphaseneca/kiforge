@@ -67,8 +67,8 @@ build_cli_args() {
   append_bool_toggle INPUT_STEP_SUBST_MODELS step-subst-models
   append_bool_toggle INPUT_BOM_INCLUDE_MFR_MPN bom-include-mfr-mpn
 
-  if [[ -n "${INPUT_VERSION:-}" ]]; then
-    args+=("--version-tag" "${INPUT_VERSION}")
+  if [[ -n "${INPUT_VERSION_TAG:-}" ]]; then
+    args+=("--version-tag" "${INPUT_VERSION_TAG}")
   fi
 
   printf '%s\0' "${args[@]}"

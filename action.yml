@@ -92,7 +92,7 @@ inputs:
     description: 'BOM/iBOM: include Manufacturer & MPN columns (true/false)'
     required: false
     default: 'true'
-  version:
+  version-tag:
     description: 'Optional version tag override for output filenames (defaults to GITHUB_REF_NAME or v0.1.0)'
     required: false
     default: ''
@@ -128,7 +128,7 @@ runs:
         INPUT_POS_EXCLUDE_DNP: ${{ inputs['pos-exclude-dnp'] }}
         INPUT_STEP_SUBST_MODELS: ${{ inputs['step-subst-models'] }}
         INPUT_BOM_INCLUDE_MFR_MPN: ${{ inputs['bom-include-mfr-mpn'] }}
-        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_VERSION_TAG: ${{ inputs['version-tag'] }}
         INPUT_KICAD_VERSION: ${{ inputs['kicad-version'] }}
         GITHUB_REF_NAME: ${{ github.ref_name }}
         GITHUB_REF_TYPE: ${{ github.ref_type }}

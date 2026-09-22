@@ -1027,6 +1027,58 @@ class TestKiForgeStudio(unittest.TestCase):
         finally:
             progress.Destroy()
 
+    def test_dialog_desktop_proportions(self):
+        """Studio dialog must open with balanced desktop CAD landscape proportions."""
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            size = dialog.GetSize()
+            self.assertGreaterEqual(size.width, 580, f"Width {size.width} should be >= 580px")
+            self.assertGreaterEqual(size.height, 480, f"Height {size.height} should be >= 480px")
+            self.assertGreater(size.width, size.height, "Dialog should have landscape aspect ratio")
+        finally:
+            dialog.Destroy()
+
+    def test_modal_dialog_styles_exclude_minimize_and_maximize(self):
+        """Modal child dialogs must not show minimize or maximize buttons on Linux/GTK."""
+        progress = kiforge_studio._ExportProgressDialog(None)
+        try:
+            style = progress.GetWindowStyleFlag()
+            self.assertFalse(style & wx.MINIMIZE_BOX, "Progress dialog should omit wx.MINIMIZE_BOX")
+            self.assertFalse(style & wx.MAXIMIZE_BOX, "Progress dialog should omit wx.MAXIMIZE_BOX")
+        finally:
+            progress.Destroy()
+
+        msg_dlg = kiforge_studio._KiForgeMessageDialog(None, "Test", "Title", "info", "ok")
+        try:
+            msg_style = msg_dlg.GetWindowStyleFlag()
+            self.assertFalse(msg_style & wx.MINIMIZE_BOX, "Message dialog should omit wx.MINIMIZE_BOX")
+            self.assertFalse(msg_style & wx.MAXIMIZE_BOX, "Message dialog should omit wx.MAXIMIZE_BOX")
+        finally:
+            msg_dlg.Destroy()
+
+    def test_progress_dialog_show_result_completion_state(self):
+        """On export complete, progress gauge must show 100% and span edge-to-edge."""
+        progress = kiforge_studio._ExportProgressDialog(None)
+        try:
+            progress.show_result("Export complete. Saved to /kiforge.", complete=True)
+            self.assertTrue(progress.gauge.IsShown())
+            self.assertEqual(progress.gauge.GetValue(), 100)
+            self.assertGreaterEqual(progress.GetSize().width, 380)
+            self.assertGreaterEqual(progress.GetSize().height, 120)
+            self.assertEqual(progress.btn_cancel.GetLabel(), "OK")
+        finally:
+            progress.Destroy()
+
+    def test_notebook_tabs_use_clean_native_text(self):
+        """Notebook tabs must use clean, native text labels without fragile ImageLists."""
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            labels = [dialog.notebook.GetPageText(i) for i in range(dialog.notebook.GetPageCount())]
+            self.assertEqual(labels, ["Export", "Advanced", "Releases"])
+            self.assertIsNone(dialog.notebook.GetImageList())
+        finally:
+            dialog.Destroy()
+
     def test_progress_dialog_cancel_does_not_close_studio(self):
         """
         Regression: cancelling from the export progress dialog must only stop
@@ -1509,6 +1561,92 @@ class TestStudioPalette(unittest.TestCase):
         self.assertEqual(popup._selected, 0)
         popup.Dismiss()
         frame.Destroy()
+
+
+class TestStudioHALCompliance(unittest.TestCase):
+    """
+    Invariants defined in .agents/rules/cross_platform_wx_ui.md.
+    Validates cross-platform hardware/toolkit abstraction layer (HAL) behavior across OS backends.
+    """
+
+    def setUp(self):
+        self.app = wx.GetApp() or wx.App(False)
+
+    def test_hal_measure_text_and_screendc_fallback(self):
+        """Rule 1: Never allocate ClientDC in __init__, safely measure text with fallback to ScreenDC."""
+        frame = wx.Frame(None)
+        try:
+            # Safe measurement with valid window
+            w, h = kiforge_studio._hal_measure_text(frame, "Export Production Files")
+            self.assertGreater(w, 0)
+            self.assertGreater(h, 0)
+
+            # Measurement with None window (falls back to ScreenDC)
+            w_screen, h_screen = kiforge_studio._hal_measure_text(None, "Export Production Files")
+            self.assertGreater(w_screen, 0)
+            self.assertGreater(h_screen, 0)
+
+            # Measurement when window.GetTextExtent raises (GTK unmapped window simulation)
+            with patch.object(frame, "GetTextExtent", side_effect=RuntimeError("GdkWindow unrealized")):
+                w_fallback, h_fallback = kiforge_studio._hal_measure_text(frame, "Export Production Files")
+                self.assertGreater(w_fallback, 0)
+                self.assertGreater(h_fallback, 0)
+
+            # Empty text returns (0, 0)
+            self.assertEqual(kiforge_studio._hal_measure_text(frame, ""), (0, 0))
+        finally:
+            frame.Destroy()
+
+    def test_hal_resolve_bg_null_colour_safety(self):
+        """Rule 3: Walking parent hierarchy skips wx.NullColour and falls back to theme palette."""
+        frame = wx.Frame(None)
+        try:
+            frame.SetBackgroundColour(wx.Colour(50, 60, 70))
+            p1 = wx.Panel(frame)
+            p1.GetBackgroundColour = lambda: wx.NullColour  # GTK transparent CSS simulation
+            p2 = wx.Panel(p1)
+
+            resolved = kiforge_studio._hal_resolve_bg(p2)
+            self.assertEqual(resolved, wx.Colour(50, 60, 70))
+
+            # Grandparent also uninitialized -> returns theme surface fallback
+            frame.GetBackgroundColour = lambda: wx.NullColour
+            fallback_col = kiforge_studio._hal_resolve_bg(p2)
+            expected = kiforge_studio._COLORS.get("surface") or kiforge_studio._COLORS["app_bg"]
+            self.assertEqual(fallback_col, expected)
+        finally:
+            frame.Destroy()
+
+    def test_hal_concentric_solid_fills_rendering(self):
+        """Rule 2: Subpixel strokes eliminated by concentric solid fills without integer stroke pens."""
+        bmp = wx.Bitmap(64, 64)
+        dc = wx.MemoryDC(bmp)
+        try:
+            fill_col = wx.Colour(30, 30, 30)
+            border_col = wx.Colour(200, 100, 0)
+            # Rounded rect drawing operates cleanly without throwing
+            kiforge_studio._hal_draw_rounded_rect(dc, 0, 0, 64, 64, 4, fill=fill_col, border=border_col, border_width=1)
+            # Circle drawing operates cleanly without throwing
+            kiforge_studio._hal_draw_circle(dc, 32, 32, 16, fill=fill_col, border=border_col, border_width=1)
+        finally:
+            dc.SelectObject(wx.NullBitmap)
+
+    def test_hal_dynamic_sizing_no_fixed_pixel_height(self):
+        """Rule 4: Dynamic sizing without fixed widget pixel heights adapts to larger fonts."""
+        frame = wx.Frame(None)
+        try:
+            btn_default = kiforge_studio._FlatButton(frame, "Export Files")
+            default_h = btn_default.GetMinSize().height
+
+            # With a significantly larger font (simulating Linux high DPI / large desktop font metrics)
+            large_font = wx.Font(24, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+            frame.SetFont(large_font)
+            btn_large = kiforge_studio._FlatButton(frame, "Export Files")
+            large_h = btn_large.GetMinSize().height
+
+            self.assertGreater(large_h, default_h, "Button height must dynamically adapt to font line height")
+        finally:
+            frame.Destroy()
 
 
 if __name__ == '__main__':

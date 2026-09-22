@@ -49,12 +49,12 @@ is what the plugin actually runs on:
 GUI tests need `KIFORGE_RUN_GUI_TESTS=1` and real wx, so run them with KiCad's
 Python too.
 
-**Gotcha:** `package_plugin.py` copies the root `kiforge.py` to
-`plugins/kiforge.py` and leaves it there for local plugin development.
-`kiforge_studio`'s `from . import kiforge` then binds to that stale copy instead
-of the module you just edited, and your change appears to do nothing. Delete it
-(`rm plugins/kiforge.py`) before testing Studio. `tests/test_studio.py` detects
-this and skips with the remedy; ad-hoc scripts do not.
+**Gotcha eliminated:** `package_plugin.py` stages `kiforge.py` into `dist/staging/`
+before zipping it as `plugins/kiforge.py`. The packager never writes to or leaves
+`plugins/kiforge.py` in the workspace, ensuring `plugins/kiforge_studio.py`'s
+`from . import kiforge` always imports the active repo-root module. Any stray
+`plugins/kiforge.py` is automatically unlinked by the packager. `tests/test_studio.py`
+retains a defensive guard to prevent shadowing if created manually.
 
 ## 3. Dependencies: resolve them lazily, at the point of need
 

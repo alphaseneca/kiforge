@@ -50,6 +50,8 @@ class TestPackagePlugin(unittest.TestCase):
             os.remove(cls._PLUGINS_KIFORGE_PY)
         if not cls._had_plugins_templates_dir and os.path.isdir(cls._PLUGINS_TEMPLATES_DIR):
             shutil.rmtree(cls._PLUGINS_TEMPLATES_DIR, ignore_errors=True)
+        # Ensure automated test runs never leave dummy v9.9.9/v9.9.8 artifacts in dist/
+        package_plugin.clean_dist()
 
     def test_package_contains_required_pcm_entries(self):
         """Verify the plugin zip includes every file KiCad PCM needs."""
@@ -225,6 +227,11 @@ class TestPackagePlugin(unittest.TestCase):
         before = tracked.read_bytes()
         package_plugin.package_plugin(version="v9.9.9")
         self.assertEqual(before, tracked.read_bytes())
+
+    def test_packaging_never_creates_or_leaves_plugins_kiforge_copy(self):
+        """Packaging must stage into dist/ and never create or leave plugins/kiforge.py in the working tree."""
+        package_plugin.package_plugin(version="v9.9.9")
+        self.assertFalse(os.path.isfile(self._PLUGINS_KIFORGE_PY))
 
     def test_release_repository_json_uses_tag_urls(self):
         """Tag release repository.json points at that tag's packages.json, not @main."""

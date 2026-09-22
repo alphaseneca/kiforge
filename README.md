@@ -67,7 +67,7 @@ You can also drop the `plugins/` folder manually:
 2. Go to **Tools › External Plugins › KiForge Studio**.
 3. **Export** tab — project folder, output name, presets (Full / JLCPCB / Documentation / Custom).
 4. **Advanced** tab — export toggles, placement/STEP/BOM parameters, `format_jlc`.
-5. **Releases** tab — generate or auto-sync tag-based CI workflow YAML.
+5. **Releases** tab — generate or auto-sync tag-based CD workflow YAML.
 6. Click **Export** — a themed progress dialog tracks each step.
 
 Studio uses a tabbed layout with Material Symbols icons (cached from Google CDN on first use). **Settings** (footer) loads/saves project or global `.kiforge.json` / `settings.json`.

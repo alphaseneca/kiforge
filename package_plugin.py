@@ -26,7 +26,8 @@ Usage::
     python package_plugin.py --repo-base-url https://example.com/kiforge/
     python package_plugin.py clean               # wipe dist/
 
-The repo-root ``kiforge.py`` is copied to ``plugins/kiforge.py`` before zipping.
+The repo-root ``kiforge.py`` is staged and bundled into ``plugins/kiforge.py``
+inside the zip archive.
 Templates are read from ``templates/`` and placed at ``plugins/templates/`` inside
 the zip (not committed under ``plugins/templates/`` in git).
 """
@@ -293,23 +294,38 @@ def _repository_asset_urls(
     return f"{base}/packages.json", f"{base}/resources.zip"
 
 
-def _pin_action_ref_in_plugin(release_tag: str) -> None:
-    """Pin KIFORGE_ACTION_REF in the packaged plugin to this release tag (not @main)."""
-    plugin_path = Path("plugins/kiforge.py")
-    action_ref = f"alphaseneca/kiforge@{release_tag}"
-    text = plugin_path.read_text(encoding="utf-8")
-    updated, count = re.subn(
-        r'KIFORGE_ACTION_REF = "[^"]+"',
-        f'KIFORGE_ACTION_REF = "{action_ref}"',
-        text,
-        count=1,
-    )
-    if count != 1:
-        raise SystemExit(
-            "PCM build failed: could not pin KIFORGE_ACTION_REF in plugins/kiforge.py"
+def _stage_kiforge_with_action_ref(version: str | None, output_dir: Path) -> Path:
+    """
+    Stage a copy of ``kiforge.py`` under ``output_dir/staging`` with KIFORGE_ACTION_REF pinned.
+
+    Staging this into ``dist/staging/`` (rather than ``plugins/kiforge.py``) leaves the
+    working tree clean and eliminates the risk of an uncommitted build artifact
+    shadowing the repo-root module during Studio development or test runs.
+    """
+    source = Path("kiforge.py")
+    staged = output_dir / "staging" / "kiforge.py"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    with open(source, "r", encoding="utf-8", newline="") as f:
+        text = f.read()
+
+    if version:
+        action_ref = f"alphaseneca/kiforge@{version}"
+        updated, count = re.subn(
+            r'KIFORGE_ACTION_REF = "[^"]+"',
+            lambda _match: f'KIFORGE_ACTION_REF = "{action_ref}"',
+            text,
+            count=1,
         )
-    plugin_path.write_text(updated, encoding="utf-8")
-    print(f"  Pinned KIFORGE_ACTION_REF -> {action_ref}")
+        if count != 1:
+            raise SystemExit(
+                "PCM build failed: could not pin KIFORGE_ACTION_REF in staged kiforge.py"
+            )
+        text = updated
+        print(f"  Pinned KIFORGE_ACTION_REF -> {action_ref}")
+
+    with open(staged, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    return staged
 
 
 def _stage_bootstrap_with_version(version: str | None, output_dir: Path) -> Path:
@@ -317,10 +333,10 @@ def _stage_bootstrap_with_version(version: str | None, output_dir: Path) -> Path
     Stamp the build version into the packaged ``plugins/__init__.py``.
 
     The bootstrap prints ``__version__`` in its load-failure report, so a stale
-    value would send support down the wrong path. Unlike ``plugins/kiforge.py``
-    -- a gitignored copy the packager owns -- ``plugins/__init__.py`` is tracked
-    source, so the stamped copy is staged under ``dist/`` and the tracked file is
-    never written. Packaging leaves the working tree clean.
+    value would send support down the wrong path. Like ``kiforge.py``,
+    ``plugins/__init__.py`` is tracked source, so the stamped copy is staged
+    under ``dist/staging/`` and the tracked file is never written. Packaging
+    leaves the working tree clean.
 
     Reads and writes with ``newline=""`` so the packaged bytes do not depend on
     the platform running the build.
@@ -634,7 +650,11 @@ def _print_pcm_install_help(
         print(f"\nCustom repository URL: {base}/repository.json")
 
 
-def package_plugin(version: str = None, repo_base_url: str | None = None):
+def package_plugin(
+    version: str | None = None,
+    repo_base_url: str | None = None,
+    output_dir: Path | str | None = None,
+) -> Path:
     """
     Package the plugin for KiCad Plugin Manager.
 
@@ -644,6 +664,7 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
                        ``--repo-base-url`` for custom PCM repositories; release builds
                        use GitHub URLs when version is set. Unversioned local builds
                        produce only the installable zip.
+        output_dir: Output directory for packages and metadata. Defaults to 'dist'.
     """
     if version:
         version = version.strip()
@@ -656,8 +677,12 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
     emit_pcm_repository = use_github or bool(repo_base_url)
     resolved_repo_base = _normalize_repo_base(repo_base_url) if repo_base_url else ""
 
-    output_dir = Path("dist")
-    output_dir.mkdir(exist_ok=True)
+    output_dir = Path(output_dir) if output_dir is not None else Path("dist")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    legacy_plugin_copy = Path("plugins/kiforge.py")
+    if legacy_plugin_copy.is_file():
+        legacy_plugin_copy.unlink()
 
     if version:
         zip_name = f"{PLUGIN_ID}-{version}.zip"
@@ -665,10 +690,8 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
         zip_name = f"{PLUGIN_ID}.zip"
     zip_path = output_dir / zip_name
 
-    print("Copying root kiforge.py to plugins/kiforge.py...")
-    shutil.copy2("kiforge.py", "plugins/kiforge.py")
-    if version:
-        _pin_action_ref_in_plugin(version)
+    print(f"Staging kiforge.py into {output_dir / 'staging'}...")
+    staged_kiforge = _stage_kiforge_with_action_ref(version, output_dir)
     staged_bootstrap = _stage_bootstrap_with_version(version, output_dir)
 
     template_dir = Path("templates")
@@ -686,7 +709,7 @@ def package_plugin(version: str = None, repo_base_url: str | None = None):
     files_to_include = [
         (str(staged_bootstrap), "plugins/__init__.py"),
         ("plugins/kiforge_studio.py", "plugins/kiforge_studio.py"),
-        ("plugins/kiforge.py", "plugins/kiforge.py"),
+        (str(staged_kiforge), "plugins/kiforge.py"),
         ("plugins/icon.png", "plugins/icon.png"),
         ("resources/icon.png", "resources/icon.png"),
     ]

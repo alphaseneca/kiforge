@@ -386,22 +386,41 @@ def _hal_resolve_bg(window: wx.Window, fallback: wx.Colour | None = None) -> wx.
     return fallback or _COLORS.get("surface") or _COLORS["app_bg"]
 
 
-def _hal_measure_text(window: wx.Window, text: str, font: wx.Font | None = None) -> tuple[int, int]:
+def _hal_measure_text(window: wx.Window | None, text: str, font: wx.Font | None = None) -> tuple[int, int]:
     """
     Measure text dimensions safely without allocating an un-realized wx.ClientDC.
 
     On Linux (wxGTK3), allocating wx.ClientDC inside widget __init__ before the native
     X11/Wayland GdkWindow is realized produces GTK critical assertions and inaccurate
     extents. Using window.GetTextExtent() queries Pango/GDI/CoreText metrics directly.
+    Safely falls back to wx.ScreenDC() if the window is unmapped, unrealized, or returns zero font extents.
     """
     if not text:
         return 0, 0
     try:
-        if font and font.IsOk():
-            return window.GetTextExtent(text, font=font)
-        return window.GetTextExtent(text)
+        if window:
+            if font and font.IsOk():
+                w, h = window.GetTextExtent(text, font=font)
+            else:
+                w, h = window.GetTextExtent(text)
+            if w > 0 and h > 0:
+                return w, h
     except Exception:
-        return len(text) * 7, 14
+        pass
+    try:
+        sdc = wx.ScreenDC()
+        if font and font.IsOk():
+            sdc.SetFont(font)
+        elif window:
+            f = window.GetFont()
+            if f and f.IsOk():
+                sdc.SetFont(f)
+        w, h = sdc.GetTextExtent(text)
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return len(text) * 7, 14
 
 
 def _hal_init_paint_dc(window: wx.Window) -> tuple[wx.DC, int, int, wx.Colour]:
@@ -574,7 +593,13 @@ class _FlatButton(wx.Panel):
         self._enabled = True
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.SetBackgroundColour(_hal_resolve_bg(parent))
-        self.SetMinSize((min_width, _CTRL_H))
+        font = self.GetFont()
+        if primary:
+            font = wx.Font(font)
+            font.SetWeight(wx.FONTWEIGHT_BOLD)
+        _, th = _hal_measure_text(self, label, font)
+        btn_h = max(_CTRL_H, th + _SP_SM)
+        self.SetMinSize((min_width, btn_h))
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
         self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
@@ -1215,7 +1240,12 @@ class _FlatChoicePopup(wx.PopupTransientWindow):
         self.Bind(wx.EVT_LEAVE_WINDOW, self._on_leave)
         self.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
 
-        self._row_h = _CTRL_H
+        font = parent_choice.GetFont()
+        max_h = 0
+        for ch in choices:
+            _, th = _hal_measure_text(parent_choice, ch, font)
+            max_h = max(max_h, th)
+        self._row_h = max(_CTRL_H, max_h + _SP_SM)
         total_h = self._row_h * len(choices) + 6
         choice_w = parent_choice.GetSize().width
         self.SetSize((choice_w, total_h))
@@ -1383,12 +1413,15 @@ class _FlatChoice(wx.Panel):
             size = wx.Size(*size)
         font = self.GetFont()
         max_w = 0
+        max_h = 0
         for ch in self._choices:
-            tw, _ = _hal_measure_text(self, ch, font)
+            tw, th = _hal_measure_text(self, ch, font)
             max_w = max(max_w, tw)
+            max_h = max(max_h, th)
         min_w = max(90, max_w + 36)
+        ctrl_h = max(_CTRL_H, max_h + _SP_SM)
         req_w = size.width if (hasattr(size, "width") and size.width > 0) else min_w
-        req_h = size.height if (hasattr(size, "height") and size.height > 0) else _CTRL_H
+        req_h = size.height if (hasattr(size, "height") and size.height > 0) else ctrl_h
         self.SetMinSize((req_w, req_h))
 
         self.Bind(wx.EVT_PAINT, self._on_paint)
@@ -1404,10 +1437,12 @@ class _FlatChoice(wx.Panel):
     def DoGetBestSize(self) -> wx.Size:
         font = self.GetFont()
         max_w = 0
+        max_h = 0
         for ch in self._choices:
-            tw, _ = _hal_measure_text(self, ch, font)
+            tw, th = _hal_measure_text(self, ch, font)
             max_w = max(max_w, tw)
-        return wx.Size(max(90, max_w + 36), _CTRL_H)
+            max_h = max(max_h, th)
+        return wx.Size(max(90, max_w + 36), max(_CTRL_H, max_h + _SP_SM))
 
     def AcceptsFocus(self) -> bool:
         return self._enabled
@@ -1707,7 +1742,7 @@ class _ExportProgressDialog(wx.Dialog):
         super().__init__(
             parent,
             title="KiForge",
-            style=wx.DEFAULT_DIALOG_STYLE,
+            style=(wx.DEFAULT_DIALOG_STYLE & ~wx.MINIMIZE_BOX & ~wx.MAXIMIZE_BOX),
         )
         self._finished = False
         # Invoked the moment Cancel is pressed, not on the next poll tick. The
@@ -1740,7 +1775,7 @@ class _ExportProgressDialog(wx.Dialog):
         sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, pad_h)
 
         self.SetSizer(sizer)
-        self.SetMinSize((340, 110))
+        self.SetMinSize((380, 120))
         self.Fit()
         self.CentreOnParent()
 
@@ -1802,9 +1837,9 @@ class _ExportProgressDialog(wx.Dialog):
         """
         self._finished = True
         self._message = message
-        formatted = _format_dialog_message(message, max_token=36)
+        formatted = _format_dialog_message(message, max_token=48)
         self.lbl_message.SetLabel(formatted)
-        self.lbl_message.Wrap(320)
+        self.lbl_message.Wrap(340)
         if not complete or self._cancelled:
             self.gauge.Hide()
             if hasattr(self, "_gauge_spacer") and self._gauge_spacer is not None:
@@ -1816,10 +1851,9 @@ class _ExportProgressDialog(wx.Dialog):
         self.btn_cancel.SetTone(_COLORS["success"] if complete else None)
         self.btn_cancel.Unbind(wx.EVT_BUTTON, handler=self._on_cancel)
         self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_dismiss)
+        w, h = self.GetBestSize()
+        self.SetSize((max(w, 380), max(h, 120)))
         self.Layout()
-        self.Fit()
-        w, h = self.GetSize()
-        self.SetSize((max(w, 340), max(h, 110)))
         self.Update()
         wx.CallAfter(self.btn_cancel.SetFocus)
 
@@ -1917,7 +1951,11 @@ class _KiForgeMessageDialog(wx.Dialog):
         btn_labels: tuple[str, ...] | None = None,
     ):
         """Initialise themed message dialog matching active appearance ramp."""
-        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE)
+        super().__init__(
+            parent,
+            title=title,
+            style=(wx.DEFAULT_DIALOG_STYLE & ~wx.MINIMIZE_BOX & ~wx.MAXIMIZE_BOX),
+        )
         refresh_palette()
         self.SetBackgroundColour(_COLORS["app_bg"])
 
@@ -2015,8 +2053,8 @@ def _message_box(
         dlg.Destroy()
 
 
-_DIALOG_MIN_WIDTH = 420
-_DIALOG_MIN_HEIGHT = 380
+_DIALOG_MIN_WIDTH = 580
+_DIALOG_MIN_HEIGHT = 480
 
 EXPORT_PRESET_RADIO_LABELS = (
     "Full",
@@ -2180,15 +2218,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     ``wx.Timer``.
     """
     
-    def __init__(self, parent, project_dir=None, board_file=None, pcb_file=None):
+    def __init__(self, parent, project_dir=None, pcb_file=None):
         """
         Initialize the KiForge Studio configuration dialog.
 
         Args:
             parent: Parent wx.Window or None when running in standalone mode.
             project_dir (str, optional): Pre-resolved project directory or board file path.
-            board_file (str, optional): Path to active .kicad_pcb board file.
-            pcb_file (str, optional): Backward-compatible alias for board_file.
+            pcb_file (str, optional): Path to active .kicad_pcb board file.
         """
         super(KiForgeStudioSettingsDialog, self).__init__(
             parent, 
@@ -2201,8 +2238,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         refresh_palette()
         self.Bind(wx.EVT_SYS_COLOUR_CHANGED, self._on_system_colour_changed)
         self.project_dir = project_dir
-        self.board_file = os.path.abspath(board_file or pcb_file) if (board_file or pcb_file) else None
-        self.pcb_file = self.board_file
+        self.pcb_file = os.path.abspath(pcb_file) if pcb_file else None
         self.settings = kiforge.load_merged_settings(project_dir)
         self._export_timer = None
         self._export_state = None
@@ -2312,8 +2348,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._build_releases_tab()
         self._apply_notebook_icons()
         main_sizer.Add(self.notebook, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, _SP_LG)
-        main_sizer.Add(self._separator(self), 0, wx.EXPAND)
-        main_sizer.Add(self._build_footer_panel(), 0, wx.EXPAND)
+        main_sizer.AddSpacer(_SP_SM)
+        main_sizer.Add(self._build_footer_panel(), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, _SP_LG)
 
         self.SetSizer(main_sizer)
         self.SetMinSize((_DIALOG_MIN_WIDTH, _DIALOG_MIN_HEIGHT))
@@ -2321,7 +2357,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.Bind(wx.EVT_SIZE, self._on_dialog_resize)
         self.Bind(wx.EVT_SIZING, self._on_dialog_sizing)
         self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_notebook_page_changed)
-        self._attach_tab_icons()
 
     def _on_notebook_page_changed(self, event=None):
         """Ensure the newly selected notebook page recalculates its layout."""
@@ -2347,6 +2382,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 self.notebook.SetForegroundColour(_COLORS["text"])
             except Exception:
                 pass
+        if hasattr(self, "footer") and self.footer:
+            self.footer.SetBackgroundColour(_COLORS["app_bg"])
         self._apply_theme_to_tree(self)
         self._apply_notebook_icons()
         self.Refresh()
@@ -2381,44 +2418,15 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 child.Refresh()
 
     def _attach_tab_icons(self):
-        """
-        Put icons on the notebook tabs.
-
-        Icons ship inside the plugin, so the normal path is a local file read
-        and runs inline. Only an icon absent from the package -- one added after
-        this release -- falls back to a background CDN warm-up, which keeps the
-        network off the dialog-open path entirely.
-        """
-        missing = [n for n in _TAB_ICON_NAMES if not kiforge.read_bundled_tab_icon_svg(n)]
-        if not missing:
-            self._apply_notebook_icons()
-            return
-
-        def worker():
-            """Background worker thread for prefetching tab icon SVGs from CDN."""
-            for name in missing:
-                if kiforge.read_cached_tab_icon_svg(name):
-                    continue
-                kiforge.download_tab_icon_svg(name)
-            wx.CallAfter(self._apply_notebook_icons)
-
-        threading.Thread(target=worker, daemon=True).start()
+        """Configure notebook tabs for native desktop display."""
+        self._apply_notebook_icons()
 
     def _apply_notebook_icons(self):
-        """Attach the bundled Material Symbols to notebook tabs, tinted for the theme."""
-        display_size = 20
-        # No cache eviction: the tint is part of the key, so a theme flip is
-        # already a miss and re-rasterizes. Evicting the current tint's entry
-        # would only throw away the bitmaps this call is about to use.
-        bitmaps = [_load_tab_icon_bitmap(name, display_size) for name in _TAB_ICON_NAMES]
-        if not all(bmp and bmp.IsOk() for bmp in bitmaps):
-            return
-        image_list = wx.ImageList(display_size, display_size)
-        for bmp in bitmaps:
-            image_list.Add(bmp)
-        self.notebook.AssignImageList(image_list)
-        for index in range(self.notebook.GetPageCount()):
-            self.notebook.SetPageImage(index, index)
+        """Configure clean text tabs adhering to KiCad and desktop HIG standards."""
+        labels = ("Export", "Advanced", "Releases")
+        for index, label in enumerate(labels):
+            if index < self.notebook.GetPageCount():
+                self.notebook.SetPageText(index, label)
 
     def _bind_keyboard_shortcuts(self):
         """Bind Ctrl+1/2/3 tab switching and Enter export shortcut."""
@@ -2709,7 +2717,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """Build the bottom action bar with summary text and export button."""
         footer = wx.Panel(self)
         self.footer = footer
-        footer.SetBackgroundColour(_COLORS["footer_bg"])
+        footer.SetBackgroundColour(_COLORS["app_bg"])
         self._clear_focus_on_background_click(footer)
         sizer = wx.BoxSizer(wx.HORIZONTAL)
 
@@ -2726,12 +2734,12 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         btn_close = _FlatButton(footer, "Close", min_width=64)
         btn_close.Bind(wx.EVT_BUTTON, self.on_close)
 
-        sizer.Add(btn_save, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, _SP_SM)
+        sizer.Add(btn_save, 0, wx.ALIGN_CENTER_VERTICAL)
         sizer.AddSpacer(_SP_MD)
         sizer.Add(self.lbl_status_toast, 0, wx.ALIGN_CENTER_VERTICAL)
         sizer.AddStretchSpacer()
-        sizer.Add(self.btn_export, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, _SP_SM)
-        sizer.Add(btn_close, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, _SP_SM)
+        sizer.Add(self.btn_export, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, _SP_SM)
+        sizer.Add(btn_close, 0, wx.ALIGN_CENTER_VERTICAL)
         footer.SetSizer(sizer)
         return footer
 
@@ -2972,10 +2980,11 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.Layout()
         # Snapped: the display can be any size, so deriving from it can land
         # off-grid even though the constants either side of it do not.
-        width = _snap_to_grid(min(540, max(_DIALOG_MIN_WIDTH, display_w - 80)))
+        width = _snap_to_grid(min(720, max(_DIALOG_MIN_WIDTH, min(640, display_w - 80))))
+        natural_h = self._natural_height()
+        target_h = max(_DIALOG_MIN_HEIGHT, min(natural_h, 540))
         height = _snap_to_grid(
-            min(max(_DIALOG_MIN_HEIGHT, display_h - 100),
-                max(_DIALOG_MIN_HEIGHT, self._natural_height()))
+            min(max(_DIALOG_MIN_HEIGHT, display_h - 100), target_h)
         )
         self.SetSize((width, height))
         self._on_dialog_resize(None)
@@ -3208,16 +3217,15 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         design coherence.
 
         Returns:
-            tuple[str | None, str | None]: Absolute paths to (board_file, schematic_file).
+            tuple[str | None, str | None]: Absolute paths to (pcb_file, schematic_file).
         """
-        board_file = None
+        pcb_file = None
         sch_file = None
-        board_target = self.board_file or self.pcb_file
 
-        if board_target and os.path.isfile(board_target):
-            board_file = os.path.abspath(board_target)
+        if self.pcb_file and os.path.isfile(self.pcb_file):
+            pcb_file = os.path.abspath(self.pcb_file)
         elif self.project_dir and os.path.isfile(self.project_dir) and self.project_dir.endswith(".kicad_pcb"):
-            board_file = os.path.abspath(self.project_dir)
+            pcb_file = os.path.abspath(self.project_dir)
         elif self.project_dir and os.path.isdir(self.project_dir):
             try:
                 pcb_candidates = [
@@ -3227,13 +3235,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 ]
                 if pcb_candidates:
                     pcb_candidates.sort(key=lambda p: (len(os.path.basename(p)), os.path.basename(p)))
-                    board_file = os.path.abspath(pcb_candidates[0])
+                    pcb_file = os.path.abspath(pcb_candidates[0])
             except OSError:
                 pass
 
-        if board_file:
-            board_dir = os.path.dirname(board_file)
-            base_name = os.path.splitext(os.path.basename(board_file))[0]
+        if pcb_file:
+            board_dir = os.path.dirname(pcb_file)
+            base_name = os.path.splitext(os.path.basename(pcb_file))[0]
             matched_sch = os.path.join(board_dir, f"{base_name}.kicad_sch")
             if os.path.isfile(matched_sch):
                 sch_file = matched_sch
@@ -3250,7 +3258,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 except OSError:
                     pass
 
-        return board_file, sch_file
+        return pcb_file, sch_file
 
     def _sync_file_availability_state(self):
         """
@@ -3260,9 +3268,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         and MPN fields) when exporting from a standalone board file without an
         accompanying schematic.
         """
-        board_file, sch_file = self._resolve_project_source_files()
+        pcb_file, sch_file = self._resolve_project_source_files()
         has_sch = bool(sch_file and os.path.isfile(sch_file))
-        sch_missing = bool(board_file and not has_sch)
+        sch_missing = bool(pcb_file and not has_sch)
 
         if hasattr(self, "chk_sch_pdf"):
             if sch_missing:
@@ -3298,8 +3306,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """
         if not hasattr(self, "btn_export"):
             return
-        board_file, _ = self._resolve_project_source_files()
-        has_pcb = bool(board_file and os.path.isfile(board_file))
+        pcb_file, _ = self._resolve_project_source_files()
+        has_pcb = bool(pcb_file and os.path.isfile(pcb_file))
         if has_outputs is None:
             has_outputs = any(
                 getattr(self, self._export_checkbox_attr(key)).IsChecked()
@@ -3391,6 +3399,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         options = kiforge.apply_export_params_to_options(self._current_settings())
         if options['export_gerbers']:
             options['export_drills'] = True
+        options['generate_cd'] = False
         return options
 
     def on_save_project_defaults(self, event):
@@ -3441,6 +3450,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 return
 
         cd_options = self._export_options()
+        cd_options["generate_cd"] = True
         msg, success = kiforge.generate_cd_files(project_dir, output_dir_name, cd_options)
         if success:
             self._cd_unlocked = False
@@ -3644,6 +3654,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                     self._finish_export_progress()
                 return
 
+        if progress and state.get("success") and not state.get("cancelled"):
+            progress.update(100, state.get("msg") or "Completed successfully!")
         self._finish_export_progress()
 
     def _finish_export_progress(self):
@@ -3794,14 +3806,14 @@ class ExporterPlugin(_PluginBase):
         logger.info("KiForge Studio action plugin invoked.")
 
         project_dir = None
-        board_file = None
+        pcb_file = None
         try:
             board = pcbnew.GetBoard() if has_pcbnew else None
             if board:
-                board_file = board.GetFileName()
-                if board_file and board_file.endswith(".kicad_pcb"):
-                    board_dir = os.path.dirname(board_file)
-                    pro_file = board_file.replace(".kicad_pcb", ".kicad_pro")
+                pcb_file = board.GetFileName()
+                if pcb_file and pcb_file.endswith(".kicad_pcb"):
+                    board_dir = os.path.dirname(pcb_file)
+                    pro_file = pcb_file.replace(".kicad_pcb", ".kicad_pro")
                     if os.path.isfile(pro_file):
                         project_dir = os.path.dirname(pro_file)
                     else:
@@ -3834,7 +3846,7 @@ class ExporterPlugin(_PluginBase):
                 DlgClass = getattr(mod, "KiForgeStudioSettingsDialog", KiForgeStudioSettingsDialog)
             else:
                 DlgClass = KiForgeStudioSettingsDialog
-            dialog = DlgClass(parent_window, project_dir, board_file=board_file)
+            dialog = DlgClass(parent_window, project_dir, pcb_file=pcb_file)
             dialog.ShowModal()
         except Exception as exc:
             logger.exception("KiForge Studio dialog failed to open.")

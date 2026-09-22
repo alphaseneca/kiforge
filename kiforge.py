@@ -25,7 +25,7 @@ Settings merge order
 --------------------
 Built-in defaults → global ``settings.json`` → project ``.kiforge.json`` → runtime
 CLI/GUI flags. Saved JSON uses nested ``exports``, ``export_params``, and ``ibom``
-groups; legacy flat keys and ``generate_ci`` are still accepted.
+groups; flat and nested configuration structures are supported.
 
 Configuration layers
 --------------------
@@ -235,7 +235,6 @@ DEFAULT_EXPORT_SETTINGS = {
     "export_svg": True,
     "export_homebrew_pdf": True,
     "format_jlc": True,
-    "generate_cd": False,
 }
 
 EXPORT_SETTING_KEYS = tuple(DEFAULT_EXPORT_SETTINGS.keys())
@@ -376,6 +375,7 @@ assert set(EXPORT_PARAM_KEYS) == set(DEFAULT_EXPORT_PARAMS), "EXPORT_PARAM_SPECS
 
 DEFAULT_SETTINGS = {
     "output_dir": "kiforge",
+    "generate_cd": False,
     **DEFAULT_EXPORT_SETTINGS,
 }
 
@@ -540,8 +540,8 @@ def resolve_export_version(options: dict, project_dir: str) -> tuple[str, str]:
     Returns:
         Tuple of (normalized version string, human-readable source label).
     """
-    if options.get("version"):
-        return normalize_version_suffix(options["version"]), "option"
+    if options.get("version_tag"):
+        return normalize_version_suffix(options["version_tag"]), "option"
 
     ref_type = os.environ.get("GITHUB_REF_TYPE", "")
     if ref_type == "tag" or not ref_type:
@@ -780,8 +780,6 @@ def build_cd_substitutions(output_dir_name: str, options: dict) -> dict[str, str
         "GITHUB_REF_NAME": "${{ github.ref_name }}",
     }
     for key in EXPORT_SETTING_KEYS:
-        if key == "generate_cd":
-            continue
         substitutions[_export_toggle_cd_placeholder(key)] = _cd_option_str(
             opts, key, DEFAULT_EXPORT_SETTINGS[key]
         )
@@ -1306,8 +1304,6 @@ def _apply_settings_layer(settings: dict, loaded: dict) -> None:
     for key, default in DEFAULT_SETTINGS.items():
         if key in loaded:
             settings[key] = _coerce_setting_value(default, loaded[key])
-        elif key == "generate_cd" and "generate_ci" in loaded:
-            settings[key] = _coerce_setting_value(default, loaded["generate_ci"])
 
     settings["exports"] = merge_export_settings(
         {k: settings[k] for k in EXPORT_SETTING_KEYS},
@@ -1334,7 +1330,6 @@ def load_merged_settings(project_dir=None):
     Defaults are applied first, then the user-wide settings file (for example
     ~/.config/kiforge/settings.json on Linux), and finally project-local
     .kiforge.json when project_dir is given. Project values override global ones.
-    Legacy generate_ci keys in saved JSON are still accepted as generate_cd.
 
     Args:
         project_dir: Optional KiCad project root containing .kiforge.json.
@@ -1483,7 +1478,7 @@ def export_options_from_context(context: "ExportContext") -> dict:
     Used when generating CD workflow YAML after export so the release pipeline
     matches export toggles, export_params, and runtime options from the run.
     BOM and 3D render behavior is fixed inside KiForge and is not substituted
-    into workflow YAML. Legacy ``generate_ci`` maps to ``generate_cd``.
+    into workflow YAML.
 
     Args:
         context: A resolved ExportContext from the current run.
@@ -1494,11 +1489,9 @@ def export_options_from_context(context: "ExportContext") -> dict:
     keys = (
         "export_gerbers", "export_drills", "export_pos", "export_bom", "export_ibom",
         "export_sch_pdf", "export_step", "export_3d", "export_svg", "export_homebrew_pdf", "format_jlc",
-        "generate_cd", "version",
+        "generate_cd", "version_tag",
     )
     options = {key: context.options.get(key, DEFAULT_SETTINGS.get(key, True)) for key in keys}
-    if "generate_cd" not in context.options and context.options.get("generate_ci") is not None:
-        options["generate_cd"] = context.options.get("generate_ci")
     if isinstance(context.options.get("export_params"), dict):
         options["export_params"] = context.options["export_params"]
     return _normalize_cd_options(options)
@@ -1944,7 +1937,10 @@ class ExportContext:
         if not self.pcb_file and os.path.isfile(self.project_path) and self.project_path.endswith(".kicad_pcb"):
             self.pcb_file = self.project_path
 
-        if self.pcb_file and os.path.isfile(self.pcb_file):
+        if self.pcb_file:
+            if not os.path.isfile(self.pcb_file):
+                self.logger.error("Specified PCB file does not exist: %s", self.pcb_file)
+                return False
             self.pcb_name = os.path.splitext(os.path.basename(self.pcb_file))[0]
             if not self.project_dir:
                 self.project_dir = os.path.dirname(self.pcb_file)
@@ -2953,7 +2949,7 @@ class Render3dExportTask(ExportTask):
         fallback_flags = [
             "--preset", "0", "--floor",
             "--zoom", str(RENDER_3D_DEFAULTS["zoom"]),
-            "--quality", "normal",
+            "--quality", "basic",
             "--width", str(RENDER_3D_DEFAULTS["width"]),
             "--height", str(RENDER_3D_DEFAULTS["height"]),
         ]
@@ -4976,10 +4972,6 @@ def generate_cd_files(project_dir: str, output_dir_name: str, options: dict) -> 
         return f"Failed to generate CD files: {e}", False
 
 
-# Deprecated alias; prefer generate_cd_files.
-generate_ci_files = generate_cd_files
-
-
 def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=True, export_homebrew_pdf=True, export_bom=True, export_sch_pdf=True, export_pos=True, export_step=True, export_gerbers=True, export_drills=True, export_ibom=True, progress_callback=None, context=None, pcb_file=None):
     """
     Main library entry point for CLI, Studio, and CD workflows.
@@ -5013,7 +5005,7 @@ def run_export(project_path=None, output_dir=None, export_3d=True, export_svg=Tr
     runner = ExportRunner(context)
     success = runner.execute()
 
-    generate_cd = context.options.get("generate_cd", context.options.get("generate_ci", True))
+    generate_cd = context.options.get("generate_cd", False)
     if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
         if generate_cd:
             context.logger.info(
@@ -5057,23 +5049,19 @@ def parse_cli_args(args=None):
         description="KiForge - KiCad 10 Exporter CLI",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--project-path", "--project_path", dest="project_path", default=".")
+    parser.add_argument("--project-path", dest="project_path", default=".")
     parser.add_argument(
         "--pcb-file",
-        "--pcb_file",
         dest="pcb_file",
         default=None,
         help="Path to specific .kicad_pcb board file (e.g. from history or backup)",
     )
-    parser.add_argument("--output-dir", "--output_dir", dest="output_dir", default="kiforge")
+    parser.add_argument("--output-dir", dest="output_dir", default="kiforge")
     for key in EXPORT_SETTING_KEYS:
-        if key == "generate_cd":
-            continue
         flag = f"--{key.replace('_', '-')}"
         parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--version-tag",
-        "--version_tag",
         dest="version_tag",
         default=None,
         help="Version tag to append to output filenames",
@@ -5120,7 +5108,6 @@ def parse_cli_args(args=None):
         dest="generate_cd",
         help="Generate GitHub/Gitea release CD workflow and update .gitignore instead of exporting",
     )
-    parser.add_argument("--generate-ci", action="store_true", dest="generate_cd", help=argparse.SUPPRESS)
     return parser.parse_args(args)
 
 
@@ -5151,9 +5138,9 @@ def build_cli_options(args, *, flatten_params: bool = False) -> dict:
     options = {
         key: getattr(args, key, DEFAULT_EXPORT_SETTINGS[key])
         for key in EXPORT_SETTING_KEYS
-        if key != "generate_cd"
     }
-    options["version"] = args.version_tag
+    options["generate_cd"] = bool(getattr(args, "generate_cd", False))
+    options["version_tag"] = args.version_tag
     export_params = export_params_from_cli_args(args)
     if export_params:
         options["export_params"] = merge_export_params(None, export_params)

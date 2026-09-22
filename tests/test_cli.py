@@ -6,6 +6,7 @@ Does not require KiCad to be installed; subprocess export tests skip or mock whe
 kicad-cli is unavailable.
 """
 import unittest
+from unittest.mock import MagicMock, patch
 import sys
 import os
 import subprocess
@@ -246,7 +247,8 @@ class TestKiForgeCLI(unittest.TestCase):
         original_setup_logger = kiforge.setup_logger
         kiforge.setup_logger = lambda dir: None
         try:
-            context.resolve()
+            with patch.object(context, "_discover_project_files", return_value=True):
+                context.resolve()
         finally:
             kiforge.setup_logger = original_setup_logger
             
@@ -1108,7 +1110,7 @@ class TestKiForgeCLI(unittest.TestCase):
                 f.write('(title_block (rev "1.2.3-sch"))\n')
                 
             # Case 1: Option version takes priority and normalizes (prepends 'v' if digit)
-            options = {"version": "9.9.9"}
+            options = {"version_tag": "9.9.9"}
             context = kiforge.ExportContext(temp_dir, "out", options)
             # Mock setup_logger to prevent log folder generation
             original_setup_logger = kiforge.setup_logger
@@ -1150,10 +1152,6 @@ class TestKiForgeCLI(unittest.TestCase):
             
         finally:
             shutil.rmtree(temp_dir)
-
-    def test_generate_ci_files_alias(self):
-        """Verify deprecated generate_ci_files alias still works."""
-        self.assertIs(kiforge.generate_ci_files, kiforge.generate_cd_files)
 
     def test_step3d_export_task_vrml_warning(self):
         """Partial STEP output should count as success with a warning."""
@@ -2383,11 +2381,25 @@ class TestKiForgeCLI(unittest.TestCase):
             self.assertEqual(ctx_local.sch_file, os.path.abspath(local_sch))
 
     def test_parse_cli_args_pcb_file(self):
-        """CLI parser must accept --pcb-file and --pcb_file."""
-        args1 = kiforge.parse_cli_args(["--pcb-file", "history/board.kicad_pcb"])
-        self.assertEqual(args1.pcb_file, "history/board.kicad_pcb")
-        args2 = kiforge.parse_cli_args(["--pcb_file", "history/board.kicad_pcb"])
-        self.assertEqual(args2.pcb_file, "history/board.kicad_pcb")
+        """CLI parser must accept canonical --pcb-file."""
+        args = kiforge.parse_cli_args(["--pcb-file", "history/board.kicad_pcb"])
+        self.assertEqual(args.pcb_file, "history/board.kicad_pcb")
+
+    def test_parse_cli_args_version_tag(self):
+        """CLI parser must accept canonical --version-tag."""
+        args = kiforge.parse_cli_args(["--version-tag", "v1.2.3"])
+        self.assertEqual(args.version_tag, "v1.2.3")
+
+    def test_non_existent_pcb_file_fails_fast(self):
+        """ExportContext must fail fast if explicit pcb_file does not exist on disk."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ctx = kiforge.ExportContext(
+                tmp_dir,
+                "kiforge",
+                {},
+                pcb_file=os.path.join(tmp_dir, "missing_board.kicad_pcb"),
+            )
+            self.assertFalse(ctx._discover_project_files())
 
     def test_historical_board_export_pipeline_isolation(self):
         """Historical board export places all generated files into <history_dir>/kiforge
