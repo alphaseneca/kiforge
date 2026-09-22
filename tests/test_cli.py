@@ -1586,6 +1586,7 @@ class TestKiForgeCLI(unittest.TestCase):
         ctx.add_warning = MagicMock(side_effect=lambda m: ctx.warnings.append(m))
         ctx.is_aborted.return_value = False
         ctx.homebrew_layers = None
+        ctx.kicad_python = sys.executable
         return ctx
 
     def test_svg_export_task_stashes_context_for_homebrew_reuse(self):
@@ -2441,6 +2442,83 @@ class TestKiForgeCLI(unittest.TestCase):
                 self.assertFalse(os.path.exists(os.path.join(tmp_dir, "kiforge")))
             finally:
                 kiforge.close_file_handlers()
+
+    def test_convert_wrl_to_step(self):
+        """convert_wrl_to_step must parse VRML mesh and emit valid STEP AP214 FACETED_BREP."""
+        sample_wrl = """#VRML V2.0 utf8
+Shape {
+    geometry IndexedFaceSet {
+        coord Coordinate {
+            point [
+                0.0 0.0 0.0,
+                1.0 0.0 0.0,
+                1.0 1.0 0.0,
+                0.0 1.0 0.0
+            ]
+        }
+        coordIndex [
+            0, 1, 2, -1,
+            0, 2, 3, -1
+        ]
+    }
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wrl_file = os.path.join(tmp_dir, "cube.wrl")
+            step_file = os.path.join(tmp_dir, "cube.step")
+            with open(wrl_file, "w", encoding="utf-8") as f:
+                f.write(sample_wrl)
+
+            ok = kiforge.convert_wrl_to_step(wrl_file, step_file)
+            self.assertTrue(ok)
+            self.assertTrue(os.path.isfile(step_file))
+
+            with open(step_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            self.assertIn("ISO-10303-21;", content)
+            self.assertIn("AUTOMOTIVE_DESIGN", content)
+            self.assertIn("FACETED_BREP", content)
+            self.assertIn("CLOSED_SHELL", content)
+            self.assertIn("FACE_SURFACE", content)
+
+    def test_step3d_prepare_wrl_models(self):
+        """Step3dExportTask must auto-generate missing .step alongside referenced .wrl."""
+        sample_wrl = """#VRML V2.0 utf8
+Shape {
+    geometry IndexedFaceSet {
+        coord Coordinate {
+            point [ 0 0 0, 1 0 0, 0 1 0 ]
+        }
+        coordIndex [ 0, 1, 2, -1 ]
+    }
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wrl_path = os.path.join(tmp_dir, "sensor.wrl")
+            with open(wrl_path, "w", encoding="utf-8") as f:
+                f.write(sample_wrl)
+
+            wrl_posix = wrl_path.replace("\\", "/")
+            pcb_path = os.path.join(tmp_dir, "test.kicad_pcb")
+            with open(pcb_path, "w", encoding="utf-8") as f:
+                f.write(f'(kicad_pcb (version 20240108) (footprint "U1" (model "{wrl_posix}")))')
+
+            ctx = self._make_export_context(tmp_dir)
+            ctx.pcb_file = pcb_path
+            ctx.project_dir = tmp_dir
+
+            task = kiforge.Step3dExportTask()
+            eff_pcb, temp_dir = task._prepare_wrl_models(ctx)
+            expected_step = os.path.join(ctx.output_dir, "3dmodels", "sensor.step")
+            self.assertTrue(os.path.isfile(expected_step))
+            # External source directory must NOT have been written to
+            self.assertFalse(os.path.isfile(os.path.join(tmp_dir, "sensor.step")))
+            # Staged PCB must reference the new STEP model
+            with open(eff_pcb, "r", encoding="utf-8") as f:
+                self.assertIn("3dmodels/sensor.step", f.read().replace("\\", "/"))
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == '__main__':

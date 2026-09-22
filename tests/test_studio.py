@@ -89,7 +89,7 @@ class TestKiForgeStudio(unittest.TestCase):
         self.assertEqual(settings['output_dir'], 'kiforge')
         self.assertTrue(settings['export_gerbers'])
         self.assertTrue(settings['format_jlc'])
-        self.assertTrue(settings['generate_cd'])
+        self.assertFalse(settings['generate_cd'])
         dialog.Destroy()
 
     def test_save_and_load_settings(self):
@@ -233,14 +233,14 @@ class TestKiForgeStudio(unittest.TestCase):
 
         try:
             dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
-            dialog.chk_generate_cd.SetValue(False)
+            dialog.chk_step.SetValue(False)
 
             class MockEvent:
                 pass
 
             dialog.on_save_global_defaults(MockEvent())
             loaded = kiforge.load_merged_settings(None)
-            self.assertFalse(loaded["generate_cd"])
+            self.assertFalse(loaded["exports"]["export_step"])
             dialog.Destroy()
         finally:
             if backup is not None:
@@ -292,8 +292,8 @@ class TestKiForgeStudio(unittest.TestCase):
         self.assertTrue(dialog.chk_3d.IsChecked())
         dialog.Destroy()
 
-    def test_live_cd_sync_on_toggle(self):
-        """Verify changing an export checkbox triggers debounced CD workflow sync."""
+    def test_cd_not_mutated_on_export_toggle(self):
+        """Verify changing export settings does NOT silently regenerate CD files."""
         from unittest.mock import patch
 
         dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
@@ -304,17 +304,77 @@ class TestKiForgeStudio(unittest.TestCase):
         class MockEvent:
             pass
 
-        with patch.object(kiforge_studio.kiforge, "generate_cd_files", return_value=("ok", True)) as mock_cd:
+        with patch.object(kiforge_studio.kiforge, "generate_cd_files") as mock_cd:
             dialog.on_export_setting_changed(MockEvent())
-            dialog.on_cd_sync_timer(MockEvent())
-            mock_cd.assert_called_once()
-            self.assertTrue(mock_cd.call_args[0][2]["export_3d"])
+            mock_cd.assert_not_called()
             dialog.chk_3d.SetValue(False)
             dialog.on_export_setting_changed(MockEvent())
-            dialog.on_cd_sync_timer(MockEvent())
-            self.assertEqual(mock_cd.call_count, 2)
-            self.assertFalse(mock_cd.call_args[0][2]["export_3d"])
+            mock_cd.assert_not_called()
         dialog.Destroy()
+
+    def test_in_app_status_toast_on_reset_and_save(self):
+        """Reset and Save show clean in-app footer status instead of popping up modal dialogs."""
+        from unittest.mock import patch
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            with patch.object(kiforge_studio, "_message_box") as mock_box:
+                dialog.on_reset_defaults(None)
+                self.assertIn("Settings reset to built-in defaults.", dialog.lbl_status_toast.GetLabel())
+                self.assertNotIn("✓", dialog.lbl_status_toast.GetLabel())
+                mock_box.assert_not_called()
+
+                dialog.txt_project_dir.SetValue(self.test_dir)
+                dialog.on_save_project_defaults(None)
+                self.assertIn("Project defaults saved.", dialog.lbl_status_toast.GetLabel())
+                self.assertNotIn("✓", dialog.lbl_status_toast.GetLabel())
+                mock_box.assert_not_called()
+        finally:
+            dialog.Destroy()
+
+    def test_cd_workflow_lifecycle_locked_and_unlocked(self):
+        """Existing CD workflows lock editing by default and require explicit unlock."""
+        from unittest.mock import patch
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            # Initially no workflows exist
+            dialog.txt_project_dir.SetValue(self.test_dir)
+            dialog._refresh_cd_workflow_status()
+            self.assertEqual(dialog.btn_generate_cd.GetLabel(), "Set up workflows")
+            self.assertTrue(dialog.btn_generate_cd.IsEnabled())
+            self.assertFalse(dialog.btn_unlock_cd.IsShown())
+
+            # Simulate existing workflows
+            gh_dir = os.path.join(self.test_dir, ".github", "workflows")
+            os.makedirs(gh_dir, exist_ok=True)
+            with open(os.path.join(gh_dir, "release.yml"), "w") as f:
+                f.write("name: Release\n")
+
+            dialog._refresh_cd_workflow_status()
+            # Must now be locked
+            self.assertEqual(dialog.btn_generate_cd.GetLabel(), "Overwrite workflows")
+            self.assertFalse(dialog.btn_generate_cd.IsEnabled())
+            self.assertTrue(dialog.btn_unlock_cd.IsShown())
+            self.assertEqual(dialog.btn_unlock_cd._icon_kind, "lock")
+            self.assertIn("Workflows configured [Locked]", dialog.lbl_cd_sync_status.GetLabel())
+
+            # Unlock
+            dialog.on_unlock_cd_workflows(None)
+            self.assertEqual(dialog.btn_generate_cd.GetLabel(), "Overwrite workflows")
+            self.assertTrue(dialog.btn_generate_cd.IsEnabled())
+            self.assertEqual(dialog.btn_unlock_cd._icon_kind, "unlock")
+            self.assertIn("Workflows configured [Unlocked]", dialog.lbl_cd_sync_status.GetLabel())
+
+            # Overwriting prompts for confirmation
+            with patch.object(kiforge_studio, "_message_box", return_value=wx.ID_NO) as mock_box:
+                dialog.txt_output_dir.SetValue("out")
+                class MockEvt:
+                    pass
+                dialog.on_generate_cd(MockEvt())
+                mock_box.assert_called_once()
+                self.assertIn("Update Workflows?", mock_box.call_args[0][1])
+                self.assertIn("Overwrite existing workflows with the current export selections?", mock_box.call_args[0][0])
+        finally:
+            dialog.Destroy()
 
     def test_gerber_toggle_forces_drills(self):
         """Verify enabling gerbers disables and checks the drill checkbox."""
@@ -468,24 +528,26 @@ class TestKiForgeStudio(unittest.TestCase):
 
                 control._on_kill_focus(wx.FocusEvent(wx.wxEVT_KILL_FOCUS))
                 control._on_set_focus(wx.FocusEvent(wx.wxEVT_SET_FOCUS))
-                self.assertTrue(
+                self.assertFalse(
                     self._is_accent(self._glyph_edge_colour(control)),
-                    f"{factory.__name__} gives keyboard focus no visible position",
+                    f"{factory.__name__} must not paint an accent outline on unselected control",
                 )
         finally:
             frame.Destroy()
 
-    def test_checked_glyph_still_shows_keyboard_focus(self):
-        """A checked box is filled with the accent, so an accent focus border is invisible."""
+    def test_checked_glyph_shows_accent_styling(self):
+        """A checked box is styled with the accent color; an unchecked box never has an accent outline."""
         frame = wx.Frame(None)
         try:
             control = kiforge_studio._FlatCheckBox(frame, label="Gerbers")
             control.SetSize((160, 24))
+            # When unchecked, glyph edge must never be accent
+            control.SetValue(False)
+            self.assertFalse(self._is_accent(self._glyph_edge_colour(control)), "unchecked box must not have accent outline")
+
+            # When checked, glyph edge is accent
             control.SetValue(True)
-            idle = self._glyph_edge_colour(control)
-            control._on_set_focus(wx.FocusEvent(wx.wxEVT_SET_FOCUS))
-            focused = self._glyph_edge_colour(control)
-            self.assertNotEqual(idle, focused, "keyboard focus is invisible on a checked box")
+            self.assertTrue(self._is_accent(self._glyph_edge_colour(control)), "checked box must have accent styling")
         finally:
             frame.Destroy()
 
@@ -1132,6 +1194,126 @@ class TestKiForgeStudio(unittest.TestCase):
         finally:
             dialog.Destroy()
 
+    def test_unselected_radio_never_has_accent_border_on_focus(self):
+        """Verify an unselected radio button NEVER shows an accent/orange border when focused."""
+        frame = wx.Frame(None)
+        try:
+            grp = []
+            r_full = kiforge_studio._FlatRadioButton(frame, label="Full", group=grp)
+            r_doc = kiforge_studio._FlatRadioButton(frame, label="Documentation", group=grp)
+            r_full.SetValue(True)
+
+            self.assertTrue(r_full.GetValue())
+            self.assertFalse(r_doc.GetValue())
+
+            # Only the selected radio button acts as a tab stop
+            self.assertTrue(r_full.AcceptsFocusFromKeyboard())
+            self.assertFalse(r_doc.AcceptsFocusFromKeyboard())
+
+            # Simulate focus on the unselected radio button
+            r_doc._has_focus = True
+            r_doc.Refresh()
+
+            # The unselected radio must NOT be marked selected
+            self.assertFalse(r_doc.GetValue())
+
+            # Verify that border resolution in unselected state is NOT accent
+            accent = kiforge_studio._COLORS["accent"]
+            border = (
+                kiforge_studio._COLORS["muted"]
+                if (r_doc._has_focus or r_doc._hover)
+                else kiforge_studio._COLORS["border"]
+            )
+            self.assertNotEqual(border, accent)
+        finally:
+            frame.Destroy()
+
+    def test_radio_button_arrow_navigation(self):
+        """Verify arrow keys cycle selection across siblings in a radio group."""
+        frame = wx.Frame(None)
+        try:
+            grp = []
+            r1 = kiforge_studio._FlatRadioButton(frame, label="1", group=grp)
+            r2 = kiforge_studio._FlatRadioButton(frame, label="2", group=grp)
+            r3 = kiforge_studio._FlatRadioButton(frame, label="3", group=grp)
+            r1.SetValue(True)
+
+            # Navigate forward
+            r1._navigate_group(1)
+            self.assertFalse(r1.GetValue())
+            self.assertTrue(r2.GetValue())
+            self.assertFalse(r3.GetValue())
+
+            # Navigate backward
+            r2._navigate_group(-1)
+            self.assertTrue(r1.GetValue())
+            self.assertFalse(r2.GetValue())
+        finally:
+            frame.Destroy()
+
+    def test_unchecked_checkbox_never_has_accent_border_on_focus(self):
+        """Verify an unchecked checkbox never displays an orange accent border on focus."""
+        frame = wx.Frame(None)
+        try:
+            chk = kiforge_studio._FlatCheckBox(frame, label="Gerbers")
+            self.assertFalse(chk.IsChecked())
+
+            chk._has_focus = True
+            accent = kiforge_studio._COLORS["accent"]
+            border = (
+                kiforge_studio._COLORS["text"]
+                if chk._has_focus
+                else (
+                    kiforge_studio._COLORS["muted"]
+                    if chk._hover
+                    else kiforge_studio._COLORS["border"]
+                )
+            )
+            self.assertNotEqual(border, accent)
+        finally:
+            frame.Destroy()
+
+    def test_flat_choice_dropdown(self):
+        """Verify _FlatChoice API compatibility and selection management."""
+        frame = wx.Frame(None)
+        try:
+            choice = kiforge_studio._FlatChoice(frame, choices=["Both", "Front", "Back"])
+            self.assertEqual(choice.GetCount(), 3)
+            self.assertEqual(choice.GetSelection(), 0)
+            self.assertEqual(choice.GetStringSelection(), "Both")
+
+            choice.SetSelection(1)
+            self.assertEqual(choice.GetSelection(), 1)
+            self.assertEqual(choice.GetStringSelection(), "Front")
+
+            choice.SetStringSelection("Back")
+            self.assertEqual(choice.GetSelection(), 2)
+
+            self.assertEqual(choice.FindString("Front"), 1)
+            self.assertEqual(choice.GetString(0), "Both")
+        finally:
+            frame.Destroy()
+
+    def test_dynamic_theme_switching_tree(self):
+        """Verify apply_theme propagates background and foreground colors down the tree."""
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            # Force light theme
+            kiforge_studio._DARK_PALETTE["app_bg"]
+            kiforge_studio._palette_mode = "light"
+            kiforge_studio._COLORS.update(kiforge_studio._LIGHT_PALETTE)
+            dialog.apply_theme()
+            self.assertEqual(dialog.GetBackgroundColour(), kiforge_studio._COLORS["app_bg"])
+
+            # Force dark theme
+            kiforge_studio._palette_mode = "dark"
+            kiforge_studio._COLORS.update(kiforge_studio._DARK_PALETTE)
+            dialog.apply_theme()
+            self.assertEqual(dialog.GetBackgroundColour(), kiforge_studio._COLORS["app_bg"])
+        finally:
+            dialog.Destroy()
+
+
 
 class TestStudioPalette(unittest.TestCase):
     """
@@ -1162,6 +1344,9 @@ class TestStudioPalette(unittest.TestCase):
     def _contrast(cls, fg, bg):
         light, dark = sorted((cls._luminance(fg), cls._luminance(bg)), reverse=True)
         return (light + 0.05) / (dark + 0.05)
+
+    def setUp(self):
+        self.app = wx.GetApp() or wx.App(False)
 
     def _ramps(self):
         return (
@@ -1255,6 +1440,75 @@ class TestStudioPalette(unittest.TestCase):
             kiforge_studio._DARK_PALETTE if mode == "dark" else kiforge_studio._LIGHT_PALETTE
         )
         self.assertEqual(kiforge_studio._COLORS["app_bg"], expected["app_bg"])
+
+    def test_dialog_theme_modes_and_live_transition(self):
+        """Verify Studio dialog constructs and transitions cleanly between dark and light modes."""
+        from unittest.mock import patch
+        import tempfile
+
+        test_dir = tempfile.mkdtemp()
+        try:
+            # Construct in dark mode
+            with patch.object(kiforge_studio, "_system_is_dark", return_value=True):
+                kiforge_studio.refresh_palette()
+                dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, test_dir)
+                try:
+                    dialog.apply_theme()
+                    self.assertEqual(dialog.GetBackgroundColour(), kiforge_studio._DARK_PALETTE["app_bg"])
+                    self.assertEqual(kiforge_studio.active_palette_mode(), "dark")
+
+                    # Live transition to light mode
+                    with patch.object(kiforge_studio, "_system_is_dark", return_value=False):
+                        dialog.apply_theme()
+                        self.assertEqual(dialog.GetBackgroundColour(), kiforge_studio._LIGHT_PALETTE["app_bg"])
+                        self.assertEqual(kiforge_studio.active_palette_mode(), "light")
+
+                    # Live transition back to dark mode
+                    with patch.object(kiforge_studio, "_system_is_dark", return_value=True):
+                        dialog.apply_theme()
+                        self.assertEqual(dialog.GetBackgroundColour(), kiforge_studio._DARK_PALETTE["app_bg"])
+                        self.assertEqual(kiforge_studio.active_palette_mode(), "dark")
+                finally:
+                    dialog.Destroy()
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_flat_choice_initialization_and_selection(self):
+        """Test _FlatChoice control API, sizing, selection, and EVT_CHOICE notification."""
+        frame = wx.Frame(None, title="TestFrame")
+        choice = kiforge_studio._FlatChoice(frame, choices=["Both", "Front", "Back"], size=(120, 28))
+        self.assertEqual(choice.GetCount(), 3)
+        self.assertEqual(choice.GetSelection(), 0)
+        self.assertEqual(choice.GetStringSelection(), "Both")
+
+        # Test SetSelection
+        events_received = []
+        choice.Bind(wx.EVT_CHOICE, lambda evt: events_received.append((evt.GetInt(), evt.GetString())))
+
+        choice._on_popup_item_chosen(1)
+        self.assertEqual(choice.GetSelection(), 1)
+        self.assertEqual(choice.GetStringSelection(), "Front")
+        self.assertEqual(len(events_received), 1)
+        self.assertEqual(events_received[0], (1, "Front"))
+
+        # Test DoGetBestSize
+        best_sz = choice.DoGetBestSize()
+        self.assertGreaterEqual(best_sz.width, 90)
+        self.assertEqual(best_sz.height, kiforge_studio._CTRL_H)
+
+        frame.Destroy()
+
+    def test_flat_choice_popup_instantiation_and_dismiss(self):
+        """Test _FlatChoicePopup creation with flags=wx.BORDER_NONE and dismissal."""
+        frame = wx.Frame(None, title="TestFrame")
+        frame.Show()
+        choice = kiforge_studio._FlatChoice(frame, choices=["Both", "Front", "Back"])
+        popup = kiforge_studio._FlatChoicePopup(choice, choice._choices, choice._selection)
+        self.assertIsNotNone(popup)
+        self.assertEqual(popup._choices, ["Both", "Front", "Back"])
+        self.assertEqual(popup._selected, 0)
+        popup.Dismiss()
+        frame.Destroy()
 
 
 if __name__ == '__main__':

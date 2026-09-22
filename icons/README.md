@@ -24,6 +24,8 @@ Filenames map to `kiforge.TAB_ICON_CDN` keys, not to Material Symbol names, so
 | `msg_cancelled.svg` | `cancel` |
 | `msg_info.svg` | `info` |
 | `msg_question.svg` | `help` |
+| `lock.svg` | `lock` |
+| `lock_open.svg` | `lock_open` |
 
 Edit files here only; `package_plugin.py` copies them into the plugin zip at
 `plugins/icons/` at build time, the same way `templates/` is handled.

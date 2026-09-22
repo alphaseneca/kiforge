@@ -114,6 +114,8 @@ import ssl
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+import math
+import glob
 from collections.abc import Callable
 
 # Ensure the user's local site-packages folder is in sys.path
@@ -233,7 +235,7 @@ DEFAULT_EXPORT_SETTINGS = {
     "export_svg": True,
     "export_homebrew_pdf": True,
     "format_jlc": True,
-    "generate_cd": True,
+    "generate_cd": False,
 }
 
 EXPORT_SETTING_KEYS = tuple(DEFAULT_EXPORT_SETTINGS.keys())
@@ -877,6 +879,8 @@ TAB_ICON_CDN = {
     "msg_cancelled": "cancel",
     "msg_info": "info",
     "msg_question": "help",
+    "lock": "lock",
+    "lock_open": "lock_open",
 }
 TAB_ICON_CDN_URL = (
     "https://fonts.gstatic.com/s/i/short-term/release/"
@@ -2034,7 +2038,11 @@ class ExportContext:
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.temp_gerber_dir = os.path.join(self.output_dir, "temp_gerbers")
-        os.makedirs(self.temp_gerber_dir, exist_ok=True)
+        if os.path.isdir(self.temp_gerber_dir) and not os.listdir(self.temp_gerber_dir):
+            try:
+                shutil.rmtree(self.temp_gerber_dir)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -2299,10 +2307,12 @@ class ExportTask:
                 return False
             err_output = (e.stderr or e.stdout or "").strip()
             context.logger.error(
-                "Command failed (%s): %s\n%s",
+                "Task '%s' failed (subprocess exit code %s):\nCommand: %s\nWorking Dir: %s\nOutput:\n%s",
+                self.name,
                 e.returncode,
                 " ".join(cmd),
-                err_output,
+                context.project_dir or os.getcwd(),
+                err_output or "(no output captured)",
             )
             context.add_warning(
                 failure_message
@@ -2313,7 +2323,13 @@ class ExportTask:
             if context.is_aborted():
                 return False
             exe_name = cmd[0] if cmd else "unknown"
-            context.logger.error("Failed to execute %s: %s", exe_name, e)
+            context.logger.error(
+                "Task '%s' could not execute '%s': %s (Command: %s)",
+                self.name,
+                exe_name,
+                e,
+                " ".join(cmd),
+            )
             context.add_warning(
                 f"{self.name} failed: could not run '{exe_name}'. "
                 f"Ensure KiCad is installed correctly."
@@ -2423,6 +2439,7 @@ class GerberExportTask(ExportTask):
 
     def run(self, context: ExportContext) -> bool:
         """Invoke kicad-cli to export gerber layers; return True on success."""
+        os.makedirs(context.temp_gerber_dir, exist_ok=True)
         return self._run_subprocess(build_gerber_export_cmd(context), context)
 
 
@@ -2440,6 +2457,7 @@ class DrillExportTask(ExportTask):
 
     def run(self, context: ExportContext) -> bool:
         """Invoke kicad-cli to export Excellon drill files; return True on success."""
+        os.makedirs(context.temp_gerber_dir, exist_ok=True)
         return self._run_subprocess(build_drill_export_cmd(context), context)
 
 
@@ -2557,12 +2575,198 @@ class SchematicPdfExportTask(ExportTask):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def convert_wrl_to_step(wrl_path: str, step_path: str, scale: float = 2.54) -> bool:
+    """
+    Convert a VRML 1.0 / 2.0 (.wrl) 3D mesh model into an ISO-10303-21 AP214 STEP file.
+
+    KiCad's STEP exporter natively expects STEP models and skips VRML (.wrl) models
+    unless a matching .step exists. This converter extracts 3D vertices and indexed
+    face polygons from the VRML file, performs fan triangulation, scales by the
+    KiCad VRML unit conversion factor (default 2.54 for 0.1 inch to mm), computes
+    precise planar geometry for every facet, filters degenerate facets, and writes a
+    standard STEP AP214 FACETED_BREP representation compatible with OpenCASCADE.
+    """
+    try:
+        with open(wrl_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+
+        coord_matches = list(re.finditer(r"(?:Coordinate|Coordinate3)\s*\{[^}]*point\s*\[(.*?)\]", text, re.DOTALL))
+        index_matches = list(re.finditer(r"coordIndex\s*\[(.*?)\]", text, re.DOTALL))
+
+        all_vertices: list[tuple[float, float, float]] = []
+        all_faces: list[list[int]] = []
+
+        for c_m, i_m in zip(coord_matches, index_matches):
+            raw_pts = [float(x) for x in re.split(r"[\s,]+", c_m.group(1).strip()) if x]
+            raw_idx = [int(x) for x in re.split(r"[\s,]+", i_m.group(1).strip()) if x]
+            base_v = len(all_vertices)
+            for i in range(0, len(raw_pts), 3):
+                if i + 2 < len(raw_pts):
+                    all_vertices.append((raw_pts[i] * scale, raw_pts[i + 1] * scale, raw_pts[i + 2] * scale))
+
+            current_face: list[int] = []
+            for idx in raw_idx:
+                if idx == -1:
+                    if len(current_face) == 3:
+                        all_faces.append([base_v + v for v in current_face])
+                    elif len(current_face) > 3:
+                        v0 = base_v + current_face[0]
+                        for k in range(1, len(current_face) - 1):
+                            all_faces.append([v0, base_v + current_face[k], base_v + current_face[k + 1]])
+                    current_face = []
+                else:
+                    current_face.append(idx)
+            if len(current_face) >= 3:
+                v0 = base_v + current_face[0]
+                for k in range(1, len(current_face) - 1):
+                    all_faces.append([v0, base_v + current_face[k], base_v + current_face[k + 1]])
+
+        if not all_vertices or not all_faces:
+            return False
+
+        lines = [
+            "ISO-10303-21;",
+            "HEADER;",
+            "FILE_DESCRIPTION(('KiForge Faceted Mesh'),'2;1');",
+            "FILE_NAME('model.step','2026-09-16T00:00:00',('KiForge'),(''),'KiForge WRL2STEP','KiCad','');",
+            "FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));",
+            "ENDSEC;",
+            "DATA;",
+            "#1 = APPLICATION_CONTEXT('core data for automotive mechanical design processes');",
+            "#2 = APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#1);",
+            "#3 = PRODUCT_CONTEXT('part definition',#1,'mechanical');",
+            "#4 = PRODUCT('part','part','',(#3));",
+            "#5 = PRODUCT_DEFINITION_FORMATION('','',#4);",
+            "#6 = PRODUCT_DEFINITION('design','',#5,#3);",
+            "#7 = PRODUCT_DEFINITION_SHAPE('','',#6);",
+            "#8 = SHAPE_DEFINITION_REPRESENTATION(#7,#9);",
+            "#9 = ADVANCED_BREP_SHAPE_REPRESENTATION('',(#10),#11);",
+            "#10 = FACETED_BREP('part',#12);",
+            "#11 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#13)) GLOBAL_UNIT_ASSIGNED_CONTEXT((#14,#15,#16)) REPRESENTATION_CONTEXT('','3D') );",
+            "#13 = UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),#14,'closure','');",
+            "#14 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );",
+            "#15 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );",
+            "#16 = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );",
+        ]
+
+        eid = 100
+        v_ids: list[int] = []
+        for v in all_vertices:
+            lines.append(f"#{eid} = CARTESIAN_POINT('',({v[0]:.4f},{v[1]:.4f},{v[2]:.4f}));")
+            v_ids.append(eid)
+            eid += 1
+
+        face_ids: list[str] = []
+        for f in all_faces:
+            if max(f) >= len(all_vertices):
+                continue
+            p0 = all_vertices[f[0]]
+            p1 = all_vertices[f[1]]
+            p2 = all_vertices[f[2]]
+
+            e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+            e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+            nx = e1[1] * e2[2] - e1[2] * e2[1]
+            ny = e1[2] * e2[0] - e1[0] * e2[2]
+            nz = e1[0] * e2[1] - e1[1] * e2[0]
+            n_len = math.sqrt(nx * nx + ny * ny + nz * nz)
+            e1_len = math.sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2])
+
+            if n_len < 1e-6 or e1_len < 1e-6:
+                continue
+
+            n_unit = (nx / n_len, ny / n_len, nz / n_len)
+            u_unit = (e1[0] / e1_len, e1[1] / e1_len, e1[2] / e1_len)
+
+            dir_n_id = eid
+            lines.append(f"#{dir_n_id} = DIRECTION('',({n_unit[0]:.6f},{n_unit[1]:.6f},{n_unit[2]:.6f}));")
+            dir_u_id = eid + 1
+            lines.append(f"#{dir_u_id} = DIRECTION('',({u_unit[0]:.6f},{u_unit[1]:.6f},{u_unit[2]:.6f}));")
+            axis_id = eid + 2
+            lines.append(f"#{axis_id} = AXIS2_PLACEMENT_3D('',#{v_ids[f[0]]},#{dir_n_id},#{dir_u_id});")
+            plane_id = eid + 3
+            lines.append(f"#{plane_id} = PLANE('',#{axis_id});")
+
+            poly_id = eid + 4
+            lines.append(f"#{poly_id} = POLY_LOOP('',(#{v_ids[f[0]]},#{v_ids[f[1]]},#{v_ids[f[2]]}));")
+            bound_id = eid + 5
+            lines.append(f"#{bound_id} = FACE_OUTER_BOUND('',#{poly_id},.T.);")
+            face_id = eid + 6
+            lines.append(f"#{face_id} = FACE_SURFACE('',(#{bound_id}),#{plane_id},.T.);")
+
+            face_ids.append(f"#{face_id}")
+            eid += 7
+
+        if not face_ids:
+            return False
+
+        faces_str = ",".join(face_ids)
+        lines.append(f"#12 = CLOSED_SHELL('',({faces_str}));")
+        lines.append("ENDSEC;")
+        lines.append("END-ISO-10303-21;")
+
+        os.makedirs(os.path.dirname(os.path.abspath(step_path)), exist_ok=True)
+        with open(step_path, "w", encoding="utf-8") as f_out:
+            f_out.write("\n".join(lines))
+            f_out.write("\n")
+
+        return True
+    except Exception:
+        return False
+
+
+def _get_kicad_path_vars(project_dir: str | None = None) -> dict[str, str]:
+    """Collect path variables from environment, .kicad_pro, and kicad_common.json."""
+    env_vars = dict(os.environ)
+    if project_dir and os.path.isdir(project_dir):
+        env_vars["KIPRJMOD"] = os.path.abspath(project_dir)
+        for pro in glob.glob(os.path.join(project_dir, "*.kicad_pro")):
+            try:
+                with open(pro, "r", encoding="utf-8") as f:
+                    pro_data = json.load(f)
+                env_vars.update(pro_data.get("environment", {}).get("vars", {}))
+            except Exception:
+                pass
+
+    config_dirs: list[str] = []
+    if os.environ.get("APPDATA"):
+        config_dirs.append(os.path.join(os.environ["APPDATA"], "kicad"))
+    home = os.path.expanduser("~")
+    config_dirs.append(os.path.join(home, "Library", "Preferences", "kicad"))
+    config_dirs.append(os.path.join(home, ".config", "kicad"))
+
+    for cdir in config_dirs:
+        if os.path.isdir(cdir):
+            for common_file in glob.glob(os.path.join(cdir, "*", "kicad_common.json")):
+                try:
+                    with open(common_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    env_vars.update(data.get("environment", {}).get("vars", {}))
+                except Exception:
+                    pass
+    return env_vars
+
+
+def _resolve_3d_model_path(raw_path: str, vars_map: dict[str, str], project_dir: str | None = None) -> str:
+    """Expand ${VAR} or $VAR in a 3D model path and normalize it."""
+    def repl(m: re.Match) -> str:
+        var_name = m.group(1) or m.group(2)
+        return vars_map.get(var_name, m.group(0))
+
+    expanded = re.sub(r"\$\{([^}]+)\}|\$([A-Za-z0-9_]+)", repl, raw_path)
+    if not os.path.isabs(expanded) and project_dir:
+        expanded = os.path.join(project_dir, expanded)
+    return os.path.normpath(expanded)
+
+
 class Step3dExportTask(ExportTask):
     """
     Export ``{pcb_name}.step`` via kicad-cli.
 
     Honors ``step_subst_models`` from export_params. Always passes
     ``--no-optimize-step`` (fixed manufacturing default).
+    Automatically converts referenced VRML (.wrl) 3D models to STEP so they are
+    not skipped during KiCad STEP export.
     Treats non-fatal KiCad model warnings as partial success when a STEP file exists.
     """
     def __init__(self):
@@ -2573,24 +2777,130 @@ class Step3dExportTask(ExportTask):
         """Return True when STEP export is enabled and a board file is available."""
         return context.options.get("export_step", True) and bool(context.pcb_file)
 
+    def _prepare_wrl_models(self, context: ExportContext) -> tuple[str, str | None]:
+        """
+        Scan the board for referenced .wrl models and convert them to STEP in output_dir/3dmodels.
+
+        Never touches external footprint libraries. Converted models are placed in
+        {output_dir}/3dmodels and referenced via a staged copy of the PCB.
+
+        Returns (effective_pcb_path, temp_dir_or_none).
+        """
+        if not context.pcb_file or not os.path.isfile(context.pcb_file):
+            return context.pcb_file, None
+
+        try:
+            with open(context.pcb_file, "r", encoding="utf-8", errors="ignore") as f:
+                pcb_text = f.read()
+        except Exception:
+            return context.pcb_file, None
+
+        wrl_models = set(re.findall(r'\(model\s+"([^"]+\.(?:wrl|vrml))"', pcb_text, re.IGNORECASE))
+        if not wrl_models:
+            return context.pcb_file, None
+
+        models_dir = os.path.join(context.output_dir, "3dmodels")
+        os.makedirs(models_dir, exist_ok=True)
+
+        vars_map = _get_kicad_path_vars(context.project_dir)
+        temp_dir: str | None = None
+        staged_replacements: dict[str, str] = {}
+
+        # Map raw model path -> list of component reference designators (e.g. 'D1', 'U3')
+        model_to_refs: dict[str, list[str]] = {}
+        for block in pcb_text.split("(footprint "):
+            ref_match = re.search(r'\((?:property\s+"Reference"|fp_text\s+reference)\s+"([^"]+)"', block)
+            ref = ref_match.group(1) if ref_match else ""
+            if ref:
+                for m in re.findall(r'\(model\s+"([^"]+)"', block):
+                    model_to_refs.setdefault(m, []).append(ref)
+
+        for raw_m in wrl_models:
+            resolved_wrl = _resolve_3d_model_path(raw_m, vars_map, context.project_dir)
+            if not os.path.isfile(resolved_wrl):
+                continue
+
+            base_name = os.path.splitext(os.path.basename(resolved_wrl))[0] + ".step"
+            target_step = os.path.join(models_dir, base_name)
+
+            comp_refs = sorted(set(model_to_refs.get(raw_m, [])))
+            if len(comp_refs) > 6:
+                ref_summary = f"[{', '.join(comp_refs[:5])}, ... (+{len(comp_refs) - 5} more)]"
+            elif comp_refs:
+                ref_summary = f"[{', '.join(comp_refs)}]"
+            else:
+                ref_summary = ""
+            ref_label = f" for {ref_summary}" if ref_summary else ""
+
+            # Convert to output_dir/3dmodels/<name>.step if missing or source wrl was modified
+            converted = False
+            if not os.path.isfile(target_step) or (os.path.getmtime(target_step) < os.path.getmtime(resolved_wrl)):
+                try:
+                    converted = convert_wrl_to_step(resolved_wrl, target_step)
+                except Exception as exc:
+                    context.logger.warning(
+                        "Error converting VRML model%s (%s) to STEP: %s",
+                        ref_label,
+                        resolved_wrl,
+                        exc,
+                    )
+                    converted = False
+            else:
+                converted = True
+
+            if converted and os.path.isfile(target_step):
+                staged_replacements[raw_m] = target_step.replace("\\", "/")
+                context.logger.info(
+                    "Auto-converted VRML 3D model to STEP%s: %s -> %s",
+                    ref_label,
+                    os.path.basename(resolved_wrl),
+                    os.path.join("3dmodels", base_name),
+                )
+            else:
+                context.logger.warning(
+                    "Could not convert VRML model%s: %s",
+                    ref_label,
+                    resolved_wrl,
+                )
+
+        if staged_replacements:
+            temp_dir = tempfile.mkdtemp(prefix="kiforge_step_")
+            staged_pcb = os.path.join(temp_dir, os.path.basename(context.pcb_file))
+            new_text = pcb_text
+            for old_path, new_path in staged_replacements.items():
+                new_text = new_text.replace(f'"{old_path}"', f'"{new_path}"')
+            with open(staged_pcb, "w", encoding="utf-8") as f:
+                f.write(new_text)
+            return staged_pcb, temp_dir
+
+        return context.pcb_file, temp_dir
+
     def run(self, context: ExportContext) -> bool:
         """Export STEP; keep partial output when KiCad reports non-fatal model warnings."""
         output_step = os.path.join(context.output_dir, f"{context.pcb_name}.step")
-        cmd = [context.kicad_cli, "pcb", "export", "step", "--no-optimize-step"]
-        if context.options.get("step_subst_models", True):
-            cmd.append("--subst-models")
-        cmd.extend(["-f", "-o", output_step, context.pcb_file])
-        if self._run_subprocess(cmd, context):
-            return True
-        if context.is_aborted():
-            _discard_file(output_step)
+        pcb_to_export = context.pcb_file
+        temp_dir: str | None = None
+        try:
+            pcb_to_export, temp_dir = self._prepare_wrl_models(context)
+            cmd = [context.kicad_cli, "pcb", "export", "step", "--no-optimize-step"]
+            if context.options.get("step_subst_models", True):
+                cmd.append("--subst-models")
+            cmd.extend(["-f", "-o", output_step, pcb_to_export])
+            prev_warn_len = len(context.warnings)
+            if self._run_subprocess(cmd, context):
+                return True
+            if context.is_aborted():
+                _discard_file(output_step)
+                return False
+            if os.path.isfile(output_step) and os.path.getsize(output_step) > 0:
+                context.add_warning(
+                    f"{self.name} exported with non-fatal component warnings from KiCad."
+                )
+                return True
             return False
-        if os.path.isfile(output_step) and os.path.getsize(output_step) > 0:
-            context.add_warning(
-                f"{self.name} finished with warnings; a partial STEP file was still saved."
-            )
-            return True
-        return False
+        finally:
+            if temp_dir and os.path.isdir(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class Render3dExportTask(ExportTask):
@@ -3558,7 +3868,7 @@ def _export_pdf_via_subprocess(
     is marshalled onto the GUI thread at all, and the render is a plain child
     process -- which means it can simply be killed when the user cancels.
     """
-    exe = python_exe or sys.executable
+    exe = (python_exe if isinstance(python_exe, str) else None) or sys.executable
     if not exe or not os.path.isfile(exe):
         return False
     payload = json.dumps({
@@ -4056,7 +4366,9 @@ class HomebrewPdfExportTask(ExportTask):
             context.report_progress(0.05)
             front_path, back_path, cropped = self._resolve_layers(context, temp_dir)
             if not front_path and not back_path:
-                context.add_warning("No copper layer SVG available; homebrew PDF skipped.")
+                context.add_warning(
+                    "Homebrew PDF skipped: could not plot F.Cu / B.Cu copper layer SVGs via kicad-cli."
+                )
                 return False
             if not cropped:
                 context.add_warning(
@@ -4474,36 +4786,35 @@ class ExportRunner:
 
         self.context.logger.info(f"Running KiForge pipeline with {total_steps} tasks.")
 
-        for idx, task in enumerate(applicable_tasks):
-            if self.context.is_aborted():
-                self._cleanup_temp_dirs()
-                return False
-
-            self.context.begin_step(idx, total_steps)
-            if self.context.progress_callback:
-                msg = f"Running: {task.name}..."
-                keep_going = self.context.progress_callback(idx, total_steps, msg)
-                if not keep_going:
-                    self.context.cancel()
-                    self._cleanup_temp_dirs()
+        try:
+            for idx, task in enumerate(applicable_tasks):
+                if self.context.is_aborted():
                     return False
 
-            try:
-                success = task.run(self.context)
-            except Exception as exc:
-                self.context.logger.error(
-                    "Task '%s' failed with exception: %s", task.name, exc, exc_info=True
-                )
-                self.context.add_warning(f"{task.name} failed: {exc}")
-                success = False
+                self.context.begin_step(idx, total_steps)
+                if self.context.progress_callback:
+                    msg = f"Running: {task.name}..."
+                    keep_going = self.context.progress_callback(idx, total_steps, msg)
+                    if not keep_going:
+                        self.context.cancel()
+                        return False
 
-            if success:
-                tasks_succeeded += 1
+                try:
+                    success = task.run(self.context)
+                except Exception as exc:
+                    self.context.logger.error(
+                        "Task '%s' failed with exception: %s", task.name, exc, exc_info=True
+                    )
+                    self.context.add_warning(f"{task.name} failed: {exc}")
+                    success = False
 
-            if self.context.is_aborted():
-                break
+                if success:
+                    tasks_succeeded += 1
 
-        self._cleanup_temp_dirs()
+                if self.context.is_aborted():
+                    break
+        finally:
+            self._cleanup_temp_dirs()
 
         if self.context.is_aborted():
             if self.context.progress_callback:
@@ -4512,6 +4823,12 @@ class ExportRunner:
 
         if total_steps > 0 and tasks_succeeded == 0:
             self.context.add_warning("No export steps completed successfully.")
+            self.context.logger.error(
+                "KiForge export failed: 0 of %d steps succeeded. Detailed failure summary:",
+                total_steps,
+            )
+            for idx, w in enumerate(self.context.warnings, 1):
+                self.context.logger.error("  [%d/%d] %s", idx, len(self.context.warnings), w)
             if self.context.progress_callback:
                 self.context.progress_callback(total_steps, total_steps, "Export failed.")
             return False
@@ -4526,8 +4843,10 @@ class ExportRunner:
 
         if self.context.warnings:
             self.context.logger.warning(
-                "KiForge export completed with %d warning(s).", len(self.context.warnings)
+                "KiForge export completed with %d warning(s):", len(self.context.warnings)
             )
+            for idx, w in enumerate(self.context.warnings, 1):
+                self.context.logger.warning("  [%d/%d] %s", idx, len(self.context.warnings), w)
         else:
             self.context.logger.info("KiForge Exporter pipeline executed successfully.")
         return True

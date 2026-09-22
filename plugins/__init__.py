@@ -165,6 +165,16 @@ def load():
         return False
 
     try:
+        import importlib
+        pkg = __name__
+        for mod in list(sys.modules.keys()):
+            if mod.startswith(pkg + ".") and mod != pkg:
+                try:
+                    if sys.modules.get(mod) is not None:
+                        importlib.reload(sys.modules[mod])
+                except Exception:
+                    pass
+
         from .kiforge_studio import ExporterPlugin
         ExporterPlugin().register()
         return True

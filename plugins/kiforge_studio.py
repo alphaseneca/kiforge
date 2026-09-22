@@ -32,7 +32,10 @@ Registration
 from __future__ import annotations
 
 # pyrefly: ignore [missing-import]
+import re
 import os
+import sys
+import json
 import threading
 import time
 import logging
@@ -154,24 +157,159 @@ _MSG_ICON_COLORS = dict(_MSG_ICON_COLORS_BY_MODE["dark"])
 _palette_mode = "dark"
 
 
-def _system_is_dark() -> bool:
+def _detect_kicad_theme() -> str | None:
     """
-    True when the OS/KiCad appearance is dark.
+    Query KiCad's user configuration for active appearance theme (app_theme).
+    Returns 'dark', 'light', or None if set to follow system / unconfigured.
+    Supports Linux (XDG, ~/.config, Flatpak, Snap), Windows (%APPDATA%), and macOS.
+    """
+    paths = []
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            paths.append(os.path.join(appdata, "kicad"))
+    elif sys.platform == "darwin":
+        paths.append(os.path.expanduser("~/Library/Preferences/kicad"))
+    elif sys.platform.startswith("linux") or sys.platform.startswith("freebsd"):
+        # Linux (native, Flatpak, Snap)
+        xdg_config = os.environ.get("XDG_CONFIG_HOME", "")
+        if xdg_config:
+            paths.append(os.path.join(xdg_config, "kicad"))
+        paths.append(os.path.expanduser("~/.config/kicad"))
+        paths.append(os.path.expanduser("~/.var/app/org.kicad.KiCad/config/kicad"))  # Flatpak
+        paths.append(os.path.expanduser("~/snap/kicad/current/.config/kicad"))      # Snap
+    else:
+        # Generic Unix fallback
+        paths.append(os.path.expanduser("~/.config/kicad"))
 
-    ``wx.SystemAppearance.IsDark`` is the supported query on wx 4.1+. The
-    luminance fallback covers older builds and any backend that does not
-    implement it, so this never raises inside a paint path.
+    for base in paths:
+        if not os.path.isdir(base):
+            continue
+        candidates = []
+        try:
+            for entry in os.listdir(base):
+                sub = os.path.join(base, entry)
+                if os.path.isdir(sub):
+                    candidates.append((entry, os.path.join(sub, "kicad_common.json")))
+        except Exception:
+            pass
+        candidates.sort(reverse=True)
+        candidates.append(("", os.path.join(base, "kicad_common.json")))
+
+        for _ver, cf in candidates:
+            if os.path.isfile(cf):
+                try:
+                    with open(cf, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    theme = data.get("appearance", {}).get("app_theme", 0)
+                    if theme == 2:
+                        return "dark"
+                    elif theme == 1:
+                        return "light"
+                except Exception:
+                    pass
+    return None
+
+
+def _detect_linux_system_dark() -> bool | None:
     """
+    Check standard FreeDesktop / GNOME / KDE desktop theme preference on Linux.
+    Returns True for dark, False for light, or None if undetermined.
+    """
+    if not (sys.platform.startswith("linux") or sys.platform.startswith("freebsd")):
+        return None
     try:
-        return bool(wx.SystemSettings.GetAppearance().IsDark())
+        import subprocess
+        # 1. FreeDesktop / GNOME standard color-scheme preference
+        res = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+            capture_output=True, text=True, timeout=1
+        )
+        if res.returncode == 0:
+            val = res.stdout.strip().strip("'\"").lower()
+            if "dark" in val:
+                return True
+            elif "default" in val or "light" in val:
+                return False
+
+        # 2. GTK theme name fallback (e.g. Adwaita-dark, Yaru-dark)
+        res2 = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
+            capture_output=True, text=True, timeout=1
+        )
+        if res2.returncode == 0:
+            val = res2.stdout.strip().strip("'\"").lower()
+            if "dark" in val:
+                return True
+            elif val:
+                return False
     except Exception:
         pass
+    return None
+
+
+def _system_is_dark(parent: wx.Window | None = None) -> bool:
+    """
+    True when the OS or KiCad appearance is dark.
+
+    Checks:
+    1. Parent KiCad frame background luminance when embedded.
+    2. KiCad user configuration (kicad_common.json: app_theme 2=dark, 1=light).
+    3. Linux desktop dark-theme preference (gsettings color-scheme / gtk-theme).
+    4. wx.SystemSettings.GetAppearance().IsDark() (supported on Cocoa, MSW, GTK3).
+    5. Fallback system window color luminance (wx.SYS_COLOUR_WINDOW).
+    """
+    # 1. Parent window luminance if embedded in KiCad
+    if parent:
+        try:
+            bg = parent.GetBackgroundColour()
+            if bg and bg.IsOk() and bg != wx.NullColour:
+                lum = 0.299 * bg.Red() + 0.587 * bg.Green() + 0.114 * bg.Blue()
+                return lum < 128
+        except Exception:
+            pass
+
+    # 2. When running inside KiCad (pcbnew active) or parent present, KiCad config takes precedence
+    if has_pcbnew or parent:
+        kc_theme = _detect_kicad_theme()
+        if kc_theme == "dark":
+            return True
+        elif kc_theme == "light":
+            return False
+
+    # 3. Linux desktop preference (if on Linux and KiCad set to follow system)
+    linux_dark = _detect_linux_system_dark()
+    if linux_dark is not None:
+        return linux_dark
+
+    # 4. Standard cross-platform OS appearance query (works natively on Cocoa, MSW, GTK3)
+    try:
+        app = wx.SystemSettings.GetAppearance()
+        if hasattr(app, "IsDark"):
+            return bool(app.IsDark())
+    except (NotImplementedError, RuntimeError):
+        pass
+    except Exception:
+        pass
+
+    # 5. Fallback system window color luminance
     try:
         bg = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
         luminance = 0.299 * bg.Red() + 0.587 * bg.Green() + 0.114 * bg.Blue()
         return luminance < 128
+    except (NotImplementedError, RuntimeError):
+        pass
     except Exception:
+        pass
+
+    # 6. KiCad config fallback for standalone runs if system query gave no answer
+    kc_theme = _detect_kicad_theme()
+    if kc_theme == "dark":
         return True
+    elif kc_theme == "light":
+        return False
+
+    return True
 
 
 def active_palette_mode() -> str:
@@ -179,7 +317,7 @@ def active_palette_mode() -> str:
     return _palette_mode
 
 
-def refresh_palette() -> str:
+def refresh_palette(parent: wx.Window | None = None) -> str:
     """
     Point :data:`_COLORS` at the ramp matching the current system appearance.
 
@@ -188,7 +326,7 @@ def refresh_palette() -> str:
     falls back to dark rather than raising.
     """
     global _palette_mode
-    _palette_mode = "dark" if _system_is_dark() else "light"
+    _palette_mode = "dark" if _system_is_dark(parent) else "light"
     _COLORS.update(_DARK_PALETTE if _palette_mode == "dark" else _LIGHT_PALETTE)
     _MSG_ICON_COLORS.update(_MSG_ICON_COLORS_BY_MODE[_palette_mode])
     return _palette_mode
@@ -218,20 +356,224 @@ def _pointer_is_inside(window: wx.Window) -> bool:
         return False
 
 
-class _FlatButton(wx.Panel):
-    """Flat filled button with rounded corners; paints consistently on Windows and Linux."""
+# ---------------------------------------------------------------------------
+# Cross-Platform UI Hardware / Platform Abstraction Layer (UI HAL)
+# ---------------------------------------------------------------------------
+# Windows (wxMSW / Direct2D / GDI), Linux (wxGTK3 / Cairo), and macOS (wxMac / Cocoa)
+# have distinct rendering pipelines, clipping rules, background erasing, and font DPI
+# metrics. To ensure identical pixel-perfect aesthetics across all three operating systems
+# without platform-specific forks, all custom widgets delegate low-level rendering,
+# color resolution, font measurement, and geometry clipping to these shared HAL functions.
 
-    def __init__(self, parent, label: str, *, primary: bool = False, min_width: int = 0):
+def _hal_resolve_bg(window: wx.Window, fallback: wx.Colour | None = None) -> wx.Colour:
+    """
+    Safely resolve a window's parent background color across MSW, GTK, and Cocoa.
+
+    On Linux (wxGTK), un-realized parent windows or scrolled viewports can return
+    wx.NullColour or uninitialized system background brushes. This climbs the window
+    hierarchy until an initialized, valid background color is encountered, falling
+    back to the current palette surface/app background.
+    """
+    parent = window.GetParent() if window else None
+    while parent:
+        try:
+            col = parent.GetBackgroundColour()
+            if col and col.IsOk() and col != wx.NullColour:
+                return col
+        except Exception:
+            pass
+        parent = parent.GetParent()
+    return fallback or _COLORS.get("surface") or _COLORS["app_bg"]
+
+
+def _hal_measure_text(window: wx.Window, text: str, font: wx.Font | None = None) -> tuple[int, int]:
+    """
+    Measure text dimensions safely without allocating an un-realized wx.ClientDC.
+
+    On Linux (wxGTK3), allocating wx.ClientDC inside widget __init__ before the native
+    X11/Wayland GdkWindow is realized produces GTK critical assertions and inaccurate
+    extents. Using window.GetTextExtent() queries Pango/GDI/CoreText metrics directly.
+    """
+    if not text:
+        return 0, 0
+    try:
+        if font and font.IsOk():
+            return window.GetTextExtent(text, font=font)
+        return window.GetTextExtent(text)
+    except Exception:
+        return len(text) * 7, 14
+
+
+def _hal_init_paint_dc(window: wx.Window) -> tuple[wx.DC, int, int, wx.Colour]:
+    """
+    Initialize a double-buffered paint DC, drawable client bounds, and background color.
+
+    On Windows (wxMSW), wx.AutoBufferedPaintDC provides double buffering and eliminates
+    flicker. On Linux (wxGTK) and macOS (wxMac), double-buffering is native and
+    AutoBufferedPaintDC acts as a standard PaintDC. Clears the background with the
+    resolved parent color so transparent corners and anti-aliased edges blend seamlessly.
+    """
+    dc = wx.AutoBufferedPaintDC(window)
+    try:
+        width, height = window.GetClientSize()
+    except Exception:
+        width, height = window.GetSize()
+    if width <= 0 or height <= 0:
+        width, height = window.GetSize()
+
+    parent_bg = _hal_resolve_bg(window)
+    dc.SetBackground(wx.Brush(parent_bg))
+    dc.Clear()
+    return dc, width, height, parent_bg
+
+
+def _hal_draw_rounded_rect(
+    dc: wx.DC,
+    x: int | float,
+    y: int | float,
+    w: int | float,
+    h: int | float,
+    radius: int | float,
+    fill: wx.Colour,
+    border: wx.Colour | None = None,
+    border_width: int = 1,
+) -> None:
+    """
+    Draw a filled rounded rectangle with an optional inset border.
+
+    Uses concentric solid fills rather than stroked outlines: Cairo (Linux), Direct2D (Windows),
+    and CoreGraphics (macOS) calculate 1px boundary strokes with differing half-pixel offsets.
+    Drawing the outer border as a solid filled rounded rectangle with the inner content inset
+    on top guarantees pixel-identical geometry across all backends.
+    """
+    if w <= 0 or h <= 0:
+        return
+    b_col = border if border is not None else fill
+    gc = wx.GraphicsContext.Create(dc)
+    if gc:
+        gc.SetPen(wx.TRANSPARENT_PEN)
+        gc.SetBrush(wx.Brush(b_col))
+        outer = gc.CreatePath()
+        outer.AddRoundedRectangle(x, y, w, h, radius)
+        gc.DrawPath(outer)
+
+        if fill != b_col and border_width > 0:
+            inner_x = x + border_width
+            inner_y = y + border_width
+            inner_w = max(0, w - border_width * 2)
+            inner_h = max(0, h - border_width * 2)
+            inner_r = max(0, radius - border_width)
+            if inner_w > 0 and inner_h > 0:
+                gc.SetBrush(wx.Brush(fill))
+                inner = gc.CreatePath()
+                inner.AddRoundedRectangle(inner_x, inner_y, inner_w, inner_h, inner_r)
+                gc.DrawPath(inner)
+    else:
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.SetBrush(wx.Brush(b_col))
+        dc.DrawRoundedRectangle(int(x), int(y), int(w), int(h), int(radius))
+        if fill != b_col and border_width > 0:
+            inner_x = int(x + border_width)
+            inner_y = int(y + border_width)
+            inner_w = max(0, int(w - border_width * 2))
+            inner_h = max(0, int(h - border_width * 2))
+            inner_r = max(0, int(radius - border_width))
+            if inner_w > 0 and inner_h > 0:
+                dc.SetBrush(wx.Brush(fill))
+                dc.DrawRoundedRectangle(inner_x, inner_y, inner_w, inner_h, inner_r)
+
+
+def _hal_draw_circle(
+    dc: wx.DC,
+    cx: float,
+    cy: float,
+    radius: float,
+    fill: wx.Colour,
+    border: wx.Colour | None = None,
+    border_width: int = 1,
+) -> None:
+    """Draw a filled circle with an optional inset border for radio buttons and status discs."""
+    if radius <= 0:
+        return
+    b_col = border if border is not None else fill
+    gc = wx.GraphicsContext.Create(dc)
+    if gc:
+        gc.SetPen(wx.TRANSPARENT_PEN)
+        gc.SetBrush(wx.Brush(b_col))
+        gc.DrawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
+        if fill != b_col and border_width > 0:
+            inner_r = max(0, radius - border_width)
+            if inner_r > 0:
+                gc.SetBrush(wx.Brush(fill))
+                gc.DrawEllipse(cx - inner_r, cy - inner_r, inner_r * 2, inner_r * 2)
+    else:
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.SetBrush(wx.Brush(b_col))
+        dc.DrawEllipse(int(cx - radius), int(cy - radius), int(radius * 2), int(radius * 2))
+        if fill != b_col and border_width > 0:
+            inner_r = max(0, int(radius - border_width))
+            if inner_r > 0:
+                dc.SetBrush(wx.Brush(fill))
+                dc.DrawEllipse(int(cx - inner_r), int(cy - inner_r), int(inner_r * 2), int(inner_r * 2))
+
+
+def _hal_control_border(selected: bool, hover: bool) -> tuple[wx.Colour, int]:
+    """
+    Resolve cross-platform border colour and stroke width for checkboxes and radio glyphs.
+
+    Ensures identical aesthetics across macOS, Windows, and Linux:
+    - Selected / checked controls use the brand accent color.
+    - Unselected / unchecked controls use neutral border (or muted on hover).
+    - Eliminates aberrant selection outlines on unselected controls.
+    """
+    if selected:
+        return _COLORS["accent"], 1
+    if hover:
+        return _COLORS["muted"], 1
+    return _COLORS["border"], 1
+
+
+_flat_button_icon_cache: dict[tuple[str, int, str], wx.Bitmap] = {}
+
+
+def _get_button_icon_bitmap(icon_kind: str, size: int, colour: wx.Colour) -> wx.Bitmap | None:
+    """Load and rasterize a Material Symbol icon tinted with colour for flat buttons."""
+    name = "lock_open" if icon_kind in ("unlock", "lock_open") else icon_kind
+    hex_col = f"#{colour.Red():02x}{colour.Green():02x}{colour.Blue():02x}"
+    key = (name, size, hex_col)
+    if key in _flat_button_icon_cache:
+        cached = _flat_button_icon_cache[key]
+        return cached if cached.IsOk() else None
+
+    svg_data = kiforge.fetch_tab_icon_svg(name)
+    if not svg_data:
+        return None
+    try:
+        tinted = kiforge.prepare_tab_icon_svg(svg_data, hex_col)
+        bundle = wx.BitmapBundle.FromSVG(tinted, (size * 2, size * 2))
+        bmp = bundle.GetBitmap(wx.Size(size, size))
+        _flat_button_icon_cache[key] = bmp
+        return bmp if bmp.IsOk() else None
+    except Exception as exc:
+        logger.warning("Failed to rasterize button icon %s: %s", name, exc)
+        return None
+
+
+class _FlatButton(wx.Panel):
+    """Flat filled button with rounded corners; paints consistently on Windows, Linux, and macOS."""
+
+    def __init__(self, parent, label: str = "", *, primary: bool = False, min_width: int = 0, icon_kind: str | None = None):
         """Initialise flat button with text label, appearance style, and minimum width."""
         super().__init__(parent, style=wx.BORDER_NONE)
         self._label = label
         self._primary = primary
+        self._icon_kind = icon_kind
         self._tone = None
         self._hover = False
         self._pressed = False
         self._enabled = True
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
-        self.SetBackgroundColour(parent.GetBackgroundColour() if parent else _COLORS["app_bg"])
+        self.SetBackgroundColour(_hal_resolve_bg(parent))
         self.SetMinSize((min_width, _CTRL_H))
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
@@ -254,6 +596,11 @@ class _FlatButton(wx.Panel):
     def GetLabel(self) -> str:
         """Return the painted label string."""
         return self._label
+
+    def SetIcon(self, icon_kind: str | None) -> None:
+        """Set or clear icon (e.g. 'lock', 'unlock') to render on the button."""
+        self._icon_kind = icon_kind
+        self.Refresh()
 
     def _on_enter(self, event):
         """Handle mouse enter event to update hover appearance."""
@@ -296,27 +643,14 @@ class _FlatButton(wx.Panel):
             wx.PostEvent(self, event)
 
     def _on_capture_lost(self, event):
-        """
-        Capture can be taken away at any time (a modal dialog, a window switch).
-
-        Only ``_pressed`` is a click-in-progress and must drop. Hover is a
-        property of where the pointer is, so it is recomputed rather than
-        cleared -- clearing it blanks the highlight on a control the pointer is
-        still resting on, and EVT_ENTER_WINDOW has already fired so nothing
-        restores it until the pointer leaves and comes back.
-        """
+        """Handle lost mouse capture."""
         self._pressed = False
         self._hover = _pointer_is_inside(self)
         self.Refresh()
 
     def _on_paint(self, event):
-        """Paint flat rounded button with border, fill tone, and centered label."""
-        dc = wx.AutoBufferedPaintDC(self)
-        width, height = self.GetSize()
-        parent = self.GetParent()
-        parent_bg = parent.GetBackgroundColour() if parent else _COLORS["app_bg"]
-        dc.SetBackground(wx.Brush(parent_bg))
-        dc.Clear()
+        """Paint flat rounded button with border, fill tone, and centered label via UI HAL."""
+        dc, width, height, parent_bg = _hal_init_paint_dc(self)
 
         if self._primary:
             accent = self._tone or _COLORS["accent"]
@@ -359,35 +693,51 @@ class _FlatButton(wx.Panel):
                 text = _COLORS["text"]
             border = _COLORS["border"]
 
-        # Fill-only, like every other custom-painted control here: a 1px
-        # stroke has to straddle the path boundary at a half-pixel offset,
-        # which backends round inconsistently (see _FlatRadioButton._on_paint).
-        # The border is a solid rounded rect with the fill inset on top.
-        gc = wx.GraphicsContext.Create(dc)
-        if gc:
-            gc.SetPen(wx.TRANSPARENT_PEN)
-            gc.SetBrush(wx.Brush(border))
-            outer = gc.CreatePath()
-            outer.AddRoundedRectangle(0, 0, width, height, _BUTTON_RADIUS)
-            gc.DrawPath(outer)
-            gc.SetBrush(wx.Brush(fill))
-            inner = gc.CreatePath()
-            inner.AddRoundedRectangle(1, 1, width - 2, height - 2, max(0, _BUTTON_RADIUS - 1))
-            gc.DrawPath(inner)
-        else:
-            dc.SetPen(wx.TRANSPARENT_PEN)
-            dc.SetBrush(wx.Brush(border))
-            dc.DrawRoundedRectangle(0, 0, width, height, _BUTTON_RADIUS)
-            dc.SetBrush(wx.Brush(fill))
-            dc.DrawRoundedRectangle(1, 1, width - 2, height - 2, max(0, _BUTTON_RADIUS - 1))
+        _hal_draw_rounded_rect(dc, 0, 0, width, height, _BUTTON_RADIUS, fill=fill, border=border, border_width=1)
 
-        dc.SetTextForeground(text)
         font = self.GetFont()
         if self._primary and self._enabled:
+            font = wx.Font(font)
             font.SetWeight(wx.FONTWEIGHT_BOLD)
-        dc.SetFont(font)
-        tw, th = dc.GetTextExtent(self._label)
-        dc.DrawText(self._label, (width - tw) // 2, (height - th) // 2)
+
+        gc = wx.GraphicsContext.Create(dc)
+        if self._icon_kind:
+            bmp = _get_button_icon_bitmap(self._icon_kind, 18, text)
+            if bmp and bmp.IsOk():
+                bx = (width - bmp.GetWidth()) / 2.0
+                by = (height - bmp.GetHeight()) / 2.0
+                if gc:
+                    gc.DrawBitmap(bmp, bx, by, bmp.GetWidth(), bmp.GetHeight())
+                else:
+                    dc.DrawBitmap(bmp, int(bx), int(by), True)
+        elif self._label:
+            if gc:
+                gc.SetFont(font, text)
+                gw, gh = gc.GetTextExtent(self._label)
+                gx = (width - gw) / 2
+                gy = (height - gh) / 2 - 1
+                gc.DrawText(self._label, gx, gy)
+            else:
+                dc.SetFont(font)
+                dc.SetTextForeground(text)
+                tw, th = _hal_measure_text(self, self._label, font)
+                try:
+                    m = dc.GetFontMetrics()
+                    ty = max(0, (height - m.ascent - m.internalLeading) // 2)
+                except Exception:
+                    ty = max(0, (height - th) // 2 - 1)
+                dc.DrawText(self._label, max(0, (width - tw) // 2), ty)
+
+    def DoGetBestSize(self) -> wx.Size:
+        """Calculate button best size based on font extents and padding."""
+        font = self.GetFont()
+        if self._primary:
+            font = wx.Font(font)
+            font.SetWeight(wx.FONTWEIGHT_BOLD)
+        tw, th = _hal_measure_text(self, self._label, font)
+        w = max(self.GetMinSize().width, tw + _SP_MD * 2)
+        h = max(self.GetMinSize().height, th + _SP_SM)
+        return wx.Size(w, h)
 
     def Enable(self, enable=True):
         """Enable or disable button interaction and refresh visual style."""
@@ -405,13 +755,7 @@ _CHECKBOX_GLYPH_RADIUS = 4
 
 
 def _checkmark_pen() -> "wx.Pen":
-    """
-    White stroke for the checkbox tick, with rounded ends.
-
-    The default butt cap and mitre join leave a 16px tick with two blunt
-    square ends and a notched outer corner where the two strokes meet, which
-    is what made the glyph look chipped rather than drawn.
-    """
+    """White stroke for the checkbox tick, with rounded ends."""
     pen = wx.Pen(wx.Colour(255, 255, 255), 2)
     pen.SetCap(wx.CAP_ROUND)
     pen.SetJoin(wx.JOIN_ROUND)
@@ -420,18 +764,8 @@ def _checkmark_pen() -> "wx.Pen":
 
 class _FlatCheckBox(wx.Panel):
     """
-    Fully custom-painted checkbox: no native OS chrome behind the label, so
-    there is no native focus rectangle to fight. wx.CheckBox's own dotted
-    keyboard-focus rectangle on MSW does not respect WM_UPDATEUISTATE /
-    UISF_HIDEFOCUS for this control/theme combination (confirmed by direct
-    testing, not assumed), so suppressing it after the fact isn't reliable;
-    owning the paint entirely -- the same approach _FlatButton already uses
-    for buttons in this dialog -- sidesteps the problem instead of chasing it.
-
-    Drop-in replacement for wx.CheckBox's IsChecked()/GetValue()/SetValue()/
-    Enable()/Disable() and wx.EVT_CHECKBOX surface, so existing call sites
-    (self.chk_x.IsChecked(), .SetValue(...), .Bind(wx.EVT_CHECKBOX, ...))
-    need no changes beyond the constructor.
+    Fully custom-painted checkbox: consistent pixel-exact rendering on Windows, Linux, and macOS.
+    Eliminates native OS focus-rectangle bugs and off-color punchouts.
     """
 
     def __init__(self, parent, label: str = ""):
@@ -445,13 +779,12 @@ class _FlatCheckBox(wx.Panel):
         self._has_focus = False
         self._focus_from_pointer = False
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
-        self.SetBackgroundColour(parent.GetBackgroundColour() if parent else _COLORS["app_bg"])
+        self.SetBackgroundColour(_hal_resolve_bg(parent))
 
-        dc = wx.ClientDC(self)
-        dc.SetFont(self.GetFont())
-        text_w, text_h = dc.GetTextExtent(label) if label else (0, 0)
+        text_w, text_h = _hal_measure_text(self, label, self.GetFont())
         gap = _SP_SM if label else 0
-        self.SetMinSize((_CHECKBOX_GLYPH_SIZE + gap + text_w, max(_CHECKBOX_GLYPH_SIZE, text_h) + _SP_XS))
+        extra_pad = _SP_SM if label else 0
+        self.SetMinSize((_CHECKBOX_GLYPH_SIZE + gap + text_w + extra_pad, max(_CHECKBOX_GLYPH_SIZE, text_h) + _SP_XS))
 
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
@@ -463,35 +796,29 @@ class _FlatCheckBox(wx.Panel):
         self.Bind(wx.EVT_KILL_FOCUS, self._on_kill_focus)
         self.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
 
+    def DoGetBestSize(self) -> wx.Size:
+        """Calculate best size including glyph, gap, text width, and right padding for ClearType/font overhang."""
+        text_w, text_h = _hal_measure_text(self, self._label, self.GetFont())
+        gap = _SP_SM if self._label else 0
+        extra_pad = _SP_SM if self._label else 0
+        return wx.Size(
+            _CHECKBOX_GLYPH_SIZE + gap + text_w + extra_pad,
+            max(_CHECKBOX_GLYPH_SIZE, text_h) + _SP_XS,
+        )
+
     def AcceptsFocus(self):
         """Return True if enabled to allow keyboard focus navigation."""
         return self._enabled
 
     def _on_set_focus(self, event):
-        """
-        Draw a focus ring for keyboard focus only.
-
-        A ring after every mouse click is the "focus ring pollution" the
-        platform itself avoids: click a control on macOS and no ring appears,
-        Tab to it and one does. ``_focus_from_pointer`` is set by
-        :meth:`_on_left_down` immediately before ``SetFocus()``, so a click
-        still takes focus -- it just does not advertise it.
-        """
+        """Draw a focus ring for keyboard focus only."""
         self._has_focus = not self._focus_from_pointer
         self._focus_from_pointer = False
         self.Refresh()
         event.Skip()
 
     def _on_kill_focus(self, event):
-        """
-        Take the state from the event, never from HasFocus().
-
-        Inside EVT_KILL_FOCUS the focus transfer has not completed, so
-        HasFocus() can still report True. Deriving the flag from it left the
-        control that just lost focus permanently "focused", and since the paint
-        code draws an accent ring for a focused glyph, the previously selected
-        radio kept an orange ring after its dot had correctly cleared.
-        """
+        """Clear focus state from event."""
         self._has_focus = False
         self._focus_from_pointer = False
         self.Refresh()
@@ -519,25 +846,23 @@ class _FlatCheckBox(wx.Panel):
         event.Skip()
 
     def _on_left_down(self, event):
-        """Capture mouse input and flag pressed state on left down."""
+        """Handle left mouse click."""
         if not self._enabled:
             return
-        self._pressed = True
-        self.CaptureMouse()
         self._focus_from_pointer = True
         self.SetFocus()
+        self._pressed = True
+        self.CaptureMouse()
         self.Refresh()
 
     def _on_left_up(self, event):
-        """Release mouse and toggle check state if released within control bounds."""
+        """Handle left mouse release and toggle if inside."""
         if not self._enabled:
             return
         if self.HasCapture():
             self.ReleaseMouse()
         was_pressed = self._pressed
         self._pressed = False
-        # See _FlatRadioButton._on_left_up: a captured mouse suppresses
-        # EVT_LEAVE_WINDOW, so hover has to be recomputed from the pointer.
         inside = self.ClientRect.Contains(event.GetPosition())
         self._hover = inside
         self.Refresh()
@@ -545,21 +870,13 @@ class _FlatCheckBox(wx.Panel):
             self._toggle()
 
     def _on_capture_lost(self, event):
-        """
-        Capture can be taken away at any time (a modal dialog, a window switch).
-
-        Only ``_pressed`` is a click-in-progress and must drop. Hover is a
-        property of where the pointer is, so it is recomputed rather than
-        cleared -- clearing it blanks the highlight on a control the pointer is
-        still resting on, and EVT_ENTER_WINDOW has already fired so nothing
-        restores it until the pointer leaves and comes back.
-        """
+        """Handle lost mouse capture."""
         self._pressed = False
         self._hover = _pointer_is_inside(self)
         self.Refresh()
 
     def _toggle(self):
-        """Toggle checked state and fire wx.EVT_CHECKBOX event."""
+        """Toggle checked state and fire wx.EVT_CHECKBOX."""
         self._checked = not self._checked
         self.Refresh()
         event = wx.CommandEvent(wx.EVT_CHECKBOX.typeId, self.GetId())
@@ -568,94 +885,53 @@ class _FlatCheckBox(wx.Panel):
         wx.PostEvent(self, event)
 
     def _on_paint(self, event):
-        """Paint custom square checkbox glyph, focus ring, checkmark, and text label."""
-        dc = wx.AutoBufferedPaintDC(self)
-        width, height = self.GetSize()
-        parent = self.GetParent()
-        parent_bg = parent.GetBackgroundColour() if parent else _COLORS["app_bg"]
-        dc.SetBackground(wx.Brush(parent_bg))
-        dc.Clear()
+        """Paint custom square checkbox glyph, focus ring, checkmark, and text label via UI HAL."""
+        dc, width, height, parent_bg = _hal_init_paint_dc(self)
 
         box_y = (height - _CHECKBOX_GLYPH_SIZE) // 2
         accent = _COLORS["accent"]
 
-        focused = self._has_focus and self._enabled
         if not self._enabled:
-            border = _COLORS["border"]
-            fill = (
-                wx.Colour(accent.Red() // 2, accent.Green() // 2, accent.Blue() // 2)
-                if self._checked else _COLORS["input_bg"]
-            )
+            if self._checked:
+                fill = wx.Colour(accent.Red() // 2, accent.Green() // 2, accent.Blue() // 2)
+                border = fill
+            else:
+                fill = _COLORS["input_bg"]
+                border = _COLORS["border"]
             text_colour = _COLORS["muted"]
+            border_width = 1
         elif self._checked:
             fill = accent
-            # The glyph is already filled with the accent, so an accent border
-            # is invisible -- keyboard focus needs a colour that contrasts with
-            # the fill or Tab navigation has no visible position at all.
-            border = _COLORS["text"] if focused else accent
+            border, border_width = _hal_control_border(selected=True, hover=self._hover)
             text_colour = _COLORS["text"]
         else:
             fill = _COLORS["input_bg"]
-            border = accent if focused else _COLORS["muted"]
+            border, border_width = _hal_control_border(selected=False, hover=self._hover)
             text_colour = _COLORS["text"]
 
-        # Focus is shown as a bolder accent border directly on the glyph
-        # itself (never a separate outline around the whole row -- that
-        # reads as the same intrusive dotted-rectangle look this control
-        # exists to avoid, and clips against the panel edge besides, since
-        # the glyph sits flush against x=0 with no margin to draw outside of).
-        border_width = 2 if focused else 1
+        _hal_draw_rounded_rect(
+            dc,
+            0,
+            box_y,
+            _CHECKBOX_GLYPH_SIZE,
+            _CHECKBOX_GLYPH_SIZE,
+            _CHECKBOX_GLYPH_RADIUS,
+            fill=fill,
+            border=border,
+            border_width=border_width,
+        )
 
-        # Concentric filled shapes, never a stroked outline -- see the
-        # matching comment in _FlatRadioButton._on_paint: a stroke centred on
-        # a path boundary needs sub-pixel positioning at odd widths (a 1px
-        # line straddling a boundary is two half-pixels), which graphics
-        # backends are free to round asymmetrically, while a plain fill never
-        # hits that ambiguity. Drawing the border as a solid rounded rect
-        # with a smaller, inset rounded rect (fill colour) on top removes
-        # that inconsistency instead of chasing one more coordinate.
-        inner_inset = border_width
-        inner_w = max(0, _CHECKBOX_GLYPH_SIZE - inner_inset * 2)
-        inner_radius = max(0, _CHECKBOX_GLYPH_RADIUS - inner_inset)
-
-        gc = wx.GraphicsContext.Create(dc)
-        if gc:
-            gc.SetPen(wx.TRANSPARENT_PEN)
-            gc.SetBrush(wx.Brush(border))
-            outer_path = gc.CreatePath()
-            outer_path.AddRoundedRectangle(0, box_y, _CHECKBOX_GLYPH_SIZE, _CHECKBOX_GLYPH_SIZE, _CHECKBOX_GLYPH_RADIUS)
-            gc.DrawPath(outer_path)
-            gc.SetBrush(wx.Brush(fill))
-            inner_path = gc.CreatePath()
-            inner_path.AddRoundedRectangle(inner_inset, box_y + inner_inset, inner_w, inner_w, inner_radius)
-            gc.DrawPath(inner_path)
-            if self._checked:
-                # Proportional to the glyph size (not fixed pixels) so the
-                # checkmark stays centred and correctly scaled if
-                # _CHECKBOX_GLYPH_SIZE ever changes again.
-                g = _CHECKBOX_GLYPH_SIZE
+        if self._checked:
+            g = _CHECKBOX_GLYPH_SIZE
+            gc = wx.GraphicsContext.Create(dc)
+            if gc:
                 gc.SetPen(_checkmark_pen())
                 check = gc.CreatePath()
                 check.MoveToPoint(0.22 * g, box_y + 0.5 * g)
                 check.AddLineToPoint(0.42 * g, box_y + 0.72 * g)
                 check.AddLineToPoint(0.78 * g, box_y + 0.28 * g)
                 gc.StrokePath(check)
-        else:
-            # wx.GraphicsContext.Create() can legitimately return None -- most
-            # commonly on a freshly-created window's very first paint, before
-            # it has a realized native drawing surface -- and reliably
-            # succeeds on every later repaint. This path must stay visually
-            # complete on its own (checkmark, correct border weight) rather
-            # than a stripped-down placeholder: a checked box that first
-            # paints via this branch must still look checked, not empty until
-            # the user happens to interact with it and trigger a GC repaint.
-            dc.SetPen(wx.TRANSPARENT_PEN)
-            dc.SetBrush(wx.Brush(border))
-            dc.DrawRoundedRectangle(0, box_y, _CHECKBOX_GLYPH_SIZE, _CHECKBOX_GLYPH_SIZE, _CHECKBOX_GLYPH_RADIUS)
-            dc.SetBrush(wx.Brush(fill))
-            dc.DrawRoundedRectangle(inner_inset, box_y + inner_inset, inner_w, inner_w, inner_radius)
-            if self._checked:
-                g = _CHECKBOX_GLYPH_SIZE
+            else:
                 dc.SetPen(_checkmark_pen())
                 dc.DrawLine(int(0.22 * g), int(box_y + 0.5 * g), int(0.42 * g), int(box_y + 0.72 * g))
                 dc.DrawLine(int(0.42 * g), int(box_y + 0.72 * g), int(0.78 * g), int(box_y + 0.28 * g))
@@ -663,8 +939,8 @@ class _FlatCheckBox(wx.Panel):
         if self._label:
             dc.SetTextForeground(text_colour)
             dc.SetFont(self.GetFont())
-            _tw, text_h = dc.GetTextExtent(self._label)
-            dc.DrawText(self._label, _CHECKBOX_GLYPH_SIZE + _SP_SM, (height - text_h) // 2)
+            _tw, text_h = _hal_measure_text(self, self._label, self.GetFont())
+            dc.DrawText(self._label, _CHECKBOX_GLYPH_SIZE + _SP_SM, max(0, (height - text_h) // 2))
 
     # --- wx.CheckBox-compatible API ---
     def IsChecked(self) -> bool:
@@ -672,39 +948,34 @@ class _FlatCheckBox(wx.Panel):
         return self._checked
 
     def GetValue(self) -> bool:
-        """Return current boolean state."""
+        """Return True if checkbox is checked."""
         return self._checked
 
     def SetValue(self, value: bool) -> None:
-        """Set checkbox boolean value and refresh."""
-        self._checked = bool(value)
-        self.Refresh()
+        """Programmatic state update -- matches wx.CheckBox.SetValue(): no event fired."""
+        if self._checked != bool(value):
+            self._checked = bool(value)
+            self.Refresh()
 
     def Enable(self, enable=True):
-        """Enable or disable control interaction and repaint."""
+        """Enable or disable interaction and repaint control."""
         self._enabled = bool(enable)
         self.Refresh()
         return super().Enable(enable)
 
     def Disable(self):
-        """Disable control interaction."""
+        """Disable interaction."""
         return self.Enable(False)
 
 
 class _FlatRadioButton(wx.Panel):
     """
-    Fully custom-painted radio button -- same rationale as _FlatCheckBox: no
-    native OS chrome means no native dotted focus rectangle to fight.
-
-    Native wx.RadioButton groups siblings automatically via the wx.RB_GROUP
-    style; since this control owns its own painting instead of wrapping a
-    native radio control, group membership is explicit instead: pass the same
-    ``group`` list to every button that should be mutually exclusive (each
-    appends itself on construction), and selecting one clears the rest.
+    Fully custom-painted radio button: consistent circular glyph across Windows, Linux, and macOS.
+    Eliminates OS punchout halo artifacts and unselected disabled dots.
     """
 
-    def __init__(self, parent, label: str = "", group: list | None = None):
-        """Initialise custom-painted radio button and link to peer group."""
+    def __init__(self, parent, label: str = "", *, group: list | None = None):
+        """Initialise custom-painted radio button with text label and mutual exclusion group."""
         super().__init__(parent, style=wx.BORDER_NONE)
         self._label = label
         self._selected = False
@@ -717,13 +988,12 @@ class _FlatRadioButton(wx.Panel):
         if group is not None:
             group.append(self)
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
-        self.SetBackgroundColour(parent.GetBackgroundColour() if parent else _COLORS["app_bg"])
+        self.SetBackgroundColour(_hal_resolve_bg(parent))
 
-        dc = wx.ClientDC(self)
-        dc.SetFont(self.GetFont())
-        text_w, text_h = dc.GetTextExtent(label) if label else (0, 0)
+        text_w, text_h = _hal_measure_text(self, label, self.GetFont())
         gap = _SP_SM if label else 0
-        self.SetMinSize((_CHECKBOX_GLYPH_SIZE + gap + text_w, max(_CHECKBOX_GLYPH_SIZE, text_h) + _SP_XS))
+        extra_pad = _SP_SM if label else 0
+        self.SetMinSize((_CHECKBOX_GLYPH_SIZE + gap + text_w + extra_pad, max(_CHECKBOX_GLYPH_SIZE, text_h) + _SP_XS))
 
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
@@ -735,84 +1005,105 @@ class _FlatRadioButton(wx.Panel):
         self.Bind(wx.EVT_KILL_FOCUS, self._on_kill_focus)
         self.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
 
+    def DoGetBestSize(self) -> wx.Size:
+        """Calculate best size including glyph, gap, text width, and right padding for ClearType/font overhang."""
+        text_w, text_h = _hal_measure_text(self, self._label, self.GetFont())
+        gap = _SP_SM if self._label else 0
+        extra_pad = _SP_SM if self._label else 0
+        return wx.Size(
+            _CHECKBOX_GLYPH_SIZE + gap + text_w + extra_pad,
+            max(_CHECKBOX_GLYPH_SIZE, text_h) + _SP_XS,
+        )
+
     def AcceptsFocus(self):
         """Return True if enabled to allow keyboard focus navigation."""
         return self._enabled
 
-    def _on_set_focus(self, event):
-        """
-        Draw a focus ring for keyboard focus only.
+    def AcceptsFocusFromKeyboard(self):
+        """Only the selected radio button in a group acts as a Tab stop."""
+        if not self._enabled:
+            return False
+        selected_in_group = [b for b in self._group if b._selected and b._enabled]
+        if selected_in_group:
+            return self is selected_in_group[0]
+        enabled_in_group = [b for b in self._group if b._enabled]
+        return bool(enabled_in_group and self is enabled_in_group[0])
 
-        A ring after every mouse click is the "focus ring pollution" the
-        platform itself avoids: click a control on macOS and no ring appears,
-        Tab to it and one does. ``_focus_from_pointer`` is set by
-        :meth:`_on_left_down` immediately before ``SetFocus()``, so a click
-        still takes focus -- it just does not advertise it.
-        """
+    def _on_set_focus(self, event):
+        """Draw a focus ring for keyboard focus only."""
         self._has_focus = not self._focus_from_pointer
         self._focus_from_pointer = False
         self.Refresh()
         event.Skip()
 
     def _on_kill_focus(self, event):
-        """
-        Take the state from the event, never from HasFocus().
-
-        Inside EVT_KILL_FOCUS the focus transfer has not completed, so
-        HasFocus() can still report True. Deriving the flag from it left the
-        control that just lost focus permanently "focused", and since the paint
-        code draws an accent ring for a focused glyph, the previously selected
-        radio kept an orange ring after its dot had correctly cleared.
-        """
+        """Clear focus state from event."""
         self._has_focus = False
         self._focus_from_pointer = False
         self.Refresh()
         event.Skip()
 
     def _on_key_down(self, event):
-        """Handle Space and Enter key presses to select radio option."""
-        if self._enabled and event.GetKeyCode() in (wx.WXK_SPACE, wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+        """Select radio button on Space/Enter, or navigate group with Arrow keys."""
+        if not self._enabled:
+            event.Skip()
+            return
+        key = event.GetKeyCode()
+        if key in (wx.WXK_SPACE, wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             self._select()
+        elif key in (wx.WXK_UP, wx.WXK_LEFT):
+            self._navigate_group(-1)
+        elif key in (wx.WXK_DOWN, wx.WXK_RIGHT):
+            self._navigate_group(1)
         else:
             event.Skip()
 
+    def _navigate_group(self, direction: int):
+        """Navigate and select adjacent radio button in the group."""
+        if not self._group or len(self._group) <= 1:
+            return
+        try:
+            curr_idx = self._group.index(self)
+        except ValueError:
+            return
+        next_idx = (curr_idx + direction) % len(self._group)
+        target = self._group[next_idx]
+        if target.IsEnabled():
+            target.SetFocus()
+            target._select()
+
     def _on_enter(self, event):
-        """Update hover appearance on mouse enter."""
+        """Update hover highlight state on mouse enter."""
         if self._enabled:
             self._hover = True
             self.Refresh()
         event.Skip()
 
     def _on_leave(self, event):
-        """Clear hover and pressed state on mouse leave."""
+        """Clear hover and pressed states on mouse leave."""
         self._hover = False
         self._pressed = False
         self.Refresh()
         event.Skip()
 
     def _on_left_down(self, event):
-        """Capture mouse input and flag pressed state on mouse down."""
+        """Handle left mouse click."""
         if not self._enabled:
             return
-        self._pressed = True
-        self.CaptureMouse()
         self._focus_from_pointer = True
         self.SetFocus()
+        self._pressed = True
+        self.CaptureMouse()
         self.Refresh()
 
     def _on_left_up(self, event):
-        """Release mouse capture and apply radio selection if released inside."""
+        """Handle left mouse release and select if inside."""
         if not self._enabled:
             return
         if self.HasCapture():
             self.ReleaseMouse()
         was_pressed = self._pressed
         self._pressed = False
-        # Recompute hover from where the pointer actually is. While the mouse
-        # is captured the platform stops delivering EVT_LEAVE_WINDOW, so
-        # _hover would otherwise stay True after the click and leave this
-        # control's ring painted in the accent colour as though it were still
-        # hovered -- it reads as a selection that will not clear.
         inside = self.ClientRect.Contains(event.GetPosition())
         self._hover = inside
         self.Refresh()
@@ -820,32 +1111,16 @@ class _FlatRadioButton(wx.Panel):
             self._select()
 
     def _on_capture_lost(self, event):
-        """
-        Capture can be taken away at any time (a modal dialog, a window switch).
-
-        Only ``_pressed`` is a click-in-progress and must drop. Hover is a
-        property of where the pointer is, so it is recomputed rather than
-        cleared -- clearing it blanks the highlight on a control the pointer is
-        still resting on, and EVT_ENTER_WINDOW has already fired so nothing
-        restores it until the pointer leaves and comes back.
-        """
+        """Handle lost mouse capture."""
         self._pressed = False
         self._hover = _pointer_is_inside(self)
         self.Refresh()
 
     def _apply_selection(self):
-        """Select this button and clear its group siblings, without firing an event."""
-        if self._selected:
-            return
+        """Select this radio and deselect other siblings in the group."""
         for other in self._group:
             if other is not self and other._selected:
                 other._selected = False
-                # Recompute rather than trust the cached flag: if the pointer
-                # left this control while another held the mouse capture, no
-                # EVT_LEAVE_WINDOW was delivered and _hover is still True, so
-                # the deselected radio keeps an accent ring until it is hovered
-                # again.
-                other._hover = _pointer_is_inside(other)
                 other.Refresh()
         self._selected = True
         self.Refresh()
@@ -860,79 +1135,40 @@ class _FlatRadioButton(wx.Panel):
         wx.PostEvent(self, event)
 
     def _on_paint(self, event):
-        """Paint custom circular radio glyph, focus ring, selected dot, and text label."""
-        dc = wx.AutoBufferedPaintDC(self)
-        width, height = self.GetSize()
-        parent = self.GetParent()
-        parent_bg = parent.GetBackgroundColour() if parent else _COLORS["app_bg"]
-        dc.SetBackground(wx.Brush(parent_bg))
-        dc.Clear()
+        """Paint custom circular radio glyph, focus ring, and selected dot via UI HAL."""
+        dc, width, height, parent_bg = _hal_init_paint_dc(self)
 
         box_y = (height - _CHECKBOX_GLYPH_SIZE) // 2
         accent = _COLORS["accent"]
-        cx, cy, r = _CHECKBOX_GLYPH_SIZE / 2, box_y + _CHECKBOX_GLYPH_SIZE / 2, _CHECKBOX_GLYPH_SIZE / 2 - 1
+        cx = _CHECKBOX_GLYPH_SIZE / 2
+        cy = box_y + _CHECKBOX_GLYPH_SIZE / 2
+        r = _CHECKBOX_GLYPH_SIZE / 2 - 1
 
-        focused = self._has_focus and self._enabled
         if not self._enabled:
             border = _COLORS["border"]
-            dot = _COLORS["muted"]
+            dot = _COLORS["muted"] if self._selected else None
             text_colour = _COLORS["muted"]
+            border_width = 1
         elif self._selected:
-            border = accent
+            border, border_width = _hal_control_border(selected=True, hover=self._hover)
             dot = accent
             text_colour = _COLORS["text"]
         else:
-            border = accent if focused else _COLORS["muted"]
+            border, border_width = _hal_control_border(selected=False, hover=self._hover)
             dot = None
             text_colour = _COLORS["text"]
 
-        # Focus is a bolder accent ring directly on the glyph -- see the
-        # matching comment in _FlatCheckBox._on_paint for why this replaced
-        # a separate dashed outline around the whole row.
-        border_width = 2 if focused else 1
+        _hal_draw_circle(dc, cx, cy, r, fill=parent_bg, border=border, border_width=border_width)
 
-        # Concentric filled discs, never a stroked outline: a stroke and a
-        # fill are two different rasterization paths, and graphics backends
-        # are free to apply pixel-snapping/hinting to a stroked edge that a
-        # plain fill never gets -- on at least one real combination of
-        # Windows display scaling + wx build, that alone was enough to
-        # visibly displace the ring from the dot even though both were fed
-        # numerically identical centre coordinates. Painting the ring as a
-        # solid disc (ring colour) with a smaller disc (background colour)
-        # punched out on top -- then the dot on top of that, all three via
-        # the exact same fill-only call -- removes that entire class of
-        # stroke-vs-fill inconsistency instead of chasing one more
-        # coordinate rounding case.
-        dr = round(r * 0.5)
-        inner_r = r - border_width
-
-        gc = wx.GraphicsContext.Create(dc)
-        if gc:
-            gc.SetPen(wx.TRANSPARENT_PEN)
-            gc.SetBrush(wx.Brush(border))
-            gc.DrawEllipse(cx - r, cy - r, r * 2, r * 2)
-            gc.SetBrush(wx.Brush(_COLORS["input_bg"]))
-            gc.DrawEllipse(cx - inner_r, cy - inner_r, inner_r * 2, inner_r * 2)
-            if dot is not None:
-                gc.SetBrush(wx.Brush(dot))
-                gc.DrawEllipse(cx - dr, cy - dr, dr * 2, dr * 2)
-        else:
-            # Same GC-unavailable fallback as _FlatCheckBox -- must stay
-            # visually complete (including focus border weight) on its own.
-            dc.SetPen(wx.TRANSPARENT_PEN)
-            dc.SetBrush(wx.Brush(border))
-            dc.DrawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
-            dc.SetBrush(wx.Brush(_COLORS["input_bg"]))
-            dc.DrawEllipse(int(cx - inner_r), int(cy - inner_r), int(inner_r * 2), int(inner_r * 2))
-            if dot is not None:
-                dc.SetBrush(wx.Brush(dot))
-                dc.DrawEllipse(int(cx - dr), int(cy - dr), int(dr * 2), int(dr * 2))
+        if dot is not None:
+            dr = round(r * 0.5)
+            _hal_draw_circle(dc, cx, cy, dr, fill=dot, border=dot, border_width=0)
 
         if self._label:
             dc.SetTextForeground(text_colour)
             dc.SetFont(self.GetFont())
-            _tw, text_h = dc.GetTextExtent(self._label)
-            dc.DrawText(self._label, _CHECKBOX_GLYPH_SIZE + _SP_SM, (height - text_h) // 2)
+            _tw, text_h = _hal_measure_text(self, self._label, self.GetFont())
+            dc.DrawText(self._label, _CHECKBOX_GLYPH_SIZE + _SP_SM, max(0, (height - text_h) // 2))
 
     # --- wx.RadioButton-compatible API ---
     def GetValue(self) -> bool:
@@ -958,6 +1194,511 @@ class _FlatRadioButton(wx.Panel):
         return self.Enable(False)
 
 
+class _FlatChoicePopup(wx.PopupTransientWindow):
+    """
+    Custom popup transient window for _FlatChoice matching the application design system.
+    Eliminates native Win32 context menus, bullet dots, and misaligned text.
+    """
+
+    def __init__(self, parent_choice: "_FlatChoice", choices: list[str], selected_index: int):
+        super().__init__(parent_choice.GetTopLevelParent(), flags=wx.BORDER_NONE)
+        self._choice_ctrl = parent_choice
+        self._choices = choices
+        self._selected = selected_index
+        self._hover_idx = selected_index
+
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_MOTION, self._on_motion)
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
+        self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+        self.Bind(wx.EVT_LEAVE_WINDOW, self._on_leave)
+        self.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
+
+        self._row_h = _CTRL_H
+        total_h = self._row_h * len(choices) + 6
+        choice_w = parent_choice.GetSize().width
+        self.SetSize((choice_w, total_h))
+
+    def OnDismiss(self):
+        if hasattr(self, "_choice_ctrl") and self._choice_ctrl:
+            self._choice_ctrl._dismiss_time = time.time()
+            self._choice_ctrl._popup = None
+            self._choice_ctrl._popup_open = False
+            self._choice_ctrl.Refresh()
+        super().OnDismiss()
+
+    def Dismiss(self):
+        if hasattr(self, "_choice_ctrl") and self._choice_ctrl:
+            self._choice_ctrl._dismiss_time = time.time()
+            self._choice_ctrl._popup = None
+            self._choice_ctrl._popup_open = False
+            self._choice_ctrl.Refresh()
+        super().Dismiss()
+
+    def _item_index_at_y(self, y: int) -> int:
+        idx = (y - 3) // self._row_h
+        if 0 <= idx < len(self._choices):
+            return idx
+        return -1
+
+    def _on_motion(self, event):
+        idx = self._item_index_at_y(event.GetPosition().y)
+        if idx != self._hover_idx:
+            self._hover_idx = idx
+            self.Refresh()
+
+    def _on_leave(self, event):
+        self._hover_idx = -1
+        self.Refresh()
+
+    def _on_left_down(self, event):
+        idx = self._item_index_at_y(event.GetPosition().y)
+        if 0 <= idx < len(self._choices):
+            self._hover_idx = idx
+            self.Refresh()
+        event.Skip()
+
+    def _on_left_up(self, event):
+        idx = self._item_index_at_y(event.GetPosition().y)
+        if 0 <= idx < len(self._choices):
+            self._choice_ctrl._on_popup_item_chosen(idx)
+        self.Dismiss()
+
+    def _on_key_down(self, event):
+        kc = event.GetKeyCode()
+        if kc == wx.WXK_ESCAPE:
+            self.Dismiss()
+        elif kc in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER, wx.WXK_SPACE):
+            if 0 <= self._hover_idx < len(self._choices):
+                self._choice_ctrl._on_popup_item_chosen(self._hover_idx)
+            self.Dismiss()
+        elif kc == wx.WXK_UP:
+            self._hover_idx = max(0, (self._hover_idx if self._hover_idx >= 0 else self._selected) - 1)
+            self.Refresh()
+        elif kc == wx.WXK_DOWN:
+            self._hover_idx = min(len(self._choices) - 1, (self._hover_idx if self._hover_idx >= 0 else self._selected) + 1)
+            self.Refresh()
+        else:
+            event.Skip()
+
+    def _on_paint(self, event):
+        dc, width, height, _ = _hal_init_paint_dc(self)
+        bg = _COLORS.get("surface") or _COLORS["app_bg"]
+        border = _COLORS["border"]
+
+        # Outer rounded box
+        _hal_draw_rounded_rect(dc, 0, 0, width, height, _BUTTON_RADIUS, fill=bg, border=border, border_width=1)
+
+        base_font = self.GetFont()
+        y = 3
+        item_padding_x = 5
+        for idx, text in enumerate(self._choices):
+            is_selected = (idx == self._selected)
+            is_hover = (idx == self._hover_idx)
+
+            row_rect_w = width - 6
+            row_x = 3
+            row_y = y
+
+            # Hover / Selected highlight pill
+            if is_hover:
+                fill_col = _COLORS["border"]
+                _hal_draw_rounded_rect(dc, row_x, row_y, row_rect_w, self._row_h, _CHECKBOX_GLYPH_RADIUS, fill=fill_col, border=None)
+            elif is_selected:
+                fill_col = _COLORS.get("input_bg", bg)
+                _hal_draw_rounded_rect(dc, row_x, row_y, row_rect_w, self._row_h, _CHECKBOX_GLYPH_RADIUS, fill=fill_col, border=None)
+
+            # High-contrast text: crisp readable white across dark backgrounds, bold when selected
+            text_col = _COLORS["text"]
+            if is_selected:
+                draw_font = wx.Font(base_font)
+                draw_font.SetWeight(wx.FONTWEIGHT_BOLD)
+            else:
+                draw_font = base_font
+
+            gc = wx.GraphicsContext.Create(dc)
+            if gc:
+                gc.SetFont(draw_font, text_col)
+                _gw, gh = gc.GetTextExtent(text)
+                text_y = row_y + (self._row_h - gh) / 2 - 1
+                gc.DrawText(text, row_x + item_padding_x, text_y)
+
+                if is_selected:
+                    chk_x = width - _SP_MD - 8
+                    chk_y = row_y + self._row_h // 2
+                    pen = wx.Pen(_COLORS["accent"], 2)
+                    pen.SetCap(wx.CAP_ROUND)
+                    pen.SetJoin(wx.JOIN_ROUND)
+                    gc.SetPen(pen)
+                    path = gc.CreatePath()
+                    path.MoveToPoint(chk_x - 3, chk_y)
+                    path.AddLineToPoint(chk_x, chk_y + 3)
+                    path.AddLineToPoint(chk_x + 5, chk_y - 3)
+                    gc.StrokePath(path)
+            else:
+                dc.SetFont(draw_font)
+                dc.SetTextForeground(text_col)
+                _tw, th = _hal_measure_text(self, text, draw_font)
+                text_y = row_y + max(0, (self._row_h - th) // 2)
+                dc.DrawText(text, row_x + item_padding_x, text_y)
+
+            y += self._row_h
+
+
+class _FlatChoice(wx.Panel):
+    """
+    Flat custom dropdown choice control with rounded corners and dark/light theming.
+    Replaces native Win32 wx.Choice which cannot be styled on Windows, ensuring
+    identical modern aesthetics across Windows, macOS, and Linux.
+    """
+
+    def __init__(
+        self,
+        parent,
+        id: int = wx.ID_ANY,
+        pos=wx.DefaultPosition,
+        size=wx.DefaultSize,
+        choices: list[str] | None = None,
+        style: int = 0,
+        name: str = "flatChoice",
+    ):
+        super().__init__(parent, id, pos=pos, size=size, style=wx.TAB_TRAVERSAL | wx.BORDER_NONE, name=name)
+        self._choices = list(choices) if choices else []
+        self._selection = 0 if self._choices else wx.NOT_FOUND
+        self._hover = False
+        self._pressed = False
+        self._enabled = True
+        self._has_focus = False
+        self._focus_from_pointer = False
+        self._popup_open = False
+        self._dismiss_time = 0.0
+        self._popup = None
+
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.SetBackgroundColour(_hal_resolve_bg(parent))
+
+        # Determine min size based on choices
+        if isinstance(size, (tuple, list)):
+            size = wx.Size(*size)
+        font = self.GetFont()
+        max_w = 0
+        for ch in self._choices:
+            tw, _ = _hal_measure_text(self, ch, font)
+            max_w = max(max_w, tw)
+        min_w = max(90, max_w + 36)
+        req_w = size.width if (hasattr(size, "width") and size.width > 0) else min_w
+        req_h = size.height if (hasattr(size, "height") and size.height > 0) else _CTRL_H
+        self.SetMinSize((req_w, req_h))
+
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_ENTER_WINDOW, self._on_enter)
+        self.Bind(wx.EVT_LEAVE_WINDOW, self._on_leave)
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
+        self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self._on_capture_lost)
+        self.Bind(wx.EVT_SET_FOCUS, self._on_set_focus)
+        self.Bind(wx.EVT_KILL_FOCUS, self._on_kill_focus)
+        self.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
+
+    def DoGetBestSize(self) -> wx.Size:
+        font = self.GetFont()
+        max_w = 0
+        for ch in self._choices:
+            tw, _ = _hal_measure_text(self, ch, font)
+            max_w = max(max_w, tw)
+        return wx.Size(max(90, max_w + 36), _CTRL_H)
+
+    def AcceptsFocus(self) -> bool:
+        return self._enabled
+
+    def _on_enter(self, event):
+        if self._enabled:
+            self._hover = True
+            self.Refresh()
+        event.Skip()
+
+    def _on_leave(self, event):
+        self._hover = False
+        self._pressed = False
+        self.Refresh()
+        event.Skip()
+
+    def _on_set_focus(self, event):
+        self._has_focus = not self._focus_from_pointer
+        self._focus_from_pointer = False
+        self.Refresh()
+        event.Skip()
+
+    def _on_kill_focus(self, event):
+        self._has_focus = False
+        self._focus_from_pointer = False
+        self.Refresh()
+        event.Skip()
+
+    def _on_left_down(self, event):
+        if not self._enabled:
+            return
+        self._focus_from_pointer = True
+        self.SetFocus()
+        self._pressed = True
+        self.Refresh()
+        self._show_popup()
+
+    def _on_left_up(self, event):
+        if not self._enabled:
+            return
+        self._pressed = False
+        self.Refresh()
+
+    def _on_capture_lost(self, event):
+        self._pressed = False
+        self._hover = _pointer_is_inside(self)
+        self.Refresh()
+
+    def _on_key_down(self, event):
+        if not self._enabled:
+            event.Skip()
+            return
+        kc = event.GetKeyCode()
+        if kc in (wx.WXK_SPACE, wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER, wx.WXK_DOWN) and (kc != wx.WXK_DOWN or event.AltDown()):
+            self._show_popup()
+        elif kc == wx.WXK_UP:
+            if self._selection > 0:
+                self.SetSelection(self._selection - 1)
+                self._notify_choice()
+        elif kc == wx.WXK_DOWN:
+            if self._selection < len(self._choices) - 1:
+                self.SetSelection(self._selection + 1)
+                self._notify_choice()
+        else:
+            event.Skip()
+
+    def _show_popup(self):
+        """Show custom styled popup window matching app theme."""
+        if not self._choices:
+            return
+        if time.time() - getattr(self, "_dismiss_time", 0.0) < 0.25:
+            return
+
+        try:
+            popup = _FlatChoicePopup(self, self._choices, self._selection)
+            self._popup = popup
+            self._popup_open = True
+            self.Refresh()
+
+            w, h = self.GetSize()
+            total_h = popup.GetSize().height
+            screen_pt = self.ClientToScreen(wx.Point(0, h))
+            popup.SetSize((w, total_h))
+
+            disp_idx = wx.Display.GetFromPoint(screen_pt)
+            if disp_idx != wx.NOT_FOUND:
+                client_rect = wx.Display(disp_idx).GetClientArea()
+                if screen_pt.y + total_h > client_rect.GetBottom():
+                    screen_pt = self.ClientToScreen(wx.Point(0, -total_h))
+
+            popup.Move(screen_pt)
+            popup.Popup()
+        except Exception as exc:
+            self._popup_open = False
+            self.Refresh()
+            logger.exception("Failed to open _FlatChoice custom popup: %s", exc)
+            self._show_fallback_menu()
+
+    def _show_fallback_menu(self):
+        """Fallback popup menu if transient window encounters window manager restrictions."""
+        menu = wx.Menu()
+        for idx, text in enumerate(self._choices):
+            item = menu.Append(wx.ID_ANY, text)
+            menu.Bind(wx.EVT_MENU, lambda evt, i=idx: self._on_popup_item_chosen(i), item)
+        self.PopupMenu(menu, (0, self.GetSize().height))
+        menu.Destroy()
+
+    def _on_popup_item_chosen(self, index: int):
+        if 0 <= index < len(self._choices) and index != self._selection:
+            self._selection = index
+            self.Refresh()
+            self._notify_choice()
+
+    def _notify_choice(self):
+        """Post a wx.EVT_CHOICE notification."""
+        event = wx.CommandEvent(wx.EVT_CHOICE.typeId, self.GetId())
+        event.SetEventObject(self)
+        event.SetInt(self._selection)
+        if 0 <= self._selection < len(self._choices):
+            event.SetString(self._choices[self._selection])
+        self.GetEventHandler().ProcessEvent(event)
+
+    def _on_paint(self, event):
+        """Paint flat choice container, current selection text, and dropdown chevron."""
+        dc, width, height, parent_bg = _hal_init_paint_dc(self)
+
+        focused = self._has_focus and self._enabled
+        is_open = getattr(self, "_popup_open", False)
+
+        if not self._enabled:
+            fill = _COLORS["input_bg"]
+            border = _COLORS["border"]
+            text_colour = _COLORS["muted"]
+            chevron_colour = _COLORS["border"]
+        elif is_open or self._pressed:
+            fill = _COLORS["input_bg"]
+            border = _COLORS["muted"]
+            text_colour = _COLORS["input_fg"]
+            chevron_colour = _COLORS["text"]
+        elif self._hover or focused:
+            fill = _COLORS["input_bg"]
+            border = _COLORS["muted"]
+            text_colour = _COLORS["input_fg"]
+            chevron_colour = _COLORS["text"]
+        else:
+            fill = _COLORS["input_bg"]
+            border = _COLORS["border"]
+            text_colour = _COLORS["input_fg"]
+            chevron_colour = _COLORS["muted"]
+
+        border_w = 1
+        _hal_draw_rounded_rect(
+            dc, 0, 0, width, height, _BUTTON_RADIUS, fill=fill, border=border, border_width=border_w
+        )
+
+        label = self.GetStringSelection()
+        if label:
+            font = self.GetFont()
+            gc = wx.GraphicsContext.Create(dc)
+            if gc:
+                gc.SetFont(font, text_colour)
+                _gw, gh = gc.GetTextExtent(label)
+                gy = (height - gh) / 2 - 1
+                gc.DrawText(label, _SP_SM, gy)
+            else:
+                dc.SetFont(font)
+                dc.SetTextForeground(text_colour)
+                tw, th = _hal_measure_text(self, label, font)
+                try:
+                    m = dc.GetFontMetrics()
+                    ty = max(0, (height - m.ascent - m.internalLeading) // 2)
+                except Exception:
+                    ty = max(0, (height - th) // 2 - 1)
+                dc.DrawText(label, _SP_SM, ty)
+
+        arrow_cx = width - _SP_MD
+        arrow_cy = height // 2
+        gc = wx.GraphicsContext.Create(dc)
+        if gc:
+            pen = wx.Pen(chevron_colour, 2)
+            pen.SetCap(wx.CAP_ROUND)
+            pen.SetJoin(wx.JOIN_ROUND)
+            gc.SetPen(pen)
+            path = gc.CreatePath()
+            if is_open:
+                path.MoveToPoint(arrow_cx - 4, arrow_cy + 2)
+                path.AddLineToPoint(arrow_cx, arrow_cy - 2)
+                path.AddLineToPoint(arrow_cx + 4, arrow_cy + 2)
+            else:
+                path.MoveToPoint(arrow_cx - 4, arrow_cy - 2)
+                path.AddLineToPoint(arrow_cx, arrow_cy + 2)
+                path.AddLineToPoint(arrow_cx + 4, arrow_cy - 2)
+            gc.StrokePath(path)
+        else:
+            dc.SetPen(wx.Pen(chevron_colour, 1))
+            if is_open:
+                dc.DrawLine(int(arrow_cx - 4), int(arrow_cy + 2), int(arrow_cx), int(arrow_cy - 2))
+                dc.DrawLine(int(arrow_cx), int(arrow_cy - 2), int(arrow_cx + 4), int(arrow_cy + 2))
+            else:
+                dc.DrawLine(int(arrow_cx - 4), int(arrow_cy - 2), int(arrow_cx), int(arrow_cy + 2))
+                dc.DrawLine(int(arrow_cx), int(arrow_cy + 2), int(arrow_cx + 4), int(arrow_cy - 2))
+
+    # --- wx.Choice-compatible API ---
+    def GetSelection(self) -> int:
+        return self._selection
+
+    def SetSelection(self, n: int) -> None:
+        if 0 <= n < len(self._choices):
+            self._selection = n
+            self.Refresh()
+        elif n == wx.NOT_FOUND:
+            self._selection = wx.NOT_FOUND
+            self.Refresh()
+
+    def GetStringSelection(self) -> str:
+        if 0 <= self._selection < len(self._choices):
+            return self._choices[self._selection]
+        return ""
+
+    def SetStringSelection(self, string: str) -> bool:
+        if string in self._choices:
+            self.SetSelection(self._choices.index(string))
+            return True
+        return False
+
+    def GetString(self, n: int) -> str:
+        if 0 <= n < len(self._choices):
+            return self._choices[n]
+        return ""
+
+    def SetString(self, n: int, string: str) -> None:
+        if 0 <= n < len(self._choices):
+            self._choices[n] = string
+            self.Refresh()
+
+    def GetCount(self) -> int:
+        return len(self._choices)
+
+    def FindString(self, string: str, caseSensitive: bool = False) -> int:
+        for idx, ch in enumerate(self._choices):
+            if (ch == string) if caseSensitive else (ch.lower() == string.lower()):
+                return idx
+        return wx.NOT_FOUND
+
+    def Append(self, item: str) -> int:
+        self._choices.append(item)
+        if self._selection == wx.NOT_FOUND:
+            self._selection = 0
+        self.Refresh()
+        return len(self._choices) - 1
+
+    def Clear(self) -> None:
+        self._choices.clear()
+        self._selection = wx.NOT_FOUND
+        self.Refresh()
+
+    def Enable(self, enable: bool = True) -> bool:
+        self._enabled = bool(enable)
+        self.Refresh()
+        return super().Enable(enable)
+
+    def Disable(self) -> bool:
+        return self.Enable(False)
+
+
+def _format_dialog_message(msg: str, max_token: int = 36) -> str:
+    """Format message text so long paths and unbroken tokens wrap cleanly on path separators."""
+    if not msg:
+        return ""
+
+    def _split_long_token(match: re.Match) -> str:
+        tok = match.group(0)
+        if len(tok) <= max_token:
+            return tok
+        # Split on path separators (\ or /) without losing them
+        parts = re.split(r"([\\/])", tok)
+        out: list[str] = []
+        cur = ""
+        for p in parts:
+            if len(cur) + len(p) > max_token and cur:
+                out.append(cur)
+                cur = p
+            else:
+                cur += p
+        if cur:
+            out.append(cur)
+        return "\n".join(out)
+
+    return re.sub(r"\S+", _split_long_token, msg)
+
+
 class _ExportProgressDialog(wx.Dialog):
     """Non-modal export progress window following the system appearance."""
 
@@ -980,36 +1721,26 @@ class _ExportProgressDialog(wx.Dialog):
         self._message = ""
         self.SetBackgroundColour(_COLORS["app_bg"])
         sizer = wx.BoxSizer(wx.VERTICAL)
-
-        # Message, gauge and the action row all carry the same _SP_LG side
-        # margin, so their left and right edges line up. The button used to
-        # supply its own smaller wx.ALL border instead of the row taking the
-        # container margin, which left it sitting 8px further right than the
-        # gauge above it.
+        pad_h = _SP_LG
         self.lbl_message = wx.StaticText(self, label="Initializing exporter…")
         self.lbl_message.SetForegroundColour(_COLORS["text"])
-        sizer.Add(self.lbl_message, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, _SP_LG)
+        sizer.Add(self.lbl_message, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, pad_h)
 
         self._gauge_spacer = sizer.AddSpacer(_SP_MD)
-        self.gauge = wx.Gauge(self, range=100, size=(-1, _SP_SM))
-        sizer.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, _SP_LG)
+        self.gauge = wx.Gauge(self, range=100, size=(-1, 6))
+        sizer.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, pad_h)
 
-        # _SP_XL before the actions, matching _KiForgeMessageDialog.
-        sizer.AddSpacer(_SP_XL)
+        sizer.AddSpacer(_SP_LG)
         row = wx.BoxSizer(wx.HORIZONTAL)
         row.AddStretchSpacer()
-        self.btn_cancel = _FlatButton(self, "Cancel", min_width=88)
+        self.btn_cancel = _FlatButton(self, "Cancel", min_width=72)
         self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_cancel)
         row.Add(self.btn_cancel, 0)
-        # Escape and the titlebar close arrive here. While the export runs they
-        # mean "cancel", not "close": closing the window would leave the worker
-        # running with nothing left to report it. Once the result is up they
-        # mean the same thing as OK.
         self.Bind(wx.EVT_CLOSE, self._on_close_request)
-        sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, _SP_LG)
+        sizer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, pad_h)
 
         self.SetSizer(sizer)
-        self.SetMinSize((340, -1))
+        self.SetMinSize((340, 110))
         self.Fit()
         self.CentreOnParent()
 
@@ -1020,15 +1751,10 @@ class _ExportProgressDialog(wx.Dialog):
         self._cancelled = True
         self._message = "Cancelling…"
         self.lbl_message.SetLabel(self._message)
-        self.gauge.Hide()
-        if hasattr(self, "_gauge_spacer") and self._gauge_spacer is not None:
-            self._gauge_spacer.Show(False)
+        self.gauge.Pulse()
         self.btn_cancel.Disable()
+        self.btn_cancel.SetLabel("Cancelling…")
         self.Layout()
-        self.Fit()
-        # Paint "Cancelling..." now rather than whenever the loop next idles,
-        # and abort the export straight away instead of waiting for the poll
-        # timer to notice was_cancelled().
         self.Update()
         if self._on_cancel_requested is not None:
             try:
@@ -1076,7 +1802,9 @@ class _ExportProgressDialog(wx.Dialog):
         """
         self._finished = True
         self._message = message
-        self.lbl_message.SetLabel(message)
+        formatted = _format_dialog_message(message, max_token=36)
+        self.lbl_message.SetLabel(formatted)
+        self.lbl_message.Wrap(320)
         if not complete or self._cancelled:
             self.gauge.Hide()
             if hasattr(self, "_gauge_spacer") and self._gauge_spacer is not None:
@@ -1085,17 +1813,15 @@ class _ExportProgressDialog(wx.Dialog):
             self.gauge.SetValue(100)
         self.btn_cancel.SetLabel("OK")
         self.btn_cancel.Enable()
-        # Green confirms the run finished; a failure or cancellation keeps the
-        # neutral button so the colour means something.
         self.btn_cancel.SetTone(_COLORS["success"] if complete else None)
-        # Unbind by handler, not by event type: the bare form does not reliably
-        # remove the binding, which would leave _on_cancel firing first and
-        # turning the click into "Cancelling..." instead of dismissing.
         self.btn_cancel.Unbind(wx.EVT_BUTTON, handler=self._on_cancel)
         self.btn_cancel.Bind(wx.EVT_BUTTON, self._on_dismiss)
         self.Layout()
         self.Fit()
+        w, h = self.GetSize()
+        self.SetSize((max(w, 340), max(h, 110)))
         self.Update()
+        wx.CallAfter(self.btn_cancel.SetFocus)
 
     def is_finished(self) -> bool:
         """Return True if the export task completed."""
@@ -1120,6 +1846,7 @@ class _ExportProgressDialog(wx.Dialog):
         "Cancelling..." the user is waiting to see resolve.
         """
         if self._cancelled:
+            self.gauge.Pulse()
             return
         if message and message != self._message:
             self._message = message
@@ -1149,8 +1876,8 @@ _MSG_ICON_SIZE = 24  # on-grid (6 * 4)
 # Measure the message text wraps at, and the dialog's width floor. The floor
 # sits just under the wrap measure so a short message produces a dialog that
 # hugs its content instead of being padded out to a fixed width. Both on-grid.
-_MSG_TEXT_WRAP = 300
-_MSG_MIN_WIDTH = 280
+_MSG_TEXT_WRAP = 360
+_MSG_MIN_WIDTH = 240
 _msg_icon_bitmap_cache: dict[tuple[str, int, str], wx.Bitmap] = {}
 
 
@@ -1180,26 +1907,28 @@ def _load_message_icon_bitmap(kind: str, size: int = _MSG_ICON_SIZE) -> wx.Bitma
 class _KiForgeMessageDialog(wx.Dialog):
     """Themed message dialog following the system appearance, used in place of wx.MessageBox."""
 
-    def __init__(self, parent, message: str, title: str, kind: str, buttons: str):
+    def __init__(
+        self,
+        parent,
+        message: str,
+        title: str,
+        kind: str,
+        buttons: str,
+        btn_labels: tuple[str, ...] | None = None,
+    ):
         """Initialise themed message dialog matching active appearance ramp."""
         super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE)
-        # Can be raised without the settings dialog ever opening (an export
-        # failure from the toolbar), so it resolves the palette itself.
         refresh_palette()
         self.SetBackgroundColour(_COLORS["app_bg"])
 
         outer = wx.BoxSizer(wx.VERTICAL)
         row = wx.BoxSizer(wx.HORIZONTAL)
 
-        msg = wx.StaticText(self, label=message)
+        formatted_msg = _format_dialog_message(message, max_token=36)
+        msg = wx.StaticText(self, label=formatted_msg)
         msg.SetForegroundColour(_COLORS["text"])
         msg.Wrap(_MSG_TEXT_WRAP)
 
-        # A one-line message reads best with the glyph centred against it; once
-        # the text wraps, centring against the whole block leaves the glyph
-        # floating beside the middle of a paragraph, so anchor it to the top
-        # (i.e. beside the first line) instead. Decided from the measured text
-        # height rather than a guess about how long callers' messages are.
         multiline = msg.GetBestSize().height > msg.GetCharHeight() * 1.5
         icon_align = wx.ALIGN_TOP if multiline else wx.ALIGN_CENTER_VERTICAL
 
@@ -1208,27 +1937,15 @@ class _KiForgeMessageDialog(wx.Dialog):
             row.Add(wx.StaticBitmap(self, bitmap=icon_bmp), 0, icon_align | wx.RIGHT, _SP_LG)
         row.Add(msg, 1, icon_align)
 
-        # Proportion 0: the content row keeps its own natural height instead of
-        # stretching to fill whatever extra space Fit()/SetMinSize would leave,
-        # which is what left the icon stranded at the top with a dead gap below
-        # it and the button row floating disconnected at the bottom.
         outer.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, _SP_LG)
-
-        # _SP_XL here against _SP_LG everywhere else: the action row should read
-        # as a separate area, not as one more line of the message body. A
-        # sizer border can only carry a single width across the sides it names,
-        # so the wider gap is its own spacer rather than a border on either row.
         outer.AddSpacer(_SP_XL)
 
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
         btn_row.AddStretchSpacer()
-        default_btn = self._add_buttons(btn_row, buttons)
+        default_btn = self._add_buttons(btn_row, buttons, btn_labels)
         outer.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, _SP_LG)
 
         self.SetSizer(outer)
-        # Width floor only -- height comes from Fit(). Kept just wide enough to
-        # keep the title bar and action row from cramping; anything larger only
-        # padded short messages ("Export cancelled.") out with dead space.
         self.SetMinSize((_MSG_MIN_WIDTH, -1))
         self.Fit()
         if parent:
@@ -1237,18 +1954,26 @@ class _KiForgeMessageDialog(wx.Dialog):
             self.Centre()
         wx.CallAfter(default_btn.SetFocus)
 
-    def _add_buttons(self, btn_row: wx.BoxSizer, buttons: str) -> "_FlatButton":
+    def _add_buttons(
+        self,
+        btn_row: wx.BoxSizer,
+        buttons: str,
+        btn_labels: tuple[str, ...] | None = None,
+    ) -> "_FlatButton":
         """Populate the action button row based on buttons configuration."""
         if buttons == "yes_no":
-            btn_no = _FlatButton(self, "No", min_width=80)
+            label_no = btn_labels[0] if (btn_labels and len(btn_labels) > 0) else "No"
+            label_yes = btn_labels[1] if (btn_labels and len(btn_labels) > 1) else "Yes"
+            btn_no = _FlatButton(self, label_no, min_width=72)
             btn_no.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_NO))
             btn_row.Add(btn_no, 0, wx.RIGHT, _SP_SM)
-            btn_yes = _FlatButton(self, "Yes", primary=True, min_width=80)
+            btn_yes = _FlatButton(self, label_yes, primary=True, min_width=72)
             btn_yes.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_YES))
             btn_row.Add(btn_yes, 0)
             self.Bind(wx.EVT_CLOSE, lambda e: self.EndModal(wx.ID_NO))
             return btn_yes
-        btn_ok = _FlatButton(self, "OK", primary=True, min_width=80)
+        label_ok = btn_labels[0] if (btn_labels and len(btn_labels) > 0) else "OK"
+        btn_ok = _FlatButton(self, label_ok, primary=True, min_width=72)
         btn_ok.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_OK))
         btn_row.Add(btn_ok, 0)
         self.Bind(wx.EVT_CLOSE, lambda e: self.EndModal(wx.ID_OK))
@@ -1261,6 +1986,7 @@ def _message_box(
     style: int = wx.OK | wx.ICON_INFORMATION,
     parent=None,
     kind: str | None = None,
+    btn_labels: tuple[str, ...] | None = None,
 ) -> int:
     """
     Themed drop-in for ``wx.MessageBox`` matching Studio's dark UI.
@@ -1282,7 +2008,7 @@ def _message_box(
         else:
             kind = "info"
     buttons = "yes_no" if (style & wx.YES_NO) else "ok"
-    dlg = _KiForgeMessageDialog(parent, message, caption, kind, buttons)
+    dlg = _KiForgeMessageDialog(parent, message, caption, kind, buttons, btn_labels=btn_labels)
     try:
         return dlg.ShowModal()
     finally:
@@ -1514,6 +2240,17 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.Bind(wx.EVT_TIMER, self._poll_export_progress, self._export_timer)
         self.Bind(wx.EVT_CLOSE, self.on_window_close)
         self._check_dependencies_async()
+        wx.CallAfter(self._set_initial_focus)
+
+    def _set_initial_focus(self):
+        """Place initial focus on the export action button or container to prevent highlighting the first checkbox."""
+        try:
+            if hasattr(self, "btn_export") and self.btn_export.IsEnabled():
+                self.btn_export.SetFocus()
+            elif hasattr(self, "notebook") and self.notebook:
+                self.notebook.SetFocus()
+        except Exception:
+            pass
 
     def _check_dependencies_async(self):
         """Check and install missing PDF renderer dependencies (Pillow) in the background."""
@@ -1583,18 +2320,65 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
 
         self.Bind(wx.EVT_SIZE, self._on_dialog_resize)
         self.Bind(wx.EVT_SIZING, self._on_dialog_sizing)
-        self._cd_sync_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.on_cd_sync_timer, self._cd_sync_timer)
-        self._bind_live_cd_sync_handlers()
+        self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_notebook_page_changed)
         self._attach_tab_icons()
 
+    def _on_notebook_page_changed(self, event=None):
+        """Ensure the newly selected notebook page recalculates its layout."""
+        if event is not None and hasattr(event, "Skip"):
+            event.Skip()
+        if hasattr(self, "notebook") and self.notebook:
+            page = self.notebook.GetCurrentPage()
+            if page:
+                page.Layout()
+
     def _on_system_colour_changed(self, event):
-        """Re-resolve the palette and repaint when the OS theme flips live."""
-        refresh_palette()
+        """Re-resolve the palette and repaint when the OS/KiCad theme flips live."""
+        self.apply_theme()
+        event.Skip()
+
+    def apply_theme(self):
+        """Recursively update background/foreground colors and redraw the dialog tree."""
+        refresh_palette(self.GetParent())
         self.SetBackgroundColour(_COLORS["app_bg"])
+        if hasattr(self, "notebook") and self.notebook:
+            self.notebook.SetBackgroundColour(_COLORS["app_bg"])
+            try:
+                self.notebook.SetForegroundColour(_COLORS["text"])
+            except Exception:
+                pass
+        self._apply_theme_to_tree(self)
         self._apply_notebook_icons()
         self.Refresh()
-        event.Skip()
+        self.Update()
+
+    def _apply_theme_to_tree(self, window: wx.Window):
+        """Recursively propagate active palette colors to all child controls."""
+        if not window:
+            return
+        for child in window.GetChildren():
+            if isinstance(child, wx.TextCtrl):
+                self._style_input(child)
+            elif isinstance(child, wx.StaticText):
+                fg = child.GetForegroundColour()
+                is_muted = fg in (_DARK_PALETTE["muted"], _LIGHT_PALETTE["muted"])
+                child.SetForegroundColour(_COLORS["muted"] if is_muted else _COLORS["text"])
+            elif isinstance(child, (_FlatChoice, _FlatButton, _FlatCheckBox, _FlatRadioButton)):
+                child.SetBackgroundColour(_hal_resolve_bg(child))
+                child.Refresh()
+            elif isinstance(child, (wx.ScrolledWindow, wx.Panel)):
+                bg = child.GetBackgroundColour()
+                if bg in (_DARK_PALETTE["surface"], _LIGHT_PALETTE["surface"]):
+                    child.SetBackgroundColour(_COLORS["surface"])
+                elif bg in (_DARK_PALETTE["footer_bg"], _LIGHT_PALETTE["footer_bg"]):
+                    child.SetBackgroundColour(_COLORS["footer_bg"])
+                else:
+                    child.SetBackgroundColour(_COLORS["app_bg"])
+                self._apply_theme_to_tree(child)
+                child.Refresh()
+            else:
+                self._apply_theme_to_tree(child)
+                child.Refresh()
 
     def _attach_tab_icons(self):
         """
@@ -1760,7 +2544,9 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         sizer = wx.BoxSizer(wx.VERTICAL)
         inset = wx.LEFT | wx.RIGHT
 
-        sizer.Add(self._section_label(scroll, "Project"), 0, inset | wx.TOP, _SP_SM)
+        sizer.AddSpacer(_SP_SM)
+        sizer.Add(self._section_label(scroll, "Project"), 0, inset, _SP_SM)
+        sizer.AddSpacer(_SP_XS)
         row = wx.BoxSizer(wx.HORIZONTAL)
         self.txt_project_dir = wx.TextCtrl(scroll)
         self._style_input(self.txt_project_dir)
@@ -1772,24 +2558,28 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         row.Add(self.txt_project_dir, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, _SP_SM)
         row.Add(btn_browse, 0, wx.ALIGN_CENTER_VERTICAL)
         sizer.Add(row, 0, wx.EXPAND | inset, _SP_SM)
-        sizer.AddSpacer(_SP_SM)
+        sizer.AddSpacer(_SP_MD)
 
-        sizer.Add(self._section_label(scroll, "Output folder"), 0, inset, 0)
+        sizer.Add(self._section_label(scroll, "Output folder"), 0, inset, _SP_SM)
+        sizer.AddSpacer(_SP_XS)
         self.txt_output_dir = wx.TextCtrl(scroll)
         self._style_input(self.txt_output_dir)
         self.txt_output_dir.SetValue(self.settings.get("output_dir", "kiforge"))
-        sizer.Add(self.txt_output_dir, 0, wx.EXPAND | inset | wx.TOP, _SP_SM)
+        sizer.Add(self.txt_output_dir, 0, wx.EXPAND | inset, _SP_SM)
         sizer.AddSpacer(_SP_LG)
 
-        sizer.Add(self._section_label(scroll, "Preset"), 0, inset, 0)
+        sizer.Add(self._section_label(scroll, "Preset"), 0, inset, _SP_SM)
+        sizer.AddSpacer(_SP_SM)
         self._preset_radios = []
         for label in EXPORT_PRESET_RADIO_LABELS:
             # Appends itself to self._preset_radios and joins that group for
             # mutual exclusivity -- see _FlatRadioButton's group parameter.
             rb = _FlatRadioButton(scroll, label=label, group=self._preset_radios)
             rb.Bind(wx.EVT_RADIOBUTTON, self.on_preset_changed)
-            sizer.Add(rb, 0, inset | wx.TOP, _SP_XS)
+            sizer.Add(rb, 0, inset, _SP_SM)
+            sizer.AddSpacer(_SP_XS)
 
+        sizer.AddSpacer(_SP_XS)
         self.lbl_export_summary = wx.StaticText(scroll, label="")
         # Never let this label dictate the layout's width: a StaticText reports
         # its full unwrapped text as its minimum size, and the summary is long.
@@ -1803,7 +2593,8 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         # dictating the layout's width, but without EXPAND the sizer would
         # then hand it exactly that min size and the text would render into
         # a few pixels.
-        sizer.Add(self.lbl_export_summary, 0, wx.EXPAND | inset | wx.TOP, _SP_SM)
+        sizer.Add(self.lbl_export_summary, 0, wx.EXPAND | inset, _SP_SM)
+        sizer.AddSpacer(_SP_MD)
 
         scroll.SetSizer(sizer)
         scroll.FitInside()
@@ -1840,9 +2631,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         mfg_col.AddSpacer(_SP_SM)
         side_row = wx.BoxSizer(wx.HORIZONTAL)
         side_row.Add(self._muted_label(scroll, "Placement side"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, _SP_SM)
-        self.choice_pos_side = wx.Choice(scroll, choices=["Both", "Front", "Back"])
-        self.choice_pos_side.SetBackgroundColour(_COLORS["input_bg"])
-        self.choice_pos_side.SetForegroundColour(_COLORS["input_fg"])
+        self.choice_pos_side = _FlatChoice(scroll, choices=["Both", "Front", "Back"])
         side_row.Add(self.choice_pos_side, 1, wx.EXPAND)
         mfg_col.Add(side_row, 0, wx.EXPAND | wx.TOP, _SP_XS)
         self.chk_pos_smd_only = _FlatCheckBox(scroll, label="SMD only")
@@ -1890,29 +2679,36 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
     def _build_releases_tab(self):
         """Build the Continuous Delivery tab with workflow options."""
         page = wx.Panel(self.notebook)
+        self._cd_page = page
         self._style_panel(page, surface=False)
         sizer = wx.BoxSizer(wx.VERTICAL)
         inset = wx.LEFT | wx.RIGHT | wx.TOP
 
-        sizer.Add(self._section_label(page, "Releases"), 0, inset, _SP_SM)
-        btn_generate_cd = _FlatButton(page, "Set up workflows", primary=True, min_width=160)
-        btn_generate_cd.Bind(wx.EVT_BUTTON, self.on_generate_cd)
-        sizer.Add(btn_generate_cd, 0, inset | wx.TOP, _SP_SM)
-
-        self.chk_generate_cd = _FlatCheckBox(page, label="Sync with export settings")
-        sizer.Add(self.chk_generate_cd, 0, inset | wx.TOP, _SP_SM)
+        sizer.Add(self._section_label(page, "Continuous Delivery"), 0, inset, _SP_MD)
 
         self.lbl_cd_sync_status = wx.StaticText(page, label="")
-        self._style_text(self.lbl_cd_sync_status, muted=True)
+        self._style_text(self.lbl_cd_sync_status)
         self._clear_focus_on_background_click(self.lbl_cd_sync_status, page)
         sizer.Add(self.lbl_cd_sync_status, 0, inset | wx.TOP, _SP_SM)
 
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_generate_cd = _FlatButton(page, "Set up workflows", primary=True, min_width=160)
+        self.btn_generate_cd.Bind(wx.EVT_BUTTON, self.on_generate_cd)
+        btn_row.Add(self.btn_generate_cd, 0, wx.RIGHT, _SP_SM)
+
+        self.btn_unlock_cd = _FlatButton(page, "", min_width=32, icon_kind="lock")
+        self.btn_unlock_cd.Bind(wx.EVT_BUTTON, self.on_unlock_cd_workflows)
+        btn_row.Add(self.btn_unlock_cd, 0)
+        sizer.Add(btn_row, 0, inset | wx.TOP, _SP_MD)
+
         page.SetSizer(sizer)
         self.notebook.AddPage(page, "Releases")
+        self._refresh_cd_workflow_status()
 
     def _build_footer_panel(self):
         """Build the bottom action bar with summary text and export button."""
         footer = wx.Panel(self)
+        self.footer = footer
         footer.SetBackgroundColour(_COLORS["footer_bg"])
         self._clear_focus_on_background_click(footer)
         sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -1920,16 +2716,22 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         btn_save = _FlatButton(footer, "Save", min_width=64)
         btn_save.Bind(wx.EVT_BUTTON, self.on_settings_menu)
 
+        self.lbl_status_toast = wx.StaticText(footer, label="")
+        self.lbl_status_toast.SetForegroundColour(_COLORS["text"])
+        self._clear_focus_on_background_click(self.lbl_status_toast, footer)
+
         self.btn_export = _FlatButton(footer, "Export", primary=True, min_width=72)
         self.btn_export.Bind(wx.EVT_BUTTON, self.on_run_export)
 
         btn_close = _FlatButton(footer, "Close", min_width=64)
         btn_close.Bind(wx.EVT_BUTTON, self.on_close)
 
-        sizer.Add(btn_save, 0, wx.ALL, _SP_SM)
+        sizer.Add(btn_save, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, _SP_SM)
+        sizer.AddSpacer(_SP_MD)
+        sizer.Add(self.lbl_status_toast, 0, wx.ALIGN_CENTER_VERTICAL)
         sizer.AddStretchSpacer()
-        sizer.Add(self.btn_export, 0, wx.ALL, _SP_SM)
-        sizer.Add(btn_close, 0, wx.ALL, _SP_SM)
+        sizer.Add(self.btn_export, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, _SP_SM)
+        sizer.Add(btn_close, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, _SP_SM)
         footer.SetSizer(sizer)
         return footer
 
@@ -2016,7 +2818,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self._sync_svg_pdf_checkbox_state()
             self._sync_file_availability_state()
             self._update_export_summary()
-            self._schedule_cd_sync()
         finally:
             self._applying_preset = False
 
@@ -2180,44 +2981,86 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self._on_dialog_resize(None)
         self.Layout()
 
-    def _bind_live_cd_sync_handlers(self):
-        """Regenerate CD YAML when export toggles change (debounced)."""
-        self.chk_generate_cd.Bind(wx.EVT_CHECKBOX, self.on_export_setting_changed)
-        self.txt_output_dir.Bind(wx.EVT_TEXT, self.on_export_setting_changed)
-
-    def on_export_setting_changed(self, event):
-        """Handle export toggle changes, update summary, and trigger debounced CD sync."""
+    def on_export_setting_changed(self, event=None):
+        """Update export parameters when toggles change."""
         if event is not None and hasattr(event, "Skip"):
             event.Skip()
         if self._initializing:
             return
         self.settings["export_params"] = self._collect_export_params()
-        self._schedule_cd_sync()
 
-    def _schedule_cd_sync(self):
-        """Start debounced timer to regenerate CD workflow files."""
-        if hasattr(self, "_cd_sync_timer"):
-            self._cd_sync_timer.Start(500, oneShot=True)
+    def _has_existing_cd_workflows(self) -> bool:
+        """Return True if release workflow files exist in the project directory."""
+        project_dir = self.txt_project_dir.GetValue().strip() if hasattr(self, "txt_project_dir") else ""
+        if not project_dir or not os.path.isdir(project_dir):
+            return False
+        gh_yml = os.path.join(project_dir, ".github", "workflows", "release.yml")
+        gt_yml = os.path.join(project_dir, ".gitea", "workflows", "release.yml")
+        return os.path.isfile(gh_yml) or os.path.isfile(gt_yml)
 
-    def on_cd_sync_timer(self, event):
-        """Execute silent CD workflow synchronization on timer expiry."""
-        self._sync_cd_workflows_silent()
-
-    def _sync_cd_workflows_silent(self):
-        """Silently write updated release workflow files if project and CD toggle are active."""
-        # Future: skip auto-regeneration once CD files exist (mid-project lifecycle).
-        if not self.chk_generate_cd.IsChecked():
+    def _refresh_cd_workflow_status(self):
+        """Update Releases tab UI state based on whether workflows exist."""
+        if not hasattr(self, "lbl_cd_sync_status") or not self.lbl_cd_sync_status:
             return
-        project_dir = self.txt_project_dir.GetValue().strip()
-        output_dir_name = self.txt_output_dir.GetValue().strip()
-        if not project_dir or not os.path.isdir(project_dir) or not output_dir_name:
+        exists = self._has_existing_cd_workflows()
+        self._cd_unlocked = getattr(self, "_cd_unlocked", False)
+        if exists:
+            if hasattr(self, "btn_generate_cd"):
+                self.btn_generate_cd.SetLabel("Overwrite workflows")
+            if self._cd_unlocked:
+                self.lbl_cd_sync_status.SetLabel("Workflows configured [Unlocked]")
+                self.lbl_cd_sync_status.SetForegroundColour(_COLORS["text"])
+                if hasattr(self, "btn_generate_cd"):
+                    self.btn_generate_cd.Enable(True)
+                if hasattr(self, "btn_unlock_cd"):
+                    self.btn_unlock_cd.SetIcon("unlock")
+                    self.btn_unlock_cd.Show(True)
+            else:
+                self.lbl_cd_sync_status.SetLabel("Workflows configured [Locked]")
+                self.lbl_cd_sync_status.SetForegroundColour(_COLORS["text"])
+                if hasattr(self, "btn_generate_cd"):
+                    self.btn_generate_cd.Enable(False)
+                if hasattr(self, "btn_unlock_cd"):
+                    self.btn_unlock_cd.SetIcon("lock")
+                    self.btn_unlock_cd.Show(True)
+        else:
+            self.lbl_cd_sync_status.SetLabel("No release workflows configured for this project.")
+            self.lbl_cd_sync_status.SetForegroundColour(_COLORS["muted"])
+            if hasattr(self, "btn_generate_cd"):
+                self.btn_generate_cd.SetLabel("Set up workflows")
+                self.btn_generate_cd.Enable(True)
+            if hasattr(self, "btn_unlock_cd"):
+                self.btn_unlock_cd.Show(False)
+        if hasattr(self, "_cd_page") and self._cd_page:
+            self._cd_page.Layout()
+        if hasattr(self, "notebook") and self.notebook:
+            self.notebook.Layout()
+
+    def on_unlock_cd_workflows(self, event=None):
+        """Toggle the locked/unlocked state of CD workflows."""
+        self._cd_unlocked = not getattr(self, "_cd_unlocked", False)
+        self._refresh_cd_workflow_status()
+
+    def _show_status_message(self, message: str, is_error: bool = False):
+        """Display non-modal status update in the footer with auto-clearing timer."""
+        if not hasattr(self, "lbl_status_toast") or not self.lbl_status_toast:
             return
-        try:
-            _, success = kiforge.generate_cd_files(project_dir, output_dir_name, self._export_options())
-            if success:
-                self.lbl_cd_sync_status.SetLabel("CD workflow files synced with current selections.")
-        except Exception as exc:
-            self.lbl_cd_sync_status.SetLabel(f"CD sync failed: {exc}")
+        colour = _COLORS["error"] if is_error else _COLORS["accent"]
+        self.lbl_status_toast.SetForegroundColour(colour)
+        self.lbl_status_toast.SetLabel(message)
+        if hasattr(self, "footer") and self.footer:
+            self.footer.Layout()
+        if not hasattr(self, "_status_toast_timer") or self._status_toast_timer is None:
+            self._status_toast_timer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, self._on_status_toast_timer, self._status_toast_timer)
+        self._status_toast_timer.Start(3500, oneShot=True)
+
+    def _on_status_toast_timer(self, event=None):
+        """Clear the status toast label."""
+        if hasattr(self, "lbl_status_toast") and self.lbl_status_toast:
+            self.lbl_status_toast.SetLabel("")
+            if hasattr(self, "footer") and self.footer:
+                self.footer.Layout()
 
     def _export_setting(self, key, default=None):
         """Read an export toggle from flat settings or nested exports dict."""
@@ -2252,9 +3095,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.chk_svg.SetValue(self._export_setting('export_svg'))
         self.chk_homebrew_pdf.SetValue(self._export_setting('export_homebrew_pdf'))
         self.txt_output_dir.SetValue(self.settings.get('output_dir', 'kiforge'))
-        self.chk_generate_cd.SetValue(
-            self._export_setting('generate_cd', True)
-        )
         self._set_preset_choice(self._detect_active_preset())
         self._sync_drill_checkbox_state()
         self._sync_svg_pdf_checkbox_state()
@@ -2319,7 +3159,6 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             'export_svg': self.chk_svg.IsChecked(),
             'export_homebrew_pdf': self.chk_homebrew_pdf.IsChecked(),
             'format_jlc': self._export_setting('format_jlc'),
-            'generate_cd': self.chk_generate_cd.IsChecked(),
         }
         return {
             'output_dir': self.txt_output_dir.GetValue().strip(),
@@ -2509,6 +3348,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 self.pcb_file = None
             self._reload_settings(project_dir)
             self._settings_project_dir = project_dir
+            self._refresh_cd_workflow_status()
 
     def on_browse(self, event):
         """Triggered by the 'Browse...' button to select a project root directory."""
@@ -2530,6 +3370,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 self.pcb_file = None
             self._reload_settings(chosen_dir)
             self._settings_project_dir = chosen_dir
+            self._refresh_cd_workflow_status()
         dlg.Destroy()
 
     def on_load_global_defaults(self, event):
@@ -2543,7 +3384,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.settings["exports"] = kiforge.DEFAULT_EXPORT_SETTINGS.copy()
         self.settings["export_params"] = kiforge.DEFAULT_EXPORT_PARAMS.copy()
         self.update_ui_from_settings()
-        _message_box("Dialog reset to built-in defaults.", "Reset", wx.OK | wx.ICON_INFORMATION)
+        self._show_status_message("Settings reset to built-in defaults.")
 
     def _export_options(self):
         """Build export and CD option flags from the current dialog state."""
@@ -2556,15 +3397,15 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         """Save current selections to the project .kiforge.json file."""
         project_dir = self.txt_project_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir):
-            _message_box("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
+            _message_box("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR, parent=self)
             return
         try:
             curr = self._current_settings()
             kiforge.save_settings(curr, project_dir=project_dir, scope="project")
             self.settings = curr
-            _message_box("Project defaults saved.", "Config Saved", wx.OK | wx.ICON_INFORMATION)
+            self._show_status_message("Project defaults saved.")
         except Exception as e:
-            _message_box(f"Failed to save project settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
+            _message_box(f"Failed to save project settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR, parent=self)
 
     def on_save_global_defaults(self, event):
         """Save current selections to the user-wide KiForge settings file."""
@@ -2572,27 +3413,41 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             curr = self._current_settings()
             kiforge.save_settings(curr, scope="global")
             self.settings = curr
-            _message_box("Global defaults saved.", "Config Saved", wx.OK | wx.ICON_INFORMATION)
+            self._show_status_message("Global defaults saved.")
         except Exception as e:
-            _message_box(f"Failed to save global settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR)
+            _message_box(f"Failed to save global settings:\n{e}", "Error", wx.OK | wx.ICON_ERROR, parent=self)
 
     def on_generate_cd(self, event):
         """Generate CD workflow YAML and update .gitignore from current selections."""
         project_dir = self.txt_project_dir.GetValue().strip()
         if not project_dir or not os.path.isdir(project_dir):
-            _message_box("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR)
+            _message_box("Please select a valid KiCad project directory first.", "Error", wx.OK | wx.ICON_ERROR, parent=self)
             return
 
         output_dir_name = self.txt_output_dir.GetValue().strip()
         if not output_dir_name:
-            _message_box("Please specify a valid output directory name.", "Error", wx.OK | wx.ICON_ERROR)
+            _message_box("Please specify a valid output directory name.", "Error", wx.OK | wx.ICON_ERROR, parent=self)
             return
 
-        msg, success = kiforge.generate_cd_files(project_dir, output_dir_name, self._export_options())
+        if self._has_existing_cd_workflows() and not getattr(event, "_skip_confirm", False):
+            resp = _message_box(
+                "Overwrite existing workflows with the current export selections?",
+                "Update Workflows?",
+                wx.YES_NO | wx.ICON_QUESTION,
+                parent=self,
+                btn_labels=("Cancel", "Update"),
+            )
+            if resp != wx.ID_YES:
+                return
+
+        cd_options = self._export_options()
+        msg, success = kiforge.generate_cd_files(project_dir, output_dir_name, cd_options)
         if success:
-            _message_box(msg, "CD Files Generated", wx.OK | wx.ICON_INFORMATION)
+            self._cd_unlocked = False
+            self._refresh_cd_workflow_status()
+            self._show_status_message("Release workflows updated.")
         else:
-            _message_box(msg, "Error", wx.OK | wx.ICON_ERROR)
+            _message_box(msg, "Error", wx.OK | wx.ICON_ERROR, parent=self)
 
     def on_run_export(self, event):
         """
@@ -2798,6 +3653,11 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         state = self._export_state
         context = self._export_context
         project_dir = self._export_project_dir
+        if context and hasattr(context, "temp_gerber_dir") and context.temp_gerber_dir and os.path.isdir(context.temp_gerber_dir):
+            try:
+                shutil.rmtree(context.temp_gerber_dir)
+            except Exception:
+                pass
         self._export_running = False
         self._stop_export_timer()
         self._export_thread = None
@@ -2967,7 +3827,14 @@ class ExporterPlugin(_PluginBase):
 
         dialog = None
         try:
-            dialog = KiForgeStudioSettingsDialog(parent_window, project_dir, board_file=board_file)
+            import importlib
+            mod_name = __name__
+            if mod_name in sys.modules:
+                mod = importlib.reload(sys.modules[mod_name])
+                DlgClass = getattr(mod, "KiForgeStudioSettingsDialog", KiForgeStudioSettingsDialog)
+            else:
+                DlgClass = KiForgeStudioSettingsDialog
+            dialog = DlgClass(parent_window, project_dir, board_file=board_file)
             dialog.ShowModal()
         except Exception as exc:
             logger.exception("KiForge Studio dialog failed to open.")
