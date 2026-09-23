@@ -75,7 +75,7 @@ All inputs use **kebab-case**, matching CLI flags 1:1.
 | `pos-exclude-dnp` | Placement CSV: exclude DNP parts | `'true'` |
 | `step-subst-models` | STEP export: substitute missing 3D models | `'true'` |
 | `bom-include-mfr-mpn` | BOM/iBOM: include Manufacturer & MPN columns | `'true'` |
-| `version` | Override version suffix for output filenames | _(auto from Git tag)_ |
+| `version-tag` | Override version suffix for output filenames | _(auto from Git tag)_ |
 | `kicad-version` | KiCad Docker image version | `'10.0'` |
 
 > **Export parameters:** The `pos-*`, `step-*`, and `bom-*` inputs map to `export_params` in `.kiforge.json`. Gerber/drill layers and 3D render quality are fixed (`GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`, `RENDER_3D_DEFAULTS`). BOM fields and iBOM grouping mirror `BOM_EXPORT_DEFAULTS` (with Manufacturer and MPN columns toggled on/off dynamically via the `bom-include-mfr-mpn` flag). Raw `*_bom.csv` includes `ID` and `MPN`; JLC copies are produced by `JLCPCBFormatter` when `format-jlc` is on.
