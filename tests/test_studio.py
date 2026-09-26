@@ -1069,13 +1069,17 @@ class TestKiForgeStudio(unittest.TestCase):
         finally:
             progress.Destroy()
 
-    def test_notebook_tabs_use_clean_native_text(self):
-        """Notebook tabs must use clean, native text labels without fragile ImageLists."""
+    def test_notebook_tabs_configuration(self):
+        """Notebook tabs must have labels and pre-allocated ImageList for GTK/native display."""
         dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
         try:
             labels = [dialog.notebook.GetPageText(i) for i in range(dialog.notebook.GetPageCount())]
             self.assertEqual(labels, ["Export", "Advanced", "Releases"])
-            self.assertIsNone(dialog.notebook.GetImageList())
+            image_list = dialog.notebook.GetImageList()
+            self.assertIsNotNone(image_list)
+            self.assertEqual(image_list.GetImageCount(), 3)
+            for i in range(dialog.notebook.GetPageCount()):
+                self.assertEqual(dialog.notebook.GetPageImage(i), i)
         finally:
             dialog.Destroy()
 

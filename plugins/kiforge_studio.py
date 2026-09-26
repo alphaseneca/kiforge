@@ -2119,11 +2119,10 @@ _TAB_ICON_RASTER_SIZE = 48
 _tab_icon_bitmap_cache: dict[tuple[str, int, str], wx.Bitmap] = {}
 
 
-def _load_tab_icon_bitmap(name: str, size: int = 20) -> wx.Bitmap | None:
+def _load_tab_icon_bitmap(name: str, size: int = 18, tint: str | None = None) -> wx.Bitmap | None:
     """Rasterize a bundled Material Symbol for notebook tabs, tinted for the theme."""
-    # The tint is part of the key: a near-white glyph cached under dark mode is
-    # invisible once the palette flips to light.
-    tint = _TAB_ICON_TINTS[active_palette_mode()]
+    if tint is None:
+        tint = _TAB_ICON_TINTS[active_palette_mode()]
     cache_key = (name, size, tint)
     if cache_key in _tab_icon_bitmap_cache:
         cached_bmp = _tab_icon_bitmap_cache[cache_key]
@@ -2336,19 +2335,20 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         main_sizer = wx.BoxSizer(wx.VERTICAL)
         main_sizer.Add(self._build_header_panel(), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, _SP_LG)
         main_sizer.Add(self._separator(self), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, _SP_LG)
-
+        main_sizer.AddSpacer(_SP_SM)
         self.notebook = wx.Notebook(self, style=wx.BK_DEFAULT)
         self.notebook.SetBackgroundColour(_COLORS["app_bg"])
         try:
             self.notebook.SetForegroundColour(_COLORS["text"])
         except Exception:
             pass
+        self._init_notebook_image_list()
         self._build_export_tab()
         self._build_advanced_tab()
         self._build_releases_tab()
         self._apply_notebook_icons()
         main_sizer.Add(self.notebook, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, _SP_LG)
-        main_sizer.AddSpacer(_SP_SM)
+        main_sizer.AddSpacer(_SP_LG)
         main_sizer.Add(self._build_footer_panel(), 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, _SP_LG)
 
         self.SetSizer(main_sizer)
@@ -2417,16 +2417,31 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 self._apply_theme_to_tree(child)
                 child.Refresh()
 
+    def _init_notebook_image_list(self):
+        """Pre-allocate notebook ImageList with tab icons before adding pages for GTK safety."""
+        display_size = 18
+        bitmaps = [_load_tab_icon_bitmap(name, display_size) for name in _TAB_ICON_NAMES]
+        if all(bmp and bmp.IsOk() for bmp in bitmaps):
+            image_list = wx.ImageList(display_size, display_size)
+            for bmp in bitmaps:
+                image_list.Add(bmp)
+            self.notebook.AssignImageList(image_list)
+
     def _attach_tab_icons(self):
         """Configure notebook tabs for native desktop display."""
         self._apply_notebook_icons()
 
     def _apply_notebook_icons(self):
-        """Configure clean text tabs adhering to KiCad and desktop HIG standards."""
-        labels = ("Export", "Advanced", "Releases")
-        for index, label in enumerate(labels):
-            if index < self.notebook.GetPageCount():
-                self.notebook.SetPageText(index, label)
+        """Update tab icon bitmaps in the existing ImageList on theme changes."""
+        image_list = self.notebook.GetImageList()
+        if image_list:
+            display_size = 18
+            bitmaps = [_load_tab_icon_bitmap(name, display_size) for name in _TAB_ICON_NAMES]
+            for index, bmp in enumerate(bitmaps):
+                if bmp and bmp.IsOk() and index < image_list.GetImageCount():
+                    image_list.Replace(index, bmp)
+                if index < self.notebook.GetPageCount():
+                    self.notebook.SetPageImage(index, index)
 
     def _bind_keyboard_shortcuts(self):
         """Bind Ctrl+1/2/3 tab switching and Enter export shortcut."""
@@ -2602,13 +2617,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         # then hand it exactly that min size and the text would render into
         # a few pixels.
         sizer.Add(self.lbl_export_summary, 0, wx.EXPAND | inset, _SP_SM)
-        sizer.AddSpacer(_SP_MD)
+        sizer.AddSpacer(_SP_LG)
 
         scroll.SetSizer(sizer)
         scroll.FitInside()
         page.SetSizer(wx.BoxSizer(wx.VERTICAL))
         page.GetSizer().Add(scroll, 1, wx.EXPAND)
-        self.notebook.AddPage(page, "Export")
+        self.notebook.AddPage(page, "Export", imageId=0)
 
     def _build_advanced_tab(self):
         """Build the Advanced tab containing positioning and 3D model settings."""
@@ -2682,7 +2697,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         scroll.FitInside()
         page.SetSizer(wx.BoxSizer(wx.VERTICAL))
         page.GetSizer().Add(scroll, 1, wx.EXPAND)
-        self.notebook.AddPage(page, "Advanced")
+        self.notebook.AddPage(page, "Advanced", imageId=1)
 
     def _build_releases_tab(self):
         """Build the Continuous Delivery tab with workflow options."""
@@ -2708,9 +2723,10 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         self.btn_unlock_cd.Bind(wx.EVT_BUTTON, self.on_unlock_cd_workflows)
         btn_row.Add(self.btn_unlock_cd, 0)
         sizer.Add(btn_row, 0, inset | wx.TOP, _SP_MD)
+        sizer.AddSpacer(_SP_LG)
 
         page.SetSizer(sizer)
-        self.notebook.AddPage(page, "Releases")
+        self.notebook.AddPage(page, "Releases", imageId=2)
         self._refresh_cd_workflow_status()
 
     def _build_footer_panel(self):
@@ -2968,7 +2984,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         # banner, tab strip, footer and the window borders.
         page_height = self.notebook.GetPage(0).GetClientSize().height
         chrome = max(0, self.GetSize().height - page_height)
-        return content + chrome
+        return content + chrome + _SP_XS
 
     def _fit_dialog_to_screen(self):
         """Constrain dialog dimensions to fit comfortably within display bounds."""
