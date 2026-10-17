@@ -137,7 +137,7 @@ sample_v0.1.2_bom.csv      # Reference, Value, Footprint, Description, ${QUANTIT
 sample_v0.1.2_pos.csv      # Ref, Val, Package, PosX, PosY, Rot, Side
 sample_v0.1.2_bom_jlc.csv  # Comment, Designator, Footprint, LCSC Part #, Quantity
 sample_v0.1.2_cpl_jlc.csv  # Designator, Mid X, Mid Y, Rotation, Layer
-sample_v0.1.2_gerbers.zip  # JLC manufacturing layers + Dwgs.User + Cmts.User
+sample_v0.1.2_gerbers.zip  # JLC manufacturing layers (copper, paste, silk, mask, edge cuts)
 ```
 
 `JlcFormatTask` / `JLCPCBFormatter` produce JLC copies from the raw CSVs when `format_jlc` is enabled. `ID` values matching `^C\d+$` populate `LCSC Part #`.

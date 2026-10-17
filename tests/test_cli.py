@@ -12,6 +12,7 @@ import os
 import subprocess
 import shutil
 import tempfile
+import json
 
 # Add root directory to sys.path to import kiforge
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -504,11 +505,104 @@ class TestKiForgeCLI(unittest.TestCase):
                 "F.Cu", "B.Cu",
                 "F.Paste", "B.Paste", "F.SilkS", "B.SilkS",
                 "F.Mask", "B.Mask", "Edge.Cuts",
-                "Dwgs.User", "Cmts.User",
             ],
         )
+        self.assertNotIn("Dwgs.User", layers)
+        self.assertNotIn("Cmts.User", layers)
         self.assertNotIn("F.Fab", layers)
         self.assertNotIn("User.1", layers)
+
+    def test_resolve_jlc_gerber_layers_four_layer_board_with_power_planes(self):
+        """JLC gerber export includes inner copper layers in stack order even when defined as power planes."""
+        pcb_content = """(kicad_pcb
+	(version 20260206)
+	(layers
+		(0 "F.Cu" signal)
+		(1 "In1.Cu" power "GND")
+		(2 "In2.Cu" power "VCC")
+		(31 "B.Cu" signal)
+		(13 "F.Paste" user)
+		(15 "B.Paste" user)
+		(5 "F.SilkS" user "F.Silkscreen")
+		(7 "B.SilkS" user "B.Silkscreen")
+		(1 "F.Mask" user)
+		(3 "B.Mask" user)
+		(25 "Edge.Cuts" user)
+		(17 "Dwgs.User" user)
+	)
+)"""
+        with tempfile.NamedTemporaryFile("w", suffix=".kicad_pcb", delete=False) as f:
+            f.write(pcb_content)
+            temp_pcb = f.name
+        try:
+            layers = kiforge.resolve_jlc_gerber_layers(temp_pcb)
+            self.assertEqual(
+                layers,
+                [
+                    "F.Cu",
+                    "In1.Cu",
+                    "In2.Cu",
+                    "B.Cu",
+                    "F.Paste",
+                    "B.Paste",
+                    "F.SilkS",
+                    "B.SilkS",
+                    "F.Mask",
+                    "B.Mask",
+                    "Edge.Cuts",
+                ],
+            )
+            self.assertNotIn("Dwgs.User", layers)
+        finally:
+            if os.path.exists(temp_pcb):
+                os.remove(temp_pcb)
+
+    def test_resolve_jlc_gerber_layers_six_layer_board_mixed_stack(self):
+        """JLC gerber export preserves 6-layer inner order (1, 2, 3, 4) regardless of S-expression entry order."""
+        pcb_content = """(kicad_pcb
+	(version 20260206)
+	(layers
+		(0 "F.Cu" signal)
+		(3 "In3.Cu" signal "SIG2")
+		(1 "In1.Cu" power "GND")
+		(4 "In4.Cu" power "VCC")
+		(2 "In2.Cu" signal "SIG1")
+		(31 "B.Cu" signal)
+		(13 "F.Paste" user)
+		(15 "B.Paste" user)
+		(5 "F.SilkS" user)
+		(7 "B.SilkS" user)
+		(1 "F.Mask" user)
+		(3 "B.Mask" user)
+		(25 "Edge.Cuts" user)
+	)
+)"""
+        with tempfile.NamedTemporaryFile("w", suffix=".kicad_pcb", delete=False) as f:
+            f.write(pcb_content)
+            temp_pcb = f.name
+        try:
+            layers = kiforge.resolve_jlc_gerber_layers(temp_pcb)
+            self.assertEqual(
+                layers,
+                [
+                    "F.Cu",
+                    "In1.Cu",
+                    "In2.Cu",
+                    "In3.Cu",
+                    "In4.Cu",
+                    "B.Cu",
+                    "F.Paste",
+                    "B.Paste",
+                    "F.SilkS",
+                    "B.SilkS",
+                    "F.Mask",
+                    "B.Mask",
+                    "Edge.Cuts",
+                ],
+            )
+        finally:
+            if os.path.exists(temp_pcb):
+                os.remove(temp_pcb)
 
     def test_gerber_export_defaults(self):
         """Gerber export uses JLC manufacturing layers and zone refill."""
@@ -1587,6 +1681,27 @@ class TestKiForgeCLI(unittest.TestCase):
         ctx.kicad_python = sys.executable
         return ctx
 
+    def test_copper_svg_command_excludes_non_copper_and_user_layers(self):
+        """Copper SVG export command must plot only copper (F.Cu / B.Cu) and exclude user/drawing layers."""
+        ctx = MagicMock()
+        ctx.kicad_cli = "kicad-cli"
+        ctx.pcb_file = "board.kicad_pcb"
+        front_cmd = kiforge._copper_svg_command(ctx, "front", "front.svg", board_area_only=True)
+        back_cmd = kiforge._copper_svg_command(ctx, "back", "back.svg", board_area_only=True)
+
+        self.assertIn("-l", front_cmd)
+        front_layers = front_cmd[front_cmd.index("-l") + 1]
+        self.assertEqual(front_layers, "F.Cu")
+        self.assertNotIn("Edge.Cuts", front_cmd)
+        self.assertNotIn("--cl", front_cmd)
+        self.assertIn("--exclude-drawing-sheet", front_cmd)
+
+        self.assertIn("-l", back_cmd)
+        back_layers = back_cmd[back_cmd.index("-l") + 1]
+        self.assertEqual(back_layers, "B.Cu")
+        self.assertIn("-m", back_cmd)
+        self.assertNotIn("Edge.Cuts", back_cmd)
+
     def test_svg_export_task_stashes_context_for_homebrew_reuse(self):
         """SvgExportTask.run() must record its output on context.homebrew_layers for HomebrewPdfExportTask to reuse."""
         from unittest.mock import patch
@@ -2532,8 +2647,172 @@ Shape {
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_convert_wrl_to_step_gzip(self):
+        """convert_wrl_to_step must handle gzip-compressed VRML (.wrl) files."""
+        import gzip
+        sample_wrl = """#VRML V2.0 utf8
+Shape {
+    geometry IndexedFaceSet {
+        coord Coordinate {
+            point [ 0 0 0, 1 0 0, 1 1 0, 0 1 0 ]
+        }
+        coordIndex [ 0, 1, 2, -1, 0, 2, 3, -1 ]
+    }
+}
+""".encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wrl_file = os.path.join(tmp_dir, "compressed.wrl")
+            step_file = os.path.join(tmp_dir, "compressed.step")
+            with open(wrl_file, "wb") as f:
+                f.write(gzip.compress(sample_wrl))
+
+            ok = kiforge.convert_wrl_to_step(wrl_file, step_file)
+            self.assertTrue(ok)
+            self.assertTrue(os.path.isfile(step_file))
+            with open(step_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("FACETED_BREP", content)
+
+    def test_step3d_uses_existing_companion_step(self):
+        """Step3dExportTask must prioritize existing companion .step CAD model beside referenced .wrl."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wrl_path = os.path.join(tmp_dir, "resistor.wrl")
+            step_path = os.path.join(tmp_dir, "resistor.step")
+            with open(wrl_path, "w", encoding="utf-8") as f:
+                f.write("#VRML V2.0 utf8\n")
+            with open(step_path, "w", encoding="utf-8") as f:
+                f.write("ISO-10303-21; /* High fidelity CAD STEP */\n")
+
+            wrl_posix = wrl_path.replace("\\", "/")
+            pcb_path = os.path.join(tmp_dir, "test.kicad_pcb")
+            with open(pcb_path, "w", encoding="utf-8") as f:
+                f.write(f'(kicad_pcb (version 20240108) (footprint "R1" (model "{wrl_posix}")))')
+
+            ctx = self._make_export_context(tmp_dir)
+            ctx.pcb_file = pcb_path
+            ctx.project_dir = tmp_dir
+
+            task = kiforge.Step3dExportTask()
+            eff_pcb, temp_dir = task._prepare_wrl_models(ctx)
+            # Output dir 3dmodels should NOT have been generated because native companion STEP was used
+            converted_step = os.path.join(ctx.output_dir, "3dmodels", "resistor.step")
+            self.assertFalse(os.path.isfile(converted_step))
+
+            # Staged PCB must point to the companion STEP model
+            with open(eff_pcb, "r", encoding="utf-8") as f:
+                self.assertIn("resistor.step", f.read().replace("\\", "/"))
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_step3d_substitutes_missing_wrl_with_existing_step(self):
+        """When referenced .wrl is missing but companion .step exists, substitute the STEP file."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wrl_path = os.path.join(tmp_dir, "mcu.wrl")
+            step_path = os.path.join(tmp_dir, "mcu.step")
+            # Note: wrl_path is intentionally NOT created on disk
+            with open(step_path, "w", encoding="utf-8") as f:
+                f.write("ISO-10303-21;\n")
+
+            wrl_posix = wrl_path.replace("\\", "/")
+            pcb_path = os.path.join(tmp_dir, "test.kicad_pcb")
+            with open(pcb_path, "w", encoding="utf-8") as f:
+                f.write(f'(kicad_pcb (version 20240108) (footprint "U1" (model "{wrl_posix}")))')
+
+            ctx = self._make_export_context(tmp_dir)
+            ctx.pcb_file = pcb_path
+            ctx.project_dir = tmp_dir
+
+            task = kiforge.Step3dExportTask()
+            eff_pcb, temp_dir = task._prepare_wrl_models(ctx)
+
+            with open(eff_pcb, "r", encoding="utf-8") as f:
+                self.assertIn("mcu.step", f.read().replace("\\", "/"))
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_build_subprocess_env_propagates_kicad_path_vars_and_aliases(self):
+        """_build_subprocess_env must merge .kicad_pro vars and alias all 3D model path variables."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fake_3d = os.path.join(tmp_dir, "fake_3d")
+            os.makedirs(fake_3d, exist_ok=True)
+            pro_file = os.path.join(tmp_dir, "project.kicad_pro")
+            with open(pro_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "environment": {
+                        "vars": {
+                            "KICAD8_3DMODEL_DIR": fake_3d,
+                            "CUSTOM_LIB": "/opt/custom",
+                        }
+                    }
+                }, f)
+
+            env = kiforge._build_subprocess_env(None, project_dir=tmp_dir)
+            self.assertEqual(env.get("CUSTOM_LIB"), "/opt/custom")
+            self.assertEqual(env.get("KICAD8_3DMODEL_DIR"), fake_3d)
+            # Aliases must all resolve to the same 3D model dir
+            for alias in ("KICAD10_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KISYS3DMOD", "KICAD_3DMODEL_DIR"):
+                self.assertEqual(env.get(alias), fake_3d)
+
+    def test_export_copper_layers_single_sided_board(self):
+        """export_copper_layers on single-sided board exports only present layer without warnings."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcb_path = os.path.join(tmp_dir, "single_front.kicad_pcb")
+            with open(pcb_path, "w", encoding="utf-8") as f:
+                f.write('(kicad_pcb (version 20240108) (layers (0 "F.Cu" signal) (44 "Edge.Cuts" user)))')
+
+            ctx = self._make_export_context(tmp_dir)
+            ctx.pcb_file = pcb_path
+            ctx.pcb_name = "single_front"
+
+            task = kiforge.SvgExportTask()
+            def fake_export(task, context, side, output_path):
+                with open(output_path, "w") as f:
+                    f.write("<svg></svg>")
+                return True, True
+
+            with patch("kiforge._export_copper_layer", side_effect=fake_export) as mock_export:
+                f_path, b_path, cropped = kiforge.export_copper_layers(task, ctx, ctx.output_dir)
+
+                # Only front should be attempted; back must be skipped
+                self.assertEqual(mock_export.call_count, 1)
+                self.assertEqual(mock_export.call_args[0][2], "front")
+                self.assertIsNotNone(f_path)
+                self.assertIsNone(b_path)
+                self.assertTrue(cropped)
+                self.assertEqual(len(ctx.warnings), 0)
+
+    def test_homebrew_pdf_resolve_layers_single_sided_board(self):
+        """HomebrewPdfExportTask._resolve_layers must not retry absent layer on single-sided board."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pcb_path = os.path.join(tmp_dir, "single_front.kicad_pcb")
+            with open(pcb_path, "w", encoding="utf-8") as f:
+                f.write('(kicad_pcb (version 20240108) (layers (0 "F.Cu" signal) (44 "Edge.Cuts" user)))')
+
+            ctx = self._make_export_context(tmp_dir)
+            ctx.pcb_file = pcb_path
+            ctx.pcb_name = "single_front"
+            front_svg = os.path.join(ctx.output_dir, "single_front_front.svg")
+            with open(front_svg, "w", encoding="utf-8") as f:
+                f.write("<svg></svg>")
+
+            ctx.homebrew_layers = {
+                "front": front_svg,
+                "back": None,
+                "cropped": True,
+            }
+
+            task = kiforge.HomebrewPdfExportTask()
+            with patch("kiforge._export_copper_layer") as mock_export:
+                f_path, b_path, cropped = task._resolve_layers(ctx, tmp_dir)
+                # Must NOT call _export_copper_layer because B.Cu does not exist on the board
+                mock_export.assert_not_called()
+                self.assertEqual(f_path, front_svg)
+                self.assertIsNone(b_path)
+                self.assertTrue(cropped)
+
 
 if __name__ == '__main__':
     unittest.main()
+
 
 

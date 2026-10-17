@@ -283,9 +283,8 @@ Primary render uses Preset 2 (raytracing), floor, perspective, zoom 0.8, quality
 ### Fixed Gerber / drill export (`GERBER_EXPORT_DEFAULTS`, `DRILL_EXPORT_DEFAULTS`)
 
 Aligned with [JLCPCB's KiCad 9 gerber guide](https://jlcpcb.com/help/article/how-to-generate-gerber-and-drill-files-in-kicad-9).
-Only manufacturing layers are plotted (copper stack, paste, silk, mask, edge cuts,
-plus `Dwgs.User` / `Cmts.User` for User.Drawings and User.Comments); other
-user/fab/courtyard layers are omitted. Gerber export uses `--check-zones` and
+Only manufacturing layers are plotted (copper stack, paste, silk, mask, edge cuts);
+user, fab, and courtyard layers are omitted. Gerber export uses `--check-zones` and
 `--use-drill-file-origin`; Protel extensions, X2, and netlist attributes rely on
 `kicad-cli` defaults. Drill export uses Excellon, mm, absolute origin, decimal
 zeros, alternate oval format, and a single merged PTH+NPTH file. `.gbrjob` files

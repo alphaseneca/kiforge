@@ -318,7 +318,6 @@ GERBER_ZIP_SKIP_SUFFIXES = (".gbrjob",)
 
 _JLC_GERBER_TAIL_LAYERS = (
     "F.Paste", "B.Paste", "F.SilkS", "B.SilkS", "F.Mask", "B.Mask", "Edge.Cuts",
-    "Dwgs.User", "Cmts.User",
 )
 
 _JLC_GERBER_FALLBACK_LAYERS = (
@@ -1536,23 +1535,27 @@ def _build_subprocess_env(kicad_cli: str | None, project_dir: str | None = None)
         # works identically on every OS and CI environment.
         env["KIPRJMOD"] = abs_proj
 
-        # Check if caller or parent process already defined a 3D models directory
-        resolved_3d = None
-        for key in ("KICAD10_3DMODEL_DIR", "KISYS3DMOD", "KICAD_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR"):
-            val = env.get(key)
-            if val and os.path.isdir(val):
-                resolved_3d = val
-                break
+    # Import KiCad path variables discovered from .kicad_pro and kicad_common.json
+    kicad_vars = _get_kicad_path_vars(project_dir)
+    for var_name, var_val in kicad_vars.items():
+        if var_name not in env and var_val:
+            env[var_name] = var_val
 
-        if not resolved_3d:
-            resolved_3d = _derive_system_3d_model_dir(kicad_cli)
+    # Check if caller, project, or KiCad configuration defined a 3D models directory
+    resolved_3d = None
+    for key in ("KICAD10_3DMODEL_DIR", "KISYS3DMOD", "KICAD_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR"):
+        val = env.get(key)
+        if val and os.path.isdir(val):
+            resolved_3d = val
+            break
 
-        if resolved_3d:
-            if "KICAD10_3DMODEL_DIR" not in env:
-                env["KICAD10_3DMODEL_DIR"] = resolved_3d
-            for alias in ("KISYS3DMOD", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR", "KICAD7_3DMODEL_DIR"):
-                if alias not in env:
-                    env[alias] = resolved_3d
+    if not resolved_3d:
+        resolved_3d = _derive_system_3d_model_dir(kicad_cli)
+
+    if resolved_3d:
+        for alias in ("KICAD10_3DMODEL_DIR", "KISYS3DMOD", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR", "KICAD7_3DMODEL_DIR", "KICAD6_3DMODEL_DIR", "KICAD_3DMODEL_DIR"):
+            if alias not in env or not env[alias]:
+                env[alias] = resolved_3d
 
     return env
 
@@ -2344,46 +2347,81 @@ class ExportTask:
                 context.active_process = None
 
 
-def _parse_pcb_layers(pcb_file: str) -> list[tuple[str, str]]:
-    """Return (canonical_name, type) pairs from a board's ``(layers ...)`` section."""
+def _parse_pcb_layers(pcb_file: str) -> list[tuple[int, str, str]]:
+    """Return (layer_num, canonical_name, type) triples from a board's ``(layers ...)`` section."""
     try:
         with open(pcb_file, encoding="utf-8") as f:
             content = f.read()
     except OSError:
         return []
-    match = re.search(r"\(layers\s+(.*?)\)\s*\(setup", content, re.DOTALL)
-    if not match:
+
+    idx = content.find("(layers")
+    if idx == -1:
         return []
-    return re.findall(r'\(\d+\s+"([^"]+)"\s+(\w+)', match.group(1))
+
+    depth = 0
+    start = -1
+    layers_block = ""
+    for i in range(idx, len(content)):
+        char = content[i]
+        if char == "(":
+            depth += 1
+            if start == -1:
+                start = i
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                layers_block = content[start : i + 1]
+                break
+
+    if not layers_block:
+        return []
+
+    matches = re.findall(r'\((\d+)\s+(?:"([^"]+)"|([^\s\)]+))\s+(\w+)', layers_block)
+    return [(int(num), name_q or name_u, layer_type) for num, name_q, name_u, layer_type in matches]
 
 
 def resolve_jlc_gerber_layers(pcb_file: str) -> list[str]:
     """
-    JLCPCB manufacturing layers present on the board (KiCad 9 gerber guide).
+    JLCPCB manufacturing layers present on the board (KiCad 9/10 gerber guide).
 
-    Copper: F.Cu, inner signal layers in stack order, B.Cu. Also paste, silk,
-    mask, edge cuts, and user drawing/comment layers (Dwgs.User, Cmts.User).
-    Other user, fab, and courtyard layers are omitted.
+    Copper: F.Cu, all inner copper layers in stack order (signal or power planes),
+    B.Cu. Also paste, silk, mask, and edge cuts. User, fab, and courtyard layers
+    are omitted to prevent DFM and fabrication upload issues.
     """
     parsed = _parse_pcb_layers(pcb_file)
     if not parsed:
         return list(_JLC_GERBER_FALLBACK_LAYERS)
 
-    names_present = {name for name, _ in parsed}
+    names_present = {name for _, name, _ in parsed}
     result: list[str] = []
-    inner: list[str] = []
+    inner_layers: list[tuple[int, str]] = []
 
-    for name, layer_type in parsed:
+    for num, name, layer_type in parsed:
+        # Copper layer detection:
+        # 1. Standard name ending in .Cu (e.g. In1.Cu, GND.Cu)
+        # 2. Or layer type is signal, power, mixed, or jumper (excluding user layers)
+        # 3. Or layer number in copper range 0..31 with non-user type
+        is_copper = (
+            name.endswith(".Cu")
+            or layer_type in ("signal", "power", "mixed", "jumper")
+            or (0 <= num <= 31 and layer_type != "user")
+        )
+
         if name == "F.Cu":
             result.append(name)
-        elif layer_type == "signal" and name not in ("F.Cu", "B.Cu"):
-            inner.append(name)
+        elif is_copper and name != "B.Cu":
+            inner_layers.append((num, name))
+
+    # Sort inner copper layers by physical layer stack number (1, 2, ...)
+    inner_layers.sort(key=lambda item: item[0])
+    inner_names = [name for _, name in inner_layers]
 
     if "B.Cu" in names_present:
-        result.extend(inner)
+        result.extend(inner_names)
         result.append("B.Cu")
-    elif inner:
-        result.extend(inner)
+    elif inner_names:
+        result.extend(inner_names)
 
     for layer in _JLC_GERBER_TAIL_LAYERS:
         if layer in names_present:
@@ -2583,8 +2621,14 @@ def convert_wrl_to_step(wrl_path: str, step_path: str, scale: float = 2.54) -> b
     standard STEP AP214 FACETED_BREP representation compatible with OpenCASCADE.
     """
     try:
-        with open(wrl_path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
+        with open(wrl_path, "rb") as f:
+            raw_bytes = f.read()
+
+        if raw_bytes.startswith(b"\x1f\x8b"):
+            import gzip
+            text = gzip.decompress(raw_bytes).decode("utf-8", errors="ignore")
+        else:
+            text = raw_bytes.decode("utf-8", errors="ignore")
 
         coord_matches = list(re.finditer(r"(?:Coordinate|Coordinate3)\s*\{[^}]*point\s*\[(.*?)\]", text, re.DOTALL))
         index_matches = list(re.finditer(r"coordIndex\s*\[(.*?)\]", text, re.DOTALL))
@@ -2733,13 +2777,32 @@ def _get_kicad_path_vars(project_dir: str | None = None) -> dict[str, str]:
 
     for cdir in config_dirs:
         if os.path.isdir(cdir):
-            for common_file in glob.glob(os.path.join(cdir, "*", "kicad_common.json")):
+            common_files = glob.glob(os.path.join(cdir, "*", "kicad_common.json"))
+            direct_common = os.path.join(cdir, "kicad_common.json")
+            if os.path.isfile(direct_common):
+                common_files.append(direct_common)
+            for common_file in common_files:
                 try:
                     with open(common_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     env_vars.update(data.get("environment", {}).get("vars", {}))
                 except Exception:
                     pass
+
+    # Ensure all versioned 3D model variables are aliased if any exists or can be derived
+    resolved_3d = None
+    for key in ("KICAD10_3DMODEL_DIR", "KISYS3DMOD", "KICAD_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR"):
+        val = env_vars.get(key)
+        if val and os.path.isdir(val):
+            resolved_3d = val
+            break
+    if not resolved_3d:
+        resolved_3d = _derive_system_3d_model_dir(PathResolver.get_kicad_cli_path())
+    if resolved_3d:
+        for alias in ("KICAD10_3DMODEL_DIR", "KISYS3DMOD", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR", "KICAD7_3DMODEL_DIR", "KICAD6_3DMODEL_DIR", "KICAD_3DMODEL_DIR"):
+            if alias not in env_vars or not env_vars[alias]:
+                env_vars[alias] = resolved_3d
+
     return env_vars
 
 
@@ -2750,8 +2813,24 @@ def _resolve_3d_model_path(raw_path: str, vars_map: dict[str, str], project_dir:
         return vars_map.get(var_name, m.group(0))
 
     expanded = re.sub(r"\$\{([^}]+)\}|\$([A-Za-z0-9_]+)", repl, raw_path)
-    if not os.path.isabs(expanded) and project_dir:
-        expanded = os.path.join(project_dir, expanded)
+    if not os.path.isabs(expanded):
+        if project_dir:
+            proj_cand = os.path.join(project_dir, expanded)
+            if os.path.exists(proj_cand):
+                return os.path.normpath(proj_cand)
+        for var_key in ("KICAD10_3DMODEL_DIR", "KISYS3DMOD", "KICAD_3DMODEL_DIR", "KICAD9_3DMODEL_DIR", "KICAD8_3DMODEL_DIR"):
+            base_dir = vars_map.get(var_key)
+            if base_dir and os.path.isdir(base_dir):
+                cand = os.path.join(base_dir, expanded)
+                if os.path.exists(cand):
+                    return os.path.normpath(cand)
+        for cand_dir in _get_platform_3d_model_candidates():
+            if os.path.isdir(cand_dir):
+                cand = os.path.join(cand_dir, expanded)
+                if os.path.exists(cand):
+                    return os.path.normpath(cand)
+        if project_dir:
+            return os.path.normpath(os.path.join(project_dir, expanded))
     return os.path.normpath(expanded)
 
 
@@ -2775,10 +2854,13 @@ class Step3dExportTask(ExportTask):
 
     def _prepare_wrl_models(self, context: ExportContext) -> tuple[str, str | None]:
         """
-        Scan the board for referenced .wrl models and convert them to STEP in output_dir/3dmodels.
+        Scan the board for referenced 3D models and ensure compatible STEP assets exist.
 
-        Never touches external footprint libraries. Converted models are placed in
-        {output_dir}/3dmodels and referenced via a staged copy of the PCB.
+        Prioritises existing companion CAD STEP models (.step / .stp) found beside
+        referenced .wrl models. If no companion STEP exists, automatically converts
+        VRML mesh (.wrl) models to STEP in output_dir/3dmodels. Staged replacements
+        are applied to a temporary copy of the PCB so external footprint libraries
+        and user source files are never modified.
 
         Returns (effective_pcb_path, temp_dir_or_none).
         """
@@ -2791,13 +2873,14 @@ class Step3dExportTask(ExportTask):
         except Exception:
             return context.pcb_file, None
 
-        wrl_models = set(re.findall(r'\(model\s+"([^"]+\.(?:wrl|vrml))"', pcb_text, re.IGNORECASE))
-        if not wrl_models:
+        raw_models: list[str] = []
+        for m1, m2 in re.findall(r'\(model\s+(?:"([^"]+)"|([^\s\)]+))', pcb_text, re.IGNORECASE):
+            raw_models.append(m1 or m2)
+
+        if not raw_models:
             return context.pcb_file, None
 
         models_dir = os.path.join(context.output_dir, "3dmodels")
-        os.makedirs(models_dir, exist_ok=True)
-
         vars_map = _get_kicad_path_vars(context.project_dir)
         temp_dir: str | None = None
         staged_replacements: dict[str, str] = {}
@@ -2808,16 +2891,13 @@ class Step3dExportTask(ExportTask):
             ref_match = re.search(r'\((?:property\s+"Reference"|fp_text\s+reference)\s+"([^"]+)"', block)
             ref = ref_match.group(1) if ref_match else ""
             if ref:
-                for m in re.findall(r'\(model\s+"([^"]+)"', block):
-                    model_to_refs.setdefault(m, []).append(ref)
+                for m1, m2 in re.findall(r'\(model\s+(?:"([^"]+)"|([^\s\)]+))', block):
+                    model_to_refs.setdefault(m1 or m2, []).append(ref)
 
-        for raw_m in wrl_models:
-            resolved_wrl = _resolve_3d_model_path(raw_m, vars_map, context.project_dir)
-            if not os.path.isfile(resolved_wrl):
-                continue
-
-            base_name = os.path.splitext(os.path.basename(resolved_wrl))[0] + ".step"
-            target_step = os.path.join(models_dir, base_name)
+        for raw_m in sorted(set(raw_models)):
+            lower_m = raw_m.lower()
+            is_wrl = lower_m.endswith(".wrl") or lower_m.endswith(".vrml")
+            is_step = lower_m.endswith(".step") or lower_m.endswith(".stp")
 
             comp_refs = sorted(set(model_to_refs.get(raw_m, [])))
             if len(comp_refs) > 6:
@@ -2828,43 +2908,98 @@ class Step3dExportTask(ExportTask):
                 ref_summary = ""
             ref_label = f" for {ref_summary}" if ref_summary else ""
 
-            # Convert to output_dir/3dmodels/<name>.step if missing or source wrl was modified
-            converted = False
-            if not os.path.isfile(target_step) or (os.path.getmtime(target_step) < os.path.getmtime(resolved_wrl)):
-                try:
-                    converted = convert_wrl_to_step(resolved_wrl, target_step)
-                except Exception as exc:
-                    context.logger.warning(
-                        "Error converting VRML model%s (%s) to STEP: %s",
-                        ref_label,
-                        resolved_wrl,
-                        exc,
-                    )
-                    converted = False
-            else:
-                converted = True
+            resolved_path = _resolve_3d_model_path(raw_m, vars_map, context.project_dir)
 
-            if converted and os.path.isfile(target_step):
-                staged_replacements[raw_m] = target_step.replace("\\", "/")
-                context.logger.info(
-                    "Auto-converted VRML 3D model to STEP%s: %s -> %s",
-                    ref_label,
-                    os.path.basename(resolved_wrl),
-                    os.path.join("3dmodels", base_name),
-                )
-            else:
-                context.logger.warning(
-                    "Could not convert VRML model%s: %s",
-                    ref_label,
-                    resolved_wrl,
-                )
+            if is_wrl:
+                # 1. Check for existing high-fidelity companion STEP (.step / .stp) file
+                companion_step: str | None = None
+                stem, _ = os.path.splitext(resolved_path)
+                for ext in (".step", ".stp", ".STEP", ".STP"):
+                    cand = stem + ext
+                    if os.path.isfile(cand):
+                        companion_step = cand
+                        break
+
+                if companion_step:
+                    staged_replacements[raw_m] = companion_step.replace("\\", "/")
+                    context.logger.info(
+                        "Found companion STEP 3D model%s: %s -> %s",
+                        ref_label,
+                        os.path.basename(resolved_path),
+                        os.path.basename(companion_step),
+                    )
+                    continue
+
+                # 2. If no companion STEP, convert VRML to STEP in output_dir/3dmodels
+                if os.path.isfile(resolved_path):
+                    os.makedirs(models_dir, exist_ok=True)
+                    base_name = os.path.splitext(os.path.basename(resolved_path))[0] + ".step"
+                    target_step = os.path.join(models_dir, base_name)
+
+                    converted = False
+                    if not os.path.isfile(target_step) or (os.path.getmtime(target_step) < os.path.getmtime(resolved_path)):
+                        try:
+                            converted = convert_wrl_to_step(resolved_path, target_step)
+                        except Exception as exc:
+                            context.logger.warning(
+                                "Error converting VRML model%s (%s) to STEP: %s",
+                                ref_label,
+                                resolved_path,
+                                exc,
+                            )
+                            converted = False
+                    else:
+                        converted = True
+
+                    if converted and os.path.isfile(target_step):
+                        staged_replacements[raw_m] = target_step.replace("\\", "/")
+                        context.logger.info(
+                            "Auto-converted VRML 3D model to STEP%s: %s -> %s",
+                            ref_label,
+                            os.path.basename(resolved_path),
+                            os.path.join("3dmodels", base_name),
+                        )
+                    else:
+                        context.logger.warning(
+                            "Could not convert VRML model%s: %s",
+                            ref_label,
+                            resolved_path,
+                        )
+                else:
+                    context.logger.warning(
+                        "3D model file not found%s: %s",
+                        ref_label,
+                        raw_m,
+                    )
+            elif is_step:
+                # If a STEP model references an unresolved variable or alternate extension,
+                # substitute verified file path so kicad-cli doesn't skip it
+                if os.path.isfile(resolved_path):
+                    if raw_m != resolved_path and (raw_m.startswith("$") or not os.path.isabs(raw_m)):
+                        staged_replacements[raw_m] = resolved_path.replace("\\", "/")
+                else:
+                    stem, _ = os.path.splitext(resolved_path)
+                    for ext in (".step", ".stp", ".STEP", ".STP"):
+                        cand = stem + ext
+                        if os.path.isfile(cand):
+                            staged_replacements[raw_m] = cand.replace("\\", "/")
+                            break
 
         if staged_replacements:
             temp_dir = tempfile.mkdtemp(prefix="kiforge_step_")
             staged_pcb = os.path.join(temp_dir, os.path.basename(context.pcb_file))
             new_text = pcb_text
             for old_path, new_path in staged_replacements.items():
+                alt_old_fwd = old_path.replace("\\", "/")
+                alt_old_bak = old_path.replace("/", "\\")
                 new_text = new_text.replace(f'"{old_path}"', f'"{new_path}"')
+                if alt_old_fwd != old_path:
+                    new_text = new_text.replace(f'"{alt_old_fwd}"', f'"{new_path}"')
+                if alt_old_bak != old_path:
+                    new_text = new_text.replace(f'"{alt_old_bak}"', f'"{new_path}"')
+                pat = re.compile(rf'\(model\s+(?:"{re.escape(old_path)}"|{re.escape(old_path)})(\s|\))')
+                new_text = pat.sub(rf'(model "{new_path}"\1', new_text)
+
             with open(staged_pcb, "w", encoding="utf-8") as f:
                 f.write(new_text)
             return staged_pcb, temp_dir
@@ -4125,8 +4260,8 @@ def export_svg_to_1200dpi_pdf(
 # crops the plot to the board bounding box, which is what makes 1:1 A4 placement
 # possible; older kicad-cli builds reject it, hence the fallback without it.
 _SVG_LAYER_SPECS = {
-    "front": ("F.Cu,Edge.Cuts", ()),
-    "back": ("B.Cu,Edge.Cuts", ("-m",)),
+    "front": ("F.Cu", ()),
+    "back": ("B.Cu", ("-m",)),
 }
 
 
@@ -4136,7 +4271,7 @@ def _copper_svg_command(context: "ExportContext", side: str, output_path: str, b
     cmd = [
         context.kicad_cli, "pcb", "export", "svg",
         "-l", layers, *extra_flags, "-n", "--drill-shape-opt", "2",
-        "--cl", "Edge.Cuts", "--exclude-drawing-sheet",
+        "--exclude-drawing-sheet",
     ]
     if board_area_only:
         cmd += ["--page-size-mode", "2", "--mode-single"]
@@ -4176,21 +4311,32 @@ def export_copper_layers(task: "ExportTask", context: ExportContext, target_dir:
     produced layer used the board-area-cropped export (see
     :func:`_export_copper_layer`).
     """
-    paths: dict[str, str | None] = {}
+    board_layers = _parse_pcb_layers(context.pcb_file) if context.pcb_file else []
+    names_present = {name for _, name, _ in board_layers} if board_layers else set()
+    has_front_in_board = ("F.Cu" in names_present) if names_present else True
+    has_back_in_board = ("B.Cu" in names_present) if names_present else True
+
+    paths: dict[str, str | None] = {"front": None, "back": None}
     cropped_all = True
     for side in ("front", "back"):
         if context.is_aborted():
             # Same rule as the retry inside _export_copper_layer: a cancelled
             # run must not start plotting the next layer.
             break
+        if side == "front" and not has_front_in_board:
+            continue
+        if side == "back" and not has_back_in_board:
+            continue
+
         out = os.path.join(target_dir, f"{context.pcb_name}_{side}.svg")
         ok, cropped = _export_copper_layer(task, context, side, out)
         paths[side] = out if (ok and os.path.isfile(out)) else None
         if paths[side] is not None and not cropped:
             cropped_all = False
-    if paths["front"] is None and paths["back"] is not None:
+
+    if has_front_in_board and paths["front"] is None and paths["back"] is not None:
         context.logger.warning("Front SVG export failed; back layer was exported anyway.")
-    elif paths["back"] is None and paths["front"] is not None:
+    elif has_back_in_board and paths["back"] is None and paths["front"] is not None:
         context.logger.warning("Back SVG export failed; front layer was exported anyway.")
     return paths["front"], paths["back"], cropped_all
 
@@ -4267,8 +4413,13 @@ class HomebrewPdfExportTask(ExportTask):
         cached = context.homebrew_layers
         if cached and (cached["front"] or cached["back"]):
             front, back, cropped = cached["front"], cached["back"], cached["cropped"]
+            board_layers = _parse_pcb_layers(context.pcb_file) if context.pcb_file else []
+            names_present = {name for _, name, _ in board_layers} if board_layers else set()
             for side, existing in (("front", front), ("back", back)):
                 if existing or context.is_aborted():
+                    continue
+                expected_layer = "F.Cu" if side == "front" else "B.Cu"
+                if names_present and expected_layer not in names_present:
                     continue
                 # SvgExportTask produced only one side; retry the missing one
                 # rather than silently shipping a single-sided homebrew PDF.
