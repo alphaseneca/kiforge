@@ -184,6 +184,14 @@ class TestBaselineConsistency(unittest.TestCase):
         below = sorted(v for v in versions if v < floor)
         self.assertEqual(below, [], "CI runs interpreters below the declared floor: %s" % below)
 
+    def test_dockerfile_uses_kiforge_ibom_version(self):
+        """Dockerfile must dynamically reference INTERACTIVE_HTML_BOM_PINNED_VERSION from kiforge.py."""
+        import kiforge
+        dockerfile_content = _read("Dockerfile")
+        self.assertIn("INTERACTIVE_HTML_BOM_PINNED_VERSION", dockerfile_content)
+        self.assertNotIn("InteractiveHtmlBom==2.11.2", dockerfile_content, "Dockerfile must not hardcode IBOM version; read from kiforge.py")
+        self.assertEqual(kiforge.INTERACTIVE_HTML_BOM_PINNED_VERSION, "2.11.2")
+
 
 class TestLoadFailureIsVisible(unittest.TestCase):
     """

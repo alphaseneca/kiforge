@@ -3623,7 +3623,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 self._export_progress = None
             progress.Destroy()
             if hasattr(self, "btn_export"):
-                self.btn_export.Enable()
+                self._sync_export_button_state()
 
     def _stop_export_timer(self):
         """Stop active progress poll timer if running."""
@@ -3631,13 +3631,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
             self._export_timer.Stop()
 
     def _destroy_export_progress(self):
-        """Stop timer, dismiss progress dialog, and re-enable export button."""
+        """Stop timer, dismiss progress dialog, and re-enable export button if valid."""
         self._stop_export_timer()
         progress = self._export_progress
         self._export_progress = None
         _destroy_progress_dialog(progress)
         if hasattr(self, "btn_export"):
-            self.btn_export.Enable()
+            self._sync_export_button_state()
 
     def _poll_export_progress(self, event):
         """Poll background export worker thread and update progress dialog state."""

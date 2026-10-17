@@ -117,6 +117,7 @@ import xml.etree.ElementTree as ET
 import math
 import glob
 from collections.abc import Callable
+from dataclasses import dataclass, field
 
 # Ensure the user's local site-packages folder is in sys.path
 # This is critical for KiCad's isolated Python environment to recognize --user pip packages.
@@ -199,9 +200,8 @@ KIFORGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 # Release plugin zips pin this to alphaseneca/kiforge@<tag> at package time (see package_plugin.py).
 KIFORGE_ACTION_REF = "alphaseneca/kiforge@main"
 
-# InteractiveHtmlBom version is pinned in two places: Dockerfile (build-time) and
-# InteractiveBomTask (local install fallback). Bump deliberately after testing; keep
-# both in sync manually — the Dockerfile cannot import this constant.
+# Single source of truth for InteractiveHtmlBom pinned version across runtime
+# installer and Dockerfile (which reads this constant directly at build time).
 INTERACTIVE_HTML_BOM_PINNED_VERSION = "2.11.2"
 
 # ---------------------------------------------------------------------------
@@ -2357,8 +2357,121 @@ class ExportTask:
                 context.active_process = None
 
 
-def _parse_pcb_layers(pcb_file: str) -> list[tuple[int, str, str]]:
-    """Return (layer_num, canonical_name, type) triples from a board's ``(layers ...)`` section."""
+@dataclass(frozen=True)
+class PcbLayer:
+    """Representation of a single KiCad board layer definition."""
+
+    number: int
+    canonical_name: str
+    layer_type: str
+    user_name: str = ""
+
+    @property
+    def is_copper(self) -> bool:
+        """Return True if this layer carries electrical signals or power planes."""
+        return (
+            self.canonical_name.endswith(".Cu")
+            or self.layer_type in ("signal", "power", "mixed", "jumper")
+            or (0 <= self.number <= 31 and self.layer_type != "user")
+        )
+
+
+@dataclass
+class PcbBoardInfo:
+    """
+    Structural layer metadata and manufacturing properties of a KiCad PCB.
+
+    Constructed via :func:`get_pcb_info`, maintaining an mtime-backed cache
+    so repeated inquiries from UI updates and export tasks avoid repeated file I/O.
+    """
+
+    pcb_file: str
+    layers: list[PcbLayer] = field(default_factory=list)
+
+    @property
+    def copper_layers(self) -> list[PcbLayer]:
+        """All copper layers on the board, in physical stack order."""
+        return [l for l in self.layers if l.is_copper]
+
+    @property
+    def copper_layer_count(self) -> int:
+        """Total number of copper layers on the board (e.g. 1, 2, 4, 6...)."""
+        return len(self.copper_layers)
+
+    @property
+    def has_front_copper(self) -> bool:
+        """Return True if F.Cu exists on the board."""
+        return self.has_layer("F.Cu")
+
+    @property
+    def has_back_copper(self) -> bool:
+        """Return True if B.Cu exists on the board."""
+        return self.has_layer("B.Cu")
+
+    def has_layer(self, name_or_alias: str) -> bool:
+        """Return True if the layer exists on the board by canonical or alias name."""
+        canonical = _LAYER_CANONICAL_ALIASES.get(name_or_alias, name_or_alias)
+        return any(
+            l.canonical_name == canonical
+            or l.canonical_name == name_or_alias
+            or l.user_name == name_or_alias
+            for l in self.layers
+        )
+
+    @property
+    def jlc_gerber_layers(self) -> list[str]:
+        """
+        Ordered list of manufacturing Gerber layers required by JLCPCB.
+
+        Copper: F.Cu, all inner copper layers in stack order (signal or power planes),
+        B.Cu. Also paste, silk, mask, edge cuts, drawings, comments (V-cuts/milling/stackup),
+        and adhesives. Internal CAD fab and courtyard layers are omitted.
+        """
+        if not self.layers:
+            return list(_JLC_GERBER_FALLBACK_LAYERS)
+
+        names_present = {l.canonical_name for l in self.layers}
+        for l in self.layers:
+            if l.user_name:
+                names_present.add(l.user_name)
+
+        result: list[str] = []
+        inner_layers: list[tuple[int, str]] = []
+
+        for l in self.layers:
+            if l.canonical_name == "F.Cu":
+                result.append(l.canonical_name)
+            elif l.is_copper and l.canonical_name != "B.Cu":
+                inner_layers.append((l.number, l.canonical_name))
+
+        inner_layers.sort(key=lambda item: item[0])
+        inner_names = [name for _, name in inner_layers]
+
+        if "B.Cu" in names_present:
+            result.extend(inner_names)
+            result.append("B.Cu")
+        elif inner_names:
+            result.extend(inner_names)
+
+        seen_canonical: set[str] = set()
+        for layer in _JLC_GERBER_TAIL_LAYERS:
+            canonical = _LAYER_CANONICAL_ALIASES.get(layer, layer)
+            if layer in names_present:
+                if canonical not in seen_canonical:
+                    seen_canonical.add(canonical)
+                    result.append(layer)
+            elif canonical in names_present and canonical not in seen_canonical:
+                seen_canonical.add(canonical)
+                result.append(canonical)
+
+        return result if result else list(_JLC_GERBER_FALLBACK_LAYERS)
+
+
+_PCB_INFO_CACHE: dict[tuple[str, float], PcbBoardInfo] = {}
+
+
+def _parse_pcb_layers_raw(pcb_file: str) -> list[PcbLayer]:
+    """Parse (layers ...) section of a .kicad_pcb file into PcbLayer instances."""
     try:
         with open(pcb_file, encoding="utf-8") as f:
             content = f.read()
@@ -2387,82 +2500,65 @@ def _parse_pcb_layers(pcb_file: str) -> list[tuple[int, str, str]]:
     if not layers_block:
         return []
 
-    matches = re.findall(r'\((\d+)\s+(?:"([^"]+)"|([^\s\)]+))\s+(\w+)', layers_block)
-    return [(int(num), name_q or name_u, layer_type) for num, name_q, name_u, layer_type in matches]
+    matches = re.findall(
+        r'\((\d+)\s+(?:"([^"]+)"|([^\s\)]+))\s+(\w+)(?:\s+(?:"([^"]+)"|([^\s\)]+)))?',
+        layers_block,
+    )
+    return [
+        PcbLayer(
+            number=int(num),
+            canonical_name=name_q or name_u,
+            layer_type=layer_type,
+            user_name=alias_q or alias_u or "",
+        )
+        for num, name_q, name_u, layer_type, alias_q, alias_u in matches
+    ]
+
+
+def get_pcb_info(pcb_file: str | None) -> PcbBoardInfo | None:
+    """Return cached PcbBoardInfo for the given board file, invalidating on mtime change."""
+    if not pcb_file or not os.path.isfile(pcb_file):
+        return None
+    try:
+        mtime = os.path.getmtime(pcb_file)
+    except OSError:
+        return None
+
+    abs_path = os.path.abspath(pcb_file)
+    cache_key = (abs_path, mtime)
+    cached = _PCB_INFO_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    layers = _parse_pcb_layers_raw(pcb_file)
+    info = PcbBoardInfo(pcb_file=abs_path, layers=layers)
+
+    for k in list(_PCB_INFO_CACHE.keys()):
+        if k[0] == abs_path:
+            _PCB_INFO_CACHE.pop(k, None)
+
+    _PCB_INFO_CACHE[cache_key] = info
+    return info
+
+
+def _parse_pcb_layers(pcb_file: str) -> list[tuple[int, str, str]]:
+    """Return (layer_num, canonical_name, type) triples from a board's ``(layers ...)`` section."""
+    info = get_pcb_info(pcb_file)
+    if not info:
+        return []
+    return [(l.number, l.canonical_name, l.layer_type) for l in info.layers]
 
 
 def resolve_jlc_gerber_layers(pcb_file: str) -> list[str]:
-    """
-    JLCPCB manufacturing layers present on the board (KiCad 9/10 gerber guide).
-
-    Copper: F.Cu, all inner copper layers in stack order (signal or power planes),
-    B.Cu. Also paste, silk, mask, edge cuts, drawings, comments (V-cuts/milling/stackup),
-    and adhesives. Internal CAD fab and courtyard layers are omitted.
-    """
-    parsed = _parse_pcb_layers(pcb_file)
-    if not parsed:
-        return list(_JLC_GERBER_FALLBACK_LAYERS)
-
-    names_present = {name for _, name, _ in parsed}
-    result: list[str] = []
-    inner_layers: list[tuple[int, str]] = []
-
-    for num, name, layer_type in parsed:
-        # Copper layer detection:
-        # 1. Standard name ending in .Cu (e.g. In1.Cu, GND.Cu)
-        # 2. Or layer type is signal, power, mixed, or jumper (excluding user layers)
-        # 3. Or layer number in copper range 0..31 with non-user type
-        is_copper = (
-            name.endswith(".Cu")
-            or layer_type in ("signal", "power", "mixed", "jumper")
-            or (0 <= num <= 31 and layer_type != "user")
-        )
-
-        if name == "F.Cu":
-            result.append(name)
-        elif is_copper and name != "B.Cu":
-            inner_layers.append((num, name))
-
-    # Sort inner copper layers by physical layer stack number (1, 2, ...)
-    inner_layers.sort(key=lambda item: item[0])
-    inner_names = [name for _, name in inner_layers]
-
-    if "B.Cu" in names_present:
-        result.extend(inner_names)
-        result.append("B.Cu")
-    elif inner_names:
-        result.extend(inner_names)
-
-    seen_canonical: set[str] = set()
-    for layer in _JLC_GERBER_TAIL_LAYERS:
-        canonical = _LAYER_CANONICAL_ALIASES.get(layer, layer)
-        if layer in names_present:
-            if canonical not in seen_canonical:
-                seen_canonical.add(canonical)
-                result.append(layer)
-        elif canonical in names_present and canonical not in seen_canonical:
-            seen_canonical.add(canonical)
-            result.append(canonical)
-
-    return result if result else list(_JLC_GERBER_FALLBACK_LAYERS)
+    """JLCPCB manufacturing layers present on the board (KiCad 9/10 gerber guide)."""
+    info = get_pcb_info(pcb_file)
+    return info.jlc_gerber_layers if info else list(_JLC_GERBER_FALLBACK_LAYERS)
 
 
 def get_pcb_copper_layer_count(pcb_file: str | None) -> int:
     """Return the number of copper layers defined on the PCB, or 0 if unknown/missing."""
-    if not pcb_file or not os.path.isfile(pcb_file):
-        return 0
-    parsed = _parse_pcb_layers(pcb_file)
-    if not parsed:
-        return 0
-    copper_count = 0
-    for num, name, layer_type in parsed:
-        if (
-            name.endswith(".Cu")
-            or layer_type in ("signal", "power", "mixed", "jumper")
-            or (0 <= num <= 31 and layer_type != "user")
-        ):
-            copper_count += 1
-    return copper_count
+    info = get_pcb_info(pcb_file)
+    return info.copper_layer_count if info else 0
 
 
 def build_gerber_export_cmd(context: ExportContext) -> list[str]:
@@ -4354,10 +4450,9 @@ def export_copper_layers(task: "ExportTask", context: ExportContext, target_dir:
     produced layer used the board-area-cropped export (see
     :func:`_export_copper_layer`).
     """
-    board_layers = _parse_pcb_layers(context.pcb_file) if context.pcb_file else []
-    names_present = {name for _, name, _ in board_layers} if board_layers else set()
-    has_front_in_board = ("F.Cu" in names_present) if names_present else True
-    has_back_in_board = ("B.Cu" in names_present) if names_present else True
+    info = get_pcb_info(context.pcb_file) if context.pcb_file else None
+    has_front_in_board = info.has_front_copper if info else True
+    has_back_in_board = info.has_back_copper if info else True
 
     paths: dict[str, str | None] = {"front": None, "back": None}
     cropped_all = True
@@ -4456,13 +4551,12 @@ class HomebrewPdfExportTask(ExportTask):
         cached = context.homebrew_layers
         if cached and (cached["front"] or cached["back"]):
             front, back, cropped = cached["front"], cached["back"], cached["cropped"]
-            board_layers = _parse_pcb_layers(context.pcb_file) if context.pcb_file else []
-            names_present = {name for _, name, _ in board_layers} if board_layers else set()
+            info = get_pcb_info(context.pcb_file) if context.pcb_file else None
             for side, existing in (("front", front), ("back", back)):
                 if existing or context.is_aborted():
                     continue
                 expected_layer = "F.Cu" if side == "front" else "B.Cu"
-                if names_present and expected_layer not in names_present:
+                if info and not info.has_layer(expected_layer):
                     continue
                 # SvgExportTask produced only one side; retry the missing one
                 # rather than silently shipping a single-sided homebrew PDF.

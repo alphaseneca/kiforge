@@ -2815,6 +2815,27 @@ Shape {
                 self.assertIsNone(b_path)
                 self.assertTrue(cropped)
 
+    def test_pcb_board_info_model_and_caching(self):
+        """PcbBoardInfo provides domain properties and transparent mtime-keyed caching."""
+        pcb_sample = os.path.join(os.path.dirname(__file__), "sample_project", "sample.kicad_pcb")
+        info = kiforge.get_pcb_info(pcb_sample)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.copper_layer_count, 2)
+        self.assertTrue(info.has_front_copper)
+        self.assertTrue(info.has_back_copper)
+        self.assertTrue(info.has_layer("Edge.Cuts"))
+        self.assertTrue(info.has_layer("Dwgs.User"))
+        self.assertTrue(info.has_layer("User.Drawings"))  # Alias
+        self.assertFalse(info.has_layer("NonExistent.Layer"))
+
+        # Verify caching returns identical instance on same mtime
+        info2 = kiforge.get_pcb_info(pcb_sample)
+        self.assertIs(info, info2)
+
+        # Missing file returns None safely
+        self.assertIsNone(kiforge.get_pcb_info(None))
+        self.assertIsNone(kiforge.get_pcb_info("non_existent_file.kicad_pcb"))
+
 
 if __name__ == '__main__':
     unittest.main()
