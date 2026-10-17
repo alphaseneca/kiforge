@@ -496,7 +496,7 @@ class TestKiForgeCLI(unittest.TestCase):
         )
 
     def test_resolve_jlc_gerber_layers_two_layer_board(self):
-        """JLC gerber export includes only manufacturing layers on a 2-layer board."""
+        """JLC gerber export includes manufacturing layers (copper, silk, mask, paste, cuts, drawings, comments, adhesives)."""
         pcb = os.path.join("tests", "sample_project", "sample.kicad_pcb")
         layers = kiforge.resolve_jlc_gerber_layers(pcb)
         self.assertEqual(
@@ -505,12 +505,15 @@ class TestKiForgeCLI(unittest.TestCase):
                 "F.Cu", "B.Cu",
                 "F.Paste", "B.Paste", "F.SilkS", "B.SilkS",
                 "F.Mask", "B.Mask", "Edge.Cuts",
+                "Dwgs.User", "Cmts.User", "F.Adhes", "B.Adhes",
             ],
         )
-        self.assertNotIn("Dwgs.User", layers)
-        self.assertNotIn("Cmts.User", layers)
+        self.assertIn("Dwgs.User", layers)
+        self.assertIn("Cmts.User", layers)
         self.assertNotIn("F.Fab", layers)
         self.assertNotIn("User.1", layers)
+        self.assertNotIn("F.CrtYd", layers)
+        self.assertEqual(kiforge.get_pcb_copper_layer_count(pcb), 2)
 
     def test_resolve_jlc_gerber_layers_four_layer_board_with_power_planes(self):
         """JLC gerber export includes inner copper layers in stack order even when defined as power planes."""
@@ -550,9 +553,11 @@ class TestKiForgeCLI(unittest.TestCase):
                     "F.Mask",
                     "B.Mask",
                     "Edge.Cuts",
+                    "Dwgs.User",
                 ],
             )
-            self.assertNotIn("Dwgs.User", layers)
+            self.assertIn("Dwgs.User", layers)
+            self.assertEqual(kiforge.get_pcb_copper_layer_count(temp_pcb), 4)
         finally:
             if os.path.exists(temp_pcb):
                 os.remove(temp_pcb)

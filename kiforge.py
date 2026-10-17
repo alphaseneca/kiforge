@@ -318,10 +318,20 @@ GERBER_ZIP_SKIP_SUFFIXES = (".gbrjob",)
 
 _JLC_GERBER_TAIL_LAYERS = (
     "F.Paste", "B.Paste", "F.SilkS", "B.SilkS", "F.Mask", "B.Mask", "Edge.Cuts",
+    "Dwgs.User", "User.Drawings", "Cmts.User", "User.Comments", "F.Adhes", "B.Adhes",
 )
 
+_LAYER_CANONICAL_ALIASES: dict[str, str] = {
+    "User.Drawings": "Dwgs.User",
+    "User.Comments": "Cmts.User",
+    "F.Silkscreen": "F.SilkS",
+    "B.Silkscreen": "B.SilkS",
+    "F.Adhesive": "F.Adhes",
+    "B.Adhesive": "B.Adhes",
+}
+
 _JLC_GERBER_FALLBACK_LAYERS = (
-    "F.Cu", "B.Cu", *_JLC_GERBER_TAIL_LAYERS,
+    "F.Cu", "B.Cu", "F.Paste", "B.Paste", "F.SilkS", "B.SilkS", "F.Mask", "B.Mask", "Edge.Cuts",
 )
 
 # Registry: each entry maps one export_params key → CLI flag, Action input, CD placeholder.
@@ -2386,8 +2396,8 @@ def resolve_jlc_gerber_layers(pcb_file: str) -> list[str]:
     JLCPCB manufacturing layers present on the board (KiCad 9/10 gerber guide).
 
     Copper: F.Cu, all inner copper layers in stack order (signal or power planes),
-    B.Cu. Also paste, silk, mask, and edge cuts. User, fab, and courtyard layers
-    are omitted to prevent DFM and fabrication upload issues.
+    B.Cu. Also paste, silk, mask, edge cuts, drawings, comments (V-cuts/milling/stackup),
+    and adhesives. Internal CAD fab and courtyard layers are omitted.
     """
     parsed = _parse_pcb_layers(pcb_file)
     if not parsed:
@@ -2423,11 +2433,36 @@ def resolve_jlc_gerber_layers(pcb_file: str) -> list[str]:
     elif inner_names:
         result.extend(inner_names)
 
+    seen_canonical: set[str] = set()
     for layer in _JLC_GERBER_TAIL_LAYERS:
+        canonical = _LAYER_CANONICAL_ALIASES.get(layer, layer)
         if layer in names_present:
-            result.append(layer)
+            if canonical not in seen_canonical:
+                seen_canonical.add(canonical)
+                result.append(layer)
+        elif canonical in names_present and canonical not in seen_canonical:
+            seen_canonical.add(canonical)
+            result.append(canonical)
 
     return result if result else list(_JLC_GERBER_FALLBACK_LAYERS)
+
+
+def get_pcb_copper_layer_count(pcb_file: str | None) -> int:
+    """Return the number of copper layers defined on the PCB, or 0 if unknown/missing."""
+    if not pcb_file or not os.path.isfile(pcb_file):
+        return 0
+    parsed = _parse_pcb_layers(pcb_file)
+    if not parsed:
+        return 0
+    copper_count = 0
+    for num, name, layer_type in parsed:
+        if (
+            name.endswith(".Cu")
+            or layer_type in ("signal", "power", "mixed", "jumper")
+            or (0 <= num <= 31 and layer_type != "user")
+        ):
+            copper_count += 1
+    return copper_count
 
 
 def build_gerber_export_cmd(context: ExportContext) -> list[str]:
@@ -2474,6 +2509,14 @@ class GerberExportTask(ExportTask):
     def run(self, context: ExportContext) -> bool:
         """Invoke kicad-cli to export gerber layers; return True on success."""
         os.makedirs(context.temp_gerber_dir, exist_ok=True)
+        layers = resolve_jlc_gerber_layers(context.pcb_file)
+        copper_count = get_pcb_copper_layer_count(context.pcb_file)
+        context.logger.info(
+            "Exporting Gerbers for %d-layer PCB (%d layers total: %s)",
+            copper_count,
+            len(layers),
+            ", ".join(layers),
+        )
         return self._run_subprocess(build_gerber_export_cmd(context), context)
 
 

@@ -1083,6 +1083,32 @@ class TestKiForgeStudio(unittest.TestCase):
         finally:
             dialog.Destroy()
 
+    def test_notebook_page_image_id_gtk_safety(self):
+        """_page_image_id must return valid index when ImageList exists, and -1 when None to prevent GTK crashes."""
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
+        try:
+            self.assertEqual(dialog._page_image_id(0), 0)
+            self.assertEqual(dialog._page_image_id(1), 1)
+            self.assertEqual(dialog._page_image_id(2), 2)
+            self.assertEqual(dialog._page_image_id(99), -1)
+
+            # When ImageList is not assigned, must safely return -1
+            dialog.notebook.AssignImageList(None)
+            self.assertEqual(dialog._page_image_id(0), -1)
+            self.assertEqual(dialog._page_image_id(1), -1)
+        finally:
+            dialog.Destroy()
+
+    def test_export_summary_reflects_pcb_copper_layer_count(self):
+        """Export summary must prefix with detected board copper layer count (e.g. '2-layer PCB · ')."""
+        sample_pcb = os.path.join(os.path.dirname(__file__), "sample_project", "sample.kicad_pcb")
+        dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, pcb_file=sample_pcb)
+        try:
+            dialog._update_export_summary()
+            self.assertTrue(dialog._export_summary_text.startswith("2-layer PCB · "))
+        finally:
+            dialog.Destroy()
+
     def test_progress_dialog_cancel_does_not_close_studio(self):
         """
         Regression: cancelling from the export progress dialog must only stop

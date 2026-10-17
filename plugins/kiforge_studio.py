@@ -2427,6 +2427,13 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 image_list.Add(bmp)
             self.notebook.AssignImageList(image_list)
 
+    def _page_image_id(self, index: int) -> int:
+        """Return valid ImageList index if assigned, or -1 for GTK assertion safety."""
+        image_list = self.notebook.GetImageList()
+        if image_list and index < image_list.GetImageCount():
+            return index
+        return -1
+
     def _attach_tab_icons(self):
         """Configure notebook tabs for native desktop display."""
         self._apply_notebook_icons()
@@ -2441,7 +2448,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
                 if bmp and bmp.IsOk() and index < image_list.GetImageCount():
                     image_list.Replace(index, bmp)
                 if index < self.notebook.GetPageCount():
-                    self.notebook.SetPageImage(index, index)
+                    self.notebook.SetPageImage(index, self._page_image_id(index))
 
     def _bind_keyboard_shortcuts(self):
         """Bind Ctrl+1/2/3 tab switching and Enter export shortcut."""
@@ -2623,7 +2630,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         scroll.FitInside()
         page.SetSizer(wx.BoxSizer(wx.VERTICAL))
         page.GetSizer().Add(scroll, 1, wx.EXPAND)
-        self.notebook.AddPage(page, "Export", imageId=0)
+        self.notebook.AddPage(page, "Export", imageId=self._page_image_id(0))
 
     def _build_advanced_tab(self):
         """Build the Advanced tab containing positioning and 3D model settings."""
@@ -2697,7 +2704,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         scroll.FitInside()
         page.SetSizer(wx.BoxSizer(wx.VERTICAL))
         page.GetSizer().Add(scroll, 1, wx.EXPAND)
-        self.notebook.AddPage(page, "Advanced", imageId=1)
+        self.notebook.AddPage(page, "Advanced", imageId=self._page_image_id(1))
 
     def _build_releases_tab(self):
         """Build the Continuous Delivery tab with workflow options."""
@@ -2726,7 +2733,7 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         sizer.AddSpacer(_SP_LG)
 
         page.SetSizer(sizer)
-        self.notebook.AddPage(page, "Releases", imageId=2)
+        self.notebook.AddPage(page, "Releases", imageId=self._page_image_id(2))
         self._refresh_cd_workflow_status()
 
     def _build_footer_panel(self):
@@ -2879,8 +2886,18 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         }
         return mapping[export_key]
 
+    def _detected_pcb_file(self) -> str | None:
+        """Return the active PCB file path or discover it from project_dir."""
+        if self.pcb_file and os.path.isfile(self.pcb_file):
+            return self.pcb_file
+        if self.project_dir and os.path.isdir(self.project_dir):
+            for fname in os.listdir(self.project_dir):
+                if fname.endswith(".kicad_pcb") and not fname.startswith("."):
+                    return os.path.join(self.project_dir, fname)
+        return None
+
     def _update_export_summary(self):
-        """Update footer summary text to reflect enabled outputs."""
+        """Update footer summary text to reflect enabled outputs and board layer count."""
         enabled = []
         labels = {
             "export_gerbers": "Gerbers",
@@ -2897,12 +2914,14 @@ class KiForgeStudioSettingsDialog(wx.Dialog):
         for key in _EXPORT_TOGGLE_KEYS:
             if getattr(self, self._export_checkbox_attr(key)).IsChecked():
                 enabled.append(labels[key])
+        copper_layers = kiforge.get_pcb_copper_layer_count(self._detected_pcb_file())
+        layer_prefix = f"{copper_layers}-layer PCB · " if copper_layers > 0 else ""
         if not enabled:
-            summary = "No outputs"
+            summary = f"{layer_prefix}No outputs" if layer_prefix else "No outputs"
         else:
-            summary = ", ".join(enabled)
-        if self._export_setting("format_jlc"):
-            summary += " · JLC"
+            summary = f"{layer_prefix}{', '.join(enabled)}"
+            if self._export_setting("format_jlc"):
+                summary += " · JLC"
         self._export_summary_text = summary
         self._apply_export_summary()
         self._sync_export_button_state(bool(enabled))
