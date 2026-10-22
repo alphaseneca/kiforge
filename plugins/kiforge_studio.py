@@ -569,7 +569,7 @@ def _get_button_icon_bitmap(icon_kind: str, size: int, colour: wx.Colour) -> wx.
         return None
     try:
         tinted = kiforge.prepare_tab_icon_svg(svg_data, hex_col)
-        bundle = wx.BitmapBundle.FromSVG(tinted, (size * 2, size * 2))
+        bundle = wx.BitmapBundle.FromSVG(tinted, (size, size))
         bmp = bundle.GetBitmap(wx.Size(size, size))
         _flat_button_icon_cache[key] = bmp
         return bmp if bmp.IsOk() else None
@@ -2115,7 +2115,6 @@ _EXPORT_TOGGLE_KEYS = (
 )
 
 _TAB_ICON_NAMES = ("export", "advanced", "releases")
-_TAB_ICON_RASTER_SIZE = 48
 _tab_icon_bitmap_cache: dict[tuple[str, int, str], wx.Bitmap] = {}
 
 
@@ -2134,7 +2133,7 @@ def _load_tab_icon_bitmap(name: str, size: int = 18, tint: str | None = None) ->
         return None
     try:
         tinted = kiforge.prepare_tab_icon_svg(svg_data, tint)
-        bundle = wx.BitmapBundle.FromSVG(tinted, (_TAB_ICON_RASTER_SIZE, _TAB_ICON_RASTER_SIZE))
+        bundle = wx.BitmapBundle.FromSVG(tinted, (size, size))
         bitmap = bundle.GetBitmap(wx.Size(size, size))
         _tab_icon_bitmap_cache[cache_key] = bitmap
         return bitmap if bitmap.IsOk() else None

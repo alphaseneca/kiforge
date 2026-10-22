@@ -92,6 +92,20 @@ class TestKiForgeStudio(unittest.TestCase):
         self.assertFalse(settings['generate_cd'])
         dialog.Destroy()
 
+    def test_tab_icon_bitmaps_scale_factor_and_image_list_gtk_compat(self):
+        """Verify tab icon bitmaps add to wx.ImageList with 1:1 scale and contiguous indices (GTK compatibility)."""
+        image_list = wx.ImageList(18, 18)
+        for i, name in enumerate(kiforge_studio._TAB_ICON_NAMES):
+            bmp = kiforge_studio._load_tab_icon_bitmap(name, 18)
+            self.assertIsNotNone(bmp)
+            self.assertTrue(bmp.IsOk())
+            self.assertEqual(bmp.GetSize(), (18, 18))
+            if hasattr(bmp, "GetScaleFactor"):
+                self.assertAlmostEqual(bmp.GetScaleFactor(), 1.0)
+            idx = image_list.Add(bmp)
+            self.assertEqual(idx, i, f"Icon {name} added at index {idx}, expected {i}")
+        self.assertEqual(image_list.GetImageCount(), len(kiforge_studio._TAB_ICON_NAMES))
+
     def test_save_and_load_settings(self):
         """Verify settings are saved and loaded correctly to/from .kiforge.json."""
         dialog = kiforge_studio.KiForgeStudioSettingsDialog(None, self.test_dir)
